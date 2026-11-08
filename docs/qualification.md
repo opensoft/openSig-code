@@ -1,6 +1,6 @@
 # Dependency qualification
 
-Status: the license inventory gate exists (T002). T027 lands the complete package set (it adds playwright as a non-shipped development tool) and re-runs this qualification against the real lockfile. Nothing here waives anything. The platform inventory is a separate record with status POLICY-PENDING; see [platform-inventory.md](platform-inventory.md).
+Status: qualified for the complete package set (T027). The license inventory gate (T002) passes against the real lockfile. T027 added playwright 1.61.1 as a non-shipped development tool. **No later task may add a package.** Nothing here waives anything. The platform inventory is a separate record with status POLICY-PENDING; see [platform-inventory.md](platform-inventory.md).
 
 Authority: spec leg `specs/001-corporate-signing-mvp/plan.md` § Technical Context (Dependencies, A-002) and § Pending owner decision: platform license scope; FR-011.
 
@@ -30,16 +30,65 @@ Authority: spec leg `specs/001-corporate-signing-mvp/plan.md` § Technical Conte
   - 2: a usage error, or an incomplete or inconsistent install (a package locked but not installed, a version drift, an unresolvable dependency, or a missing lockfile).
 - **Verification.** `npm run verify -- license-inventory` runs cases LI-01..LI-10 on synthetic `node_modules` trees, plus the gate on this repository.
 
-## Current result (T002 commit, lockfile with typescript and @types/node)
+## Current result (T027: complete package set)
 
-Application gate: **PASS**. The shipped closure is **empty**, and no third-party asset is copied into `dist/` (there is no `dist/` yet). `NOTICE` therefore lists no third-party material.
+Application gate: **PASS**. The shipped closure is **empty**: `package.json` declares no `dependencies`, and no third-party asset is copied into `dist/` (there is no `dist/` yet). `NOTICE` therefore lists no third-party material. `npm run verify -- qualification` re-checks five things:
+- QL-01: the gate;
+- QL-02: exact pins;
+- QL-03: the "dev bytes not in distributable" check, which fails on a synthetic `dist/` holding dev-package bytes;
+- QL-04: the browser revision, by launching it;
+- QL-05: an offline install with `ignore-scripts`. It runs `npm ci --offline --ignore-scripts` on a copy of `package.json`, `package-lock.json`, `.npmrc` and `.node-version` in a temporary directory. It drops the `npm_*` variables that the enclosing `npm run` exports, so only the `.npmrc` files configure that install. It needs the npm cache that an earlier `npm ci` of this lockfile filled, and it downloads nothing.
 
-| Package | Version | License | Policy result | Classification | License files |
+It also writes `.verify-out/qualification/inventory.json`, bound to the tree digest.
+
+| Package | Version | License | Policy result | Classification | Notes |
 |---|---|---|---|---|---|
-| typescript | 6.0.3 | Apache-2.0 | allowed | non-shipped | `LICENSE.txt` |
+| typescript | 6.0.3 | Apache-2.0 | allowed | non-shipped | `LICENSE.txt`; third-party notices below |
 | @types/node | 24.19.2 | MIT | allowed | non-shipped | `LICENSE` |
-| undici-types | 7.24.6 | MIT | allowed | non-shipped | `LICENSE` |
+| undici-types | 7.24.6 | MIT | allowed | non-shipped | `LICENSE` (dependency of @types/node) |
+| playwright | 1.61.1 | Apache-2.0 | allowed | non-shipped | `LICENSE`, `NOTICE`; third-party notices below |
+| playwright-core | 1.61.1 | Apache-2.0 | allowed | non-shipped | `LICENSE`, `NOTICE`; third-party notices below |
+| fsevents | 2.3.2 | MIT | allowed | non-shipped | Optional, darwin-only dependency of playwright. It is locked but not installed on linux. Its install script is the only one in the lockfile, so `ignore-scripts` loses nothing on linux |
 
-Recorded for the owner, not waived: typescript 6.0.3 also carries `ThirdPartyNoticeText.txt`. That file covers DefinitelyTyped (MIT), Unicode, W3C and CC-BY-4.0 material in its `lib` files. typescript is a build-time type checker that emits nothing into any distributable, so it is a non-shipped tool and not an application dependency.
+### Third-party notices of the development tools (recorded for the owner, not waived)
+
+These packages are build- or test-time tools. They contribute no bytes to any distributable, as QL-03 checks.
+
+- **`typescript/ThirdPartyNoticeText.txt`** covers DefinitelyTyped (MIT), Unicode, W3C and CC-BY-4.0 material in typescript's `lib` files.
+- **`playwright-core/ThirdPartyNotices.txt`** explains that npm packages are inlined into bundles under `lib/`, each listed in a sidecar file with its full license text:
+  - `playwright-core/lib/utilsBundle.js.LICENSE`: 83 inlined packages. The license texts are mostly MIT, plus 11 ISC and 5 BSD-style texts.
+  - `playwright-core/lib/serverRegistry.js.LICENSE`: 14 inlined packages, MIT and ISC.
+- **`playwright/ThirdPartyNotices.txt`** describes the same arrangement, with these sidecars:
+  - `playwright/lib/matchers/expect.js.LICENSE`: 29 packages, MIT and ISC.
+  - `playwright/lib/transform/babelBundle.js.LICENSE`: 68 packages, mostly MIT with ISC, and Apache mentions.
+  - `playwright/lib/transform/esmLoader.js.LICENSE`: 13 packages, MIT, ISC and one BSD-style text.
+
+The T002 gate's license-file rule (`LICENSE*`/`NOTICE*`/`COPYING*` names) does not match these `<bundle>.js.LICENSE` sidecars. That has no effect here, because both packages are non-shipped. If a future amendment ever ships a package that bundles code this way, the sidecars would need a gate rule.
+
+### Playwright pin and browser revision
+
+The effective browsers path is the one Playwright and the frozen runner's `chromium` probe both use: `PLAYWRIGHT_BROWSERS_PATH` when set, otherwise `~/.cache/ms-playwright`.
+
+| Location | Source | Builds present (2026-11-08) |
+|---|---|---|
+| `/ms-playwright` | `PLAYWRIGHT_BROWSERS_PATH` (set in this environment): **effective** | `chromium-1228`, `chromium_headless_shell-1228`, `ffmpeg-1011` |
+| `~/.cache/ms-playwright` | default cache (not used while the variable is set) | `chromium-1234`, `chromium-1243` and their headless shells, `ffmpeg-1011` |
+
+The version-to-revision mapping was read from each candidate's own `playwright-core/browsers.json` (tarballs fetched with `npm pack`):
+
+| playwright-core | chromium revision |
+|---|---|
+| 1.60.0 | 1223 |
+| 1.61.0 | 1228 |
+| 1.61.1 | 1228 |
+| 1.62.0 | 1234 |
+| 1.62.1 | 1234 |
+| 1.63.0 | 1243 |
+| 1.64.x | 1248 |
+| 1.65.0 | 1254 |
+
+Chosen: **playwright 1.61.1**, with playwright-core 1.61.1. It names `chromium` and `chromium-headless-shell` revision **1228** (browserVersion 149.0.7827.55), which matches `chromium-1228` at the effective path. That is the later patch release of the two versions with this revision. No browser was downloaded. QL-04 launches the headless shell once, on `about:blank` only, and checks that `browser.version()` equals the pinned browserVersion.
+
+Flagged for final reconciliation: the T027 task line says "the cache currently holds `chromium-1243` and `chromium-1234`". That describes `~/.cache/ms-playwright`, not the effective path, and is a stale environment note. Matching it would mean pinning 1.62.x (1234) or 1.63.0 (1243). The frozen probe would then look for those revisions under `/ms-playwright` and find them absent.
 
 Platform items (the Node runtime and its bundled components, linked system libraries, the OpenSSL CLI, the Chromium build and the Hermes image) are outside this gate. They have status POLICY-PENDING until the owner decides the platform license scope, and the release gate stays OPEN.
