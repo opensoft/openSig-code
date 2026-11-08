@@ -11,9 +11,10 @@
 // is fsynced, made read-only and closed. The temp file is then published
 // under its digest by link(2), which is atomic and never replaces an existing
 // entry (Node has no rename(2) with RENAME_NOREPLACE, so this is the
-// no-overwrite form of the rename step). The sha256 directory is fsynced and
-// the temp name is removed. A crash before publication leaves only a .partial
-// file, never a visible blob.
+// no-overwrite form of the rename step). The sha256 directory is fsynced
+// (also when the blob already existed) and the temp name is removed. Newly
+// created directories are fsynced in their parent first. A crash before
+// publication leaves only a .partial file, never a visible blob.
 //
 // No overwrite: when a blob already exists, a write verifies the existing
 // bytes and returns created=false; a corrupt existing blob is reported, never
@@ -241,9 +242,7 @@ export class FileBlobStore implements BlobStore {
         if (errorCode(error) !== 'EEXIST') throw error;
         created = false;
       }
-      if (created) {
-        this.#syncDirectory(this.#blobDir(tenantId));
-      } else {
+      if (!created) {
         const existing = this.#inspect(target, digest);
         if (existing.status !== 'ok') {
           throw new BlobIntegrityError(
@@ -251,6 +250,10 @@ export class FileBlobStore implements BlobStore {
           );
         }
       }
+      // fsync the digest directory on both paths before reporting success: on
+      // the deduplicated path the entry may have been linked by a concurrent
+      // writer that has not yet synced the directory.
+      this.#syncDirectory(this.#blobDir(tenantId));
       return { ref, tenantId, digest, size, created };
     } finally {
       this.#removeQuietly(temp);
@@ -333,11 +336,15 @@ export class FileBlobStore implements BlobStore {
     return inspection.bytes;
   }
 
-  /** Read a stored ref; the ref must belong to `tenantId`. */
+  /**
+   * Read a stored ref within `tenantId`. A ref of another tenant is reported
+   * exactly like an absent blob (BlobNotFoundError), so callers map both to
+   * the same uniform 404.
+   */
   readRef(tenantId: string, ref: string): Buffer {
     checkTenantId(tenantId);
     const key = parseBlobRef(ref);
-    if (key.tenantId !== tenantId) throw new StorageUsageError('blob ref belongs to another tenant');
+    if (key.tenantId !== tenantId) throw new BlobNotFoundError(`blob ${blobRef(tenantId, key.digest)} does not exist`);
     return this.read(key.tenantId, key.digest);
   }
 

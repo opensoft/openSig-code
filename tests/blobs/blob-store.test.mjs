@@ -14,6 +14,8 @@ import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
+  constants as fsConstants,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -280,8 +282,8 @@ test('[BL-04] equal bytes in two tenants are two separate blobs, reachable only 
 
   const tenantC = tenantId('tenant-c');
   assert.throws(() => store.read(tenantC, a.digest), BlobNotFoundError);
-  assert.throws(() => store.readRef(tenantB, a.ref), (error) => error instanceof StorageUsageError && /another tenant/.test(error.message));
-  assert.throws(() => store.readRef(tenantC, a.ref), StorageUsageError);
+  assert.throws(() => store.readRef(tenantB, a.ref), BlobNotFoundError, 'a ref of another tenant is not found (uniform 404)');
+  assert.throws(() => store.readRef(tenantC, a.ref), BlobNotFoundError);
 
   flipByte(blobPath(root, tenantB, b.digest), 10);
   assert.equal(store.check(tenantB, b.digest), 'corrupt');
@@ -453,4 +455,189 @@ test('[BL-08] a write runs temp file, fsync, read-only, publish without replacem
     assert.equal(store.check(tenant, sha256(bytes)), 'missing', `${failure}: nothing published`);
     assert.deepEqual(tmpEntries(root, tenant), [], `${failure}: temp file removed`);
   }
+});
+
+test('[BL-09] reading another tenant\'s blob ref is "not found", exactly like an absent blob (uniform 404)', () => {
+  const { store } = newStore();
+  const owner = tenantId('owner');
+  const other = tenantId('other');
+  const bytes = syntheticBytes('bl-09', 700);
+  const owned = store.put(owner, bytes);
+  const absentRef = blobRef(owner, sha256(Buffer.from('never-stored-bl-09')));
+  const notFound = (fn) => assert.throws(fn, (error) => error instanceof BlobNotFoundError && error.code === 'blob_not_found');
+  notFound(() => store.readRef(other, owned.ref));
+  notFound(() => store.readRef(owner, absentRef));
+  // Even when the other tenant holds the same content, the foreign ref is not found.
+  store.put(other, bytes);
+  notFound(() => store.readRef(other, owned.ref));
+  let foreign;
+  let absent;
+  try {
+    store.readRef(other, owned.ref);
+  } catch (error) {
+    foreign = error;
+  }
+  try {
+    store.readRef(other, blobRef(other, sha256(Buffer.from('never-stored-bl-09'))));
+  } catch (error) {
+    absent = error;
+  }
+  assert.equal(foreign.constructor, absent.constructor, 'a foreign ref and an absent blob raise the same error type');
+  assert.ok(!foreign.message.includes(owner), 'the error does not name the owning tenant');
+  assert.deepEqual(store.readRef(owner, owned.ref), bytes);
+  assert.throws(() => store.readRef(other, 'tenants/short/sha256/abc'), StorageUsageError, 'a malformed ref is still a usage error');
+});
+
+test('[BL-10] a write fsyncs the digest directory on the deduplicated path as well as after a fresh publish, and syncs new directories first', () => {
+  const root = scratch();
+  const log = [];
+  const paths = new Map();
+  const rel = (path) => (path.startsWith(root) ? path.slice(root.length + 1) || '.' : path);
+  const kind = (path) => (path.endsWith('.partial') ? 'temp' : /\/sha256$/.test(path) ? 'blob-dir' : /\/sha256\//.test(path) ? 'blob' : rel(path));
+  const recording = {
+    ...nodeFsOps,
+    open(path, flags, mode) {
+      const fd = nodeFsOps.open(path, flags, mode);
+      paths.set(fd, path);
+      log.push(`open:${kind(path)}`);
+      return fd;
+    },
+    fsync(fd) {
+      log.push(`fsync:${kind(paths.get(fd))}`);
+      nodeFsOps.fsync(fd);
+    },
+    close(fd) {
+      log.push(`close:${kind(paths.get(fd))}`);
+      paths.delete(fd);
+      nodeFsOps.close(fd);
+    },
+    mkdir(path, mode) {
+      log.push(`mkdir:${rel(path)}`);
+      nodeFsOps.mkdir(path, mode);
+    },
+    link(existing, target) {
+      log.push(`link:${kind(existing)}->${kind(target)}`);
+      nodeFsOps.link(existing, target);
+    },
+    unlink(path) {
+      log.push(`unlink:${kind(path)}`);
+      nodeFsOps.unlink(path);
+    },
+  };
+  const store = openBlobStore({ root, fsOps: recording });
+  const tenant = tenantId('tenant');
+  const bytes = syntheticBytes('bl-10', 1024);
+
+  log.length = 0;
+  assert.equal(store.put(tenant, bytes).created, true);
+  // Every directory created for the tenant is followed by an fsync of its parent
+  // before the temp file is opened.
+  const firstTemp = log.indexOf('open:temp');
+  const created = log.slice(0, firstTemp).filter((entry) => entry.startsWith('mkdir:')).map((entry) => entry.slice('mkdir:'.length));
+  assert.deepEqual(created, [`tenants/${tenant}`, `tenants/${tenant}/sha256`, `tenants/${tenant}/tmp`]);
+  for (const dir of created) {
+    const at = log.indexOf(`mkdir:${dir}`);
+    const parent = dir.slice(0, dir.lastIndexOf('/'));
+    const parentKind = parent.endsWith('/sha256') ? 'blob-dir' : parent;
+    assert.ok(log.slice(at + 1, firstTemp).includes(`fsync:${parentKind}`), `the parent of ${dir} is fsynced after it is created`);
+  }
+  const fresh = log.slice(firstTemp);
+  assert.ok(fresh.indexOf('fsync:blob-dir') > fresh.indexOf('link:temp->blob'), 'fresh publish: directory fsync after the link');
+
+  log.length = 0;
+  assert.equal(store.put(tenant, bytes).created, false);
+  const linkAt = log.indexOf('link:temp->blob');
+  const dirSyncAt = log.indexOf('fsync:blob-dir');
+  assert.ok(linkAt >= 0, 'the deduplicated write attempted the no-replace publish');
+  assert.ok(dirSyncAt > linkAt, 'deduplicated publish: the digest directory is fsynced before success is reported');
+  assert.ok(log.indexOf('unlink:temp') > linkAt);
+});
+
+test('[BL-11] success is reported only once the published entry and every newly created directory on its path are durable (put and putStream)', async () => {
+  // Crash model over the recorded operations: a directory entry made by
+  // mkdir or link is volatile until its parent directory is fsynced, and file
+  // data is volatile until the file is fsynced. At the moment put/putStream
+  // returns, the whole path root -> tenants -> <tenant> -> sha256 -> <digest>
+  // must be durable, and so must the blob's data.
+  const root = scratch();
+  const fds = new Map();
+  const volatileEntries = new Set();
+  const durableEntries = new Set();
+  const syncedData = new Set();
+  const isDirectory = (path) => {
+    try {
+      return lstatSync(path).isDirectory();
+    } catch {
+      return false;
+    }
+  };
+  const entry = (path) => `${dirname(path)}\0${path}`;
+  const model = {
+    ...nodeFsOps,
+    open(path, flags, mode) {
+      const fd = nodeFsOps.open(path, flags, mode);
+      fds.set(fd, path);
+      if ((flags & fsConstants.O_CREAT) !== 0) volatileEntries.add(entry(path));
+      return fd;
+    },
+    close(fd) {
+      fds.delete(fd);
+      nodeFsOps.close(fd);
+    },
+    fsync(fd) {
+      nodeFsOps.fsync(fd);
+      const path = fds.get(fd);
+      if (isDirectory(path)) {
+        for (const pending of [...volatileEntries]) {
+          if (pending.startsWith(`${path}\0`)) {
+            volatileEntries.delete(pending);
+            durableEntries.add(pending);
+          }
+        }
+      } else {
+        syncedData.add(path);
+      }
+    },
+    mkdir(path, mode) {
+      nodeFsOps.mkdir(path, mode);
+      volatileEntries.add(entry(path));
+    },
+    link(existing, target) {
+      nodeFsOps.link(existing, target);
+      volatileEntries.add(entry(target));
+      if (syncedData.has(existing)) syncedData.add(target);
+    },
+    unlink(path) {
+      nodeFsOps.unlink(path);
+      volatileEntries.delete(entry(path));
+      durableEntries.delete(entry(path));
+    },
+  };
+  const store = openBlobStore({ root, fsOps: model });
+  const assertDurable = (tenant, digest, label) => {
+    const chain = [join(root, 'tenants'), join(root, 'tenants', tenant), join(root, 'tenants', tenant, 'sha256'), blobPath(root, tenant, digest)];
+    for (const path of chain) {
+      assert.ok(durableEntries.has(entry(path)), `${label}: ${path.slice(root.length + 1)} is durable in its parent before success`);
+    }
+    assert.ok(syncedData.has(blobPath(root, tenant, digest)), `${label}: the blob data was fsynced before publication`);
+  };
+
+  // put(): a brand-new tenant, so every directory below tenants/ is new.
+  const first = tenantId('first');
+  const putBytes = syntheticBytes('bl-11-put', 1500);
+  const put = store.put(first, putBytes);
+  assert.equal(put.created, true);
+  assertDurable(first, put.digest, 'put');
+
+  // putStream(): another brand-new tenant.
+  const second = tenantId('second');
+  const parts = [syntheticBytes('bl-11-a', 700), syntheticBytes('bl-11-b', 900)];
+  const streamed = await store.putStream(second, parts);
+  assert.equal(streamed.created, true);
+  assertDurable(second, streamed.digest, 'putStream');
+
+  // A second blob in an existing tenant: its new entry is durable too.
+  const again = store.put(first, syntheticBytes('bl-11-again', 300));
+  assertDurable(first, again.digest, 'existing tenant');
+  assert.deepEqual(tmpEntries(root, first), []);
 });
