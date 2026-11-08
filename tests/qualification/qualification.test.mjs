@@ -49,7 +49,7 @@ test('[QL-01] the shipped-package gate passes on the complete package set and th
   const out = tempDir('inventory');
   const run = spawnSync(process.execPath, [INVENTORY_TOOL, '--root', REPO_ROOT, '--out', out], { encoding: 'utf8', timeout: 120_000 });
   assert.equal(run.status, 0, run.stdout + run.stderr);
-  assert.match(run.stdout, /license-inventory: PASS application-gate shipped=0 non-shipped=6 notice=current platform=POLICY-PENDING\n$/);
+  assert.match(run.stdout, /license-inventory: PASS application-gate shipped=0 non-shipped=6 notice=current platform=INVENTORIED\n$/);
   const inventory = readJson(join(out, 'inventory.json'));
   assert.equal(inventory.application_gate, 'PASS');
   assert.equal(inventory.shipped, 0);
