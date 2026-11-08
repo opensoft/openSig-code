@@ -41,11 +41,30 @@ Authority: spec leg `specs/001-corporate-signing-mvp/plan.md` § Technical Conte
 Application gate: **PASS**. The shipped closure is **empty**: `package.json` declares no `dependencies`, and no third-party asset is copied into `dist/` (there is no `dist/` yet). `NOTICE` therefore lists no third-party material. `npm run verify -- qualification` re-checks five things:
 - QL-01: the gate;
 - QL-02: exact pins;
-- QL-03: the "dev bytes not in distributable" check, which fails on a synthetic `dist/` holding dev-package bytes;
-- QL-04: the browser revision, by launching it;
+- QL-03: the "dev bytes not in distributable" check. It fails on synthetic `dist/` trees holding dev-package content in each form listed under "What QL-03 proves" below. On this repository it is vacuous until T035 creates `dist/`;
+- QL-04: the browser revision, by launching it at the effective browsers path. That path is computed exactly as the frozen runner's `chromium` probe computes it, and cross-checked against Playwright's own resolution;
 - QL-05: an offline install with `ignore-scripts`. It runs `npm ci --offline --ignore-scripts` on a copy of `package.json`, `package-lock.json`, `.npmrc` and `.node-version` in a temporary directory. It drops the `npm_*` variables that the enclosing `npm run` exports, so only the `.npmrc` files configure that install. It needs the npm cache that an earlier `npm ci` of this lockfile filled, and it downloads nothing.
 
 It also writes `.verify-out/qualification/inventory.json`, bound to the tree digest.
+
+### What QL-03 proves, and what it does not
+
+`tests/qualification/dev-bytes.mjs` compares every regular file in `dist/` with the installed files of every non-production package (the `devDependencies` tree). It examines each `dist/` file as raw bytes and as everything those bytes decode to, up to three levels deep:
+- each base64 or base64url run of 64 or more characters, including a `data:` URI;
+- each gzip member anywhere in the bytes, with trailing data tolerated;
+- a whole `.br` file, decoded as brotli.
+
+It reports:
+- **`dist-symlink`:** a symbolic link, or other non-regular file, anywhere in `dist/`. Links are never followed.
+- **`asset-copy`:** a `dist/` file byte-identical to a dev-package file.
+- **`embedded-bytes`:** a decoded or raw view that contains the complete content of a dev-package file of 64 bytes or more.
+- **`embedded-chunks`:** a view containing at least min(2, n) of the n 64-character chunks of a dev-package text file. Both sides are compared after removing JavaScript, CSS and HTML comments and all whitespace. This catches a copy with comments stripped or the layout changed, and a partial copy of two chunks or more. License texts are not fingerprinted, and neither are chunks that occur in three or more dev packages (shared idioms).
+
+Read errors stop the check; they are never skipped.
+
+It does **not** prove that no dev-package content reached `dist/`. Content transformed beyond comment and whitespace removal is not detected: renamed identifiers, transpiled or otherwise minified code, and fragments shorter than 64 normalized characters. Neither is content encoded another way: zlib or raw deflate without a gzip header, brotli outside a `.br` file, or encryption. Today `dist/` does not exist, so the repository case proves nothing about a real build.
+
+**Forward requirement (T035).** Closing that gap needs build provenance, not byte matching. The T035 browser build must emit an input-provenance manifest with `dist/`. It must list every file the build read, by repository-relative path and SHA-256, and every `dist/` file it wrote, by path and SHA-256. The qualification can then check two things: that no input lies inside a non-production package (or anywhere under `node_modules/`), and that every `dist/` file is accounted for. The check needs a task whose `files:` list names `tests/qualification/`; T035's list does not, so it needs a tasks.md amendment.
 
 | Package | Version | License | Policy result | Classification | Notes |
 |---|---|---|---|---|---|
@@ -58,7 +77,7 @@ It also writes `.verify-out/qualification/inventory.json`, bound to the tree dig
 
 ### Third-party notices of the development tools (recorded for the owner, not waived)
 
-These packages are build- or test-time tools. They contribute no bytes to any distributable, as QL-03 checks.
+These packages are build- or test-time tools and are not in the shipped closure. QL-03 looks for their content in `dist/` in the forms listed above; it is not a proof that none can reach a distributable (see "What QL-03 proves").
 
 - **`typescript/ThirdPartyNoticeText.txt`** covers DefinitelyTyped (MIT), Unicode, W3C and CC-BY-4.0 material in typescript's `lib` files.
 - **`playwright-core/ThirdPartyNotices.txt`** explains that npm packages are inlined into bundles under `lib/`, each listed in a sidecar file with its full license text:
@@ -73,7 +92,12 @@ The T002 gate's license-file rule matches these `<bundle>.js.LICENSE` sidecars a
 
 ### Playwright pin and browser revision
 
-The effective browsers path is the one Playwright and the frozen runner's `chromium` probe both use: `PLAYWRIGHT_BROWSERS_PATH` when set, otherwise `~/.cache/ms-playwright`.
+The effective browsers path is the one Playwright and the frozen runner's `chromium` probe both use:
+- `PLAYWRIGHT_BROWSERS_PATH=0`: `node_modules/playwright-core/.local-browsers`, inside the first of playwright-core and playwright that has a `browsers.json`;
+- `PLAYWRIGHT_BROWSERS_PATH` set to any other non-empty value: that path, resolved against the working directory;
+- unset or empty: `~/.cache/ms-playwright`.
+
+QL-04 computes the path this way rather than assuming `/ms-playwright`. It pins the runner's resolution expression by its exact text in `scripts/verify.mjs`. It also checks that Playwright resolves the same directory for each of those settings.
 
 | Location | Source | Builds present (2026-11-08) |
 |---|---|---|
@@ -95,6 +119,6 @@ The version-to-revision mapping was read from each candidate's own `playwright-c
 
 Chosen: **playwright 1.61.1**, with playwright-core 1.61.1. It names `chromium` and `chromium-headless-shell` revision **1228** (browserVersion 149.0.7827.55), which matches `chromium-1228` at the effective path. That is the later patch release of the two versions with this revision. No browser was downloaded. QL-04 launches the headless shell once, on `about:blank` only, and checks that `browser.version()` equals the pinned browserVersion.
 
-Flagged for final reconciliation: the T027 task line says "the cache currently holds `chromium-1243` and `chromium-1234`". That describes `~/.cache/ms-playwright`, not the effective path, and is a stale environment note. Matching it would mean pinning 1.62.x (1234) or 1.63.0 (1243). The frozen probe would then look for those revisions under `/ms-playwright` and find them absent.
+**Superseded task-line note.** The T027 task line says "the cache currently holds `chromium-1243` and `chromium-1234`". That note is superseded by this pin: playwright 1.61.1, chromium-1228 at the effective path. This stands pending a tasks.md amendment that the orchestrator is filing. The note describes `~/.cache/ms-playwright`, which is not the effective path in this environment (`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`), so it is a stale environment note. Matching it would mean pinning 1.62.x (1234) or 1.63.0 (1243). The frozen probe would then look for those revisions under `/ms-playwright` and find them absent.
 
 Platform items (the Node runtime and its bundled components, linked system libraries, the OpenSSL CLI, the Chromium build and the Hermes image) are outside this gate. They have status POLICY-PENDING until the owner decides the platform license scope, and the release gate stays OPEN.

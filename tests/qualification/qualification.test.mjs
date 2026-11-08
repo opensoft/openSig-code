@@ -9,11 +9,12 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { accessSync, constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { brotliCompressSync, gzipSync } from 'node:zlib';
 
 import { findDevBytesInDist } from './dev-bytes.mjs';
 
@@ -97,54 +98,208 @@ test('[QL-02] every package.json version is an exact pin and matches the lockfil
 
 // --- QL-03 ------------------------------------------------------------------------
 
-function syntheticProject({ dist }) {
+const hex = (bytes) => JSON.stringify(randomBytes(bytes).toString('hex'));
+
+/** A synthetic development-only package's runtime module: comments, two functions, random constants. */
+function devRuntime() {
+  return [
+    '// dev-kit runtime helpers (synthetic)',
+    'export function devHelper() {',
+    '  /* returns a fixed marker */',
+    `  return ${hex(24)};`,
+    '}',
+    '',
+    'export function devTable() {',
+    `  return [${hex(24)}, ${hex(24)},`,
+    `    ${hex(24)}, ${hex(24)}];`,
+    '}',
+    '',
+  ].join('\n');
+}
+
+/**
+ * A synthetic project whose devDependencies are dev-kit (lib/runtime.js) and
+ * any `extraPackages` ({ name: { file: content } }); `dist(runtime)` gives the
+ * dist/ files.
+ */
+function syntheticProject({ dist, extraPackages = {} }) {
   const root = tempDir('dist');
-  const runtime = `export function devHelper() { return ${JSON.stringify(randomBytes(48).toString('hex'))}; }\n`;
-  const rootPkg = { name: 'fixture-app', version: '1.0.0', license: 'Apache-2.0', dependencies: {}, devDependencies: { 'dev-kit': '1.0.0' } };
+  const runtime = devRuntime();
+  const packages = { 'dev-kit': { 'lib/runtime.js': runtime }, ...extraPackages };
+  const rootPkg = {
+    name: 'fixture-app',
+    version: '1.0.0',
+    license: 'Apache-2.0',
+    dependencies: {},
+    devDependencies: Object.fromEntries(Object.keys(packages).map((name) => [name, '1.0.0'])),
+  };
   write(join(root, 'package.json'), JSON.stringify(rootPkg));
-  write(
-    join(root, 'package-lock.json'),
-    JSON.stringify({
-      name: 'fixture-app',
+  const lockPackages = { '': rootPkg };
+  for (const [name, files] of Object.entries(packages)) {
+    lockPackages[`node_modules/${name}`] = {
       version: '1.0.0',
-      lockfileVersion: 3,
-      requires: true,
-      packages: {
-        '': rootPkg,
-        'node_modules/dev-kit': {
-          version: '1.0.0',
-          resolved: 'https://registry.npmjs.org/dev-kit/-/dev-kit-1.0.0.tgz',
-          integrity: `sha512-${createHash('sha512').update('dev-kit@1.0.0').digest('base64')}`,
-          dev: true,
-          license: 'MIT',
-        },
-      },
-    }),
-  );
-  write(join(root, 'node_modules', 'dev-kit', 'package.json'), JSON.stringify({ name: 'dev-kit', version: '1.0.0', license: 'MIT' }));
-  write(join(root, 'node_modules', 'dev-kit', 'LICENSE'), 'Synthetic MIT text for dev-kit.\n');
-  write(join(root, 'node_modules', 'dev-kit', 'lib', 'runtime.js'), runtime);
+      resolved: `https://registry.npmjs.org/${name}/-/${name}-1.0.0.tgz`,
+      integrity: `sha512-${createHash('sha512').update(`${name}@1.0.0`).digest('base64')}`,
+      dev: true,
+      license: 'MIT',
+    };
+    write(join(root, 'node_modules', name, 'package.json'), JSON.stringify({ name, version: '1.0.0', license: 'MIT' }));
+    write(join(root, 'node_modules', name, 'LICENSE'), `Synthetic MIT text for ${name}.\n`);
+    for (const [file, content] of Object.entries(files)) write(join(root, 'node_modules', name, file), content);
+  }
+  write(join(root, 'package-lock.json'), JSON.stringify({ name: 'fixture-app', version: '1.0.0', lockfileVersion: 3, requires: true, packages: lockPackages }));
   for (const [file, content] of Object.entries(dist(runtime))) write(join(root, 'dist', file), content);
   return root;
 }
 
+const summary = (findings) => findings.map((f) => [f.rule, f.package, f.file, f.dist, f.via ?? null]);
+
 test('[QL-03] the "dev bytes not in distributable" check fails on a dist that contains dev-package bytes', () => {
   const embedded = findDevBytesInDist(syntheticProject({ dist: (runtime) => ({ 'app.js': `// original application code\n${runtime}// end\n` }) }));
-  assert.deepEqual(
-    embedded.map((f) => [f.rule, f.package, f.file, f.dist]),
-    [['embedded-bytes', 'dev-kit@1.0.0', 'lib/runtime.js', 'dist/app.js']],
-  );
+  assert.deepEqual(summary(embedded), [['embedded-bytes', 'dev-kit@1.0.0', 'lib/runtime.js', 'dist/app.js', 'raw']]);
   const copied = findDevBytesInDist(syntheticProject({ dist: (runtime) => ({ 'vendor/runtime.js': runtime }) }));
   assert.deepEqual(
     copied.map((f) => [f.rule, f.package, f.dist]),
     [['asset-copy', 'dev-kit@1.0.0', 'dist/vendor/runtime.js']],
   );
-  const clean = findDevBytesInDist(syntheticProject({ dist: () => ({ 'app.js': `export const build = ${JSON.stringify(randomBytes(40).toString('hex'))};\n` }) }));
+  const clean = findDevBytesInDist(syntheticProject({ dist: () => ({ 'app.js': `export const build = ${hex(40)};\n` }) }));
   assert.deepEqual(clean, [], 'original bytes only');
-  assert.deepEqual(findDevBytesInDist(REPO_ROOT), [], 'the code leg has no dev bytes in dist/');
+  assert.deepEqual(findDevBytesInDist(REPO_ROOT), [], 'the code leg has no dev bytes in dist/ (there is no dist/ before T035)');
+});
+
+test('[QL-03] dev-package content inlined as base64, a data: URI, gzip or brotli is found', () => {
+  const b64 = (bytes) => Buffer.from(bytes).toString('base64');
+  const cases = {
+    'data URI': [(runtime) => ({ 'app.js': `export const worker = new URL("data:text/javascript;base64,${b64(runtime)}");\n` }), 'raw>base64'],
+    base64url: [(runtime) => ({ 'app.js': `const blob = "${Buffer.from(runtime).toString('base64url')}";\n` }), 'raw>base64'],
+    'gzip file': [(runtime) => ({ 'runtime.js.gz': gzipSync(`/* banner */\n${runtime}`) }), 'raw>gzip'],
+    'base64 of gzip': [(runtime) => ({ 'app.js': `const packed = "${b64(gzipSync(runtime))}";\n` }), 'raw>base64>gzip'],
+    'gzip inside other bytes': [(runtime) => ({ 'bundle.bin': Buffer.concat([randomBytes(97), gzipSync(runtime), randomBytes(61)]) }), 'raw>gzip'],
+    'brotli file': [(runtime) => ({ 'runtime.js.br': brotliCompressSync(Buffer.from(runtime)) }), 'raw>brotli'],
+  };
+  for (const [label, [dist, via]] of Object.entries(cases)) {
+    const findings = findDevBytesInDist(syntheticProject({ dist }));
+    assert.deepEqual(
+      summary(findings),
+      [['embedded-bytes', 'dev-kit@1.0.0', 'lib/runtime.js', `dist/${Object.keys(dist(''))[0]}`, via]],
+      `${label}: ${JSON.stringify(findings)}`,
+    );
+  }
+  // Decoded content that is not dev content.
+  const original = findDevBytesInDist(
+    syntheticProject({ dist: () => ({ 'app.js': `const data = "${b64(randomBytes(300))}";\nconst packed = "${b64(gzipSync(`export const own = ${hex(64)};\n`))}";\n` }) }),
+  );
+  assert.deepEqual(original, []);
+});
+
+test('[QL-03] dev-package content with comments stripped, reformatted or partly inlined is found by normalized chunks', () => {
+  const stripped = (runtime) =>
+    runtime
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('//') && !line.includes('/*'))
+      .map((line) => line.trim())
+      .join(' ');
+  const reformatted = findDevBytesInDist(syntheticProject({ dist: (runtime) => ({ 'app.js': `// built\n${stripped(runtime)}\nexport const own = ${hex(8)};\n` }) }));
+  assert.deepEqual(
+    reformatted.map((f) => [f.rule, f.package, f.file, f.dist]),
+    [['embedded-chunks', 'dev-kit@1.0.0', 'lib/runtime.js', 'dist/app.js']],
+  );
+  const partial = (runtime) => runtime.slice(runtime.indexOf('export function devTable'));
+  const part = findDevBytesInDist(syntheticProject({ dist: (runtime) => ({ 'table.js': `/* table */ ${partial(runtime).replace(/\n\s*/g, '\n\t')}` }) }));
+  assert.deepEqual(
+    part.map((f) => [f.rule, f.file, f.dist]),
+    [['embedded-chunks', 'lib/runtime.js', 'dist/table.js']],
+  );
+  const encoded = findDevBytesInDist(
+    syntheticProject({ dist: (runtime) => ({ 'app.js': `const packed = "${gzipSync(stripped(runtime)).toString('base64')}";\n` }) }),
+  );
+  assert.deepEqual(
+    encoded.map((f) => [f.rule, f.file]),
+    [['embedded-chunks', 'lib/runtime.js']],
+    'normalized chunks are matched in decoded views too',
+  );
+
+  // Not reported: a fragment shorter than one chunk, and an idiom common to three or more packages.
+  const fragment = findDevBytesInDist(syntheticProject({ dist: () => ({ 'app.js': 'export function devHelper() { return 1; }\n' }) }));
+  assert.deepEqual(fragment, []);
+  const idiom = `export function sharedIdiom(value) {\n  if (value === undefined || value === null) throw new TypeError("value is required");\n  return Object.freeze({ value, at: Date.now() });\n}\n`;
+  const common = findDevBytesInDist(
+    syntheticProject({
+      extraPackages: { 'kit-a': { 'index.js': `${idiom}export const a = ${hex(8)};\n` }, 'kit-b': { 'index.js': `${idiom}export const b = ${hex(8)};\n` }, 'kit-c': { 'index.js': idiom } },
+      dist: () => ({ 'app.js': `${idiom.replace(/\n/g, ' ')}\nexport const own = ${hex(8)};\n` }),
+    }),
+  );
+  assert.deepEqual(common, [], `an idiom shared by three dev packages is not fingerprinted: ${JSON.stringify(common)}`);
+});
+
+test('[QL-03] a symbolic link in dist/ fails the check and is never followed', () => {
+  const root = syntheticProject({ dist: () => ({ 'app.js': `export const build = ${hex(16)};\n` }) });
+  symlinkSync('../node_modules/dev-kit', join(root, 'dist', 'vendor'));
+  assert.deepEqual(summary(findDevBytesInDist(root)), [['dist-symlink', null, null, 'dist/vendor', null]]);
 });
 
 // --- QL-04 ------------------------------------------------------------------------
+
+// The frozen runner's chromium probe (scripts/verify.mjs, probeChromium) picks
+// the first of these packages that has a browsers.json, then resolves the
+// browsers directory with exactly this expression.
+const RUNNER_PROBE_PACKAGES = "for (const name of ['playwright-core', 'playwright']) {";
+const RUNNER_PROBE_BASE =
+  "configured === '0' ? join(packageDir, '.local-browsers') : configured ? resolve(configured) : join(homedir(), '.cache', 'ms-playwright');";
+
+function isRegularFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** The browsers directory the frozen runner's chromium probe uses for `env`, or null without Playwright. */
+function effectiveBrowsersPath(root, env) {
+  let packageDir = null;
+  for (const name of ['playwright-core', 'playwright']) {
+    const dir = join(root, 'node_modules', name);
+    if (isRegularFile(join(dir, 'browsers.json'))) {
+      packageDir = dir;
+      break;
+    }
+  }
+  if (!packageDir) return null;
+  const configured = env.PLAYWRIGHT_BROWSERS_PATH;
+  return configured === '0' ? join(packageDir, '.local-browsers') : configured ? resolve(configured) : join(homedir(), '.cache', 'ms-playwright');
+}
+
+test('[QL-04] the effective browsers path follows the frozen runner and Playwright, PLAYWRIGHT_BROWSERS_PATH=0 included', () => {
+  const runner = readFileSync(join(REPO_ROOT, 'scripts', 'verify.mjs'), 'utf8');
+  assert.ok(runner.includes(RUNNER_PROBE_PACKAGES) && runner.includes(RUNNER_PROBE_BASE), 'the frozen runner still resolves the browsers path this way');
+
+  const coreDir = join(REPO_ROOT, 'node_modules', 'playwright-core');
+  const cache = join(homedir(), '.cache', 'ms-playwright');
+  const base = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== 'PLAYWRIGHT_BROWSERS_PATH'));
+  const cases = [
+    [undefined, cache],
+    ['', cache],
+    ['0', join(coreDir, '.local-browsers')],
+    ['/opt/synthetic-browsers', '/opt/synthetic-browsers'],
+    ['relative/browsers', resolve('relative/browsers')],
+  ];
+  const revision = readJson(join(coreDir, 'browsers.json')).browsers.find((browser) => browser.name === 'chromium').revision;
+  for (const [value, expected] of cases) {
+    const env = value === undefined ? base : { ...base, PLAYWRIGHT_BROWSERS_PATH: value };
+    assert.equal(effectiveBrowsersPath(REPO_ROOT, env), expected, `PLAYWRIGHT_BROWSERS_PATH=${JSON.stringify(value)}`);
+    // Playwright itself resolves the same directory (run in a child so its registry reads this env).
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', 'const { chromium } = await import("playwright"); process.stdout.write(chromium.executablePath());'], {
+      cwd: REPO_ROOT,
+      env,
+      encoding: 'utf8',
+      timeout: 60_000,
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const childExpected = value && value !== '0' ? resolve(REPO_ROOT, value) : expected; // the child runs in REPO_ROOT
+    assert.ok(child.stdout.startsWith(join(childExpected, `chromium-${revision}`)), `Playwright resolves ${child.stdout} for ${JSON.stringify(value)}`);
+  }
+});
 
 test('[QL-04] the pinned Playwright Chromium revision is present at the effective browsers path and launches headless', async () => {
   const browsers = readJson(join(REPO_ROOT, 'node_modules', 'playwright-core', 'browsers.json')).browsers;
@@ -153,8 +308,10 @@ test('[QL-04] the pinned Playwright Chromium revision is present at the effectiv
   assert.ok(chromium && shell, 'playwright-core names chromium and its headless shell');
   assert.equal(shell.revision, chromium.revision);
 
-  const configured = process.env.PLAYWRIGHT_BROWSERS_PATH;
-  const effective = configured && configured !== '0' ? resolve(configured) : join(homedir(), '.cache', 'ms-playwright');
+  // Computed exactly as the frozen runner's chromium probe computes it; in this
+  // environment PLAYWRIGHT_BROWSERS_PATH=/ms-playwright, but nothing assumes it.
+  const effective = effectiveBrowsersPath(REPO_ROOT, process.env);
+  assert.ok(effective, 'Playwright is installed');
   for (const dir of [`chromium-${chromium.revision}`, `chromium_headless_shell-${shell.revision}`]) {
     assert.ok(existsSync(join(effective, dir, 'INSTALLATION_COMPLETE')), `${dir} is installed under ${effective} (revision must match the pinned Playwright)`);
   }
