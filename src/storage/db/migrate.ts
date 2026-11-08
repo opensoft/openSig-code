@@ -37,6 +37,25 @@ const DENIED_ACTIONS: ReadonlySet<number> = new Set([
   constants.SQLITE_DETACH,
 ]);
 
+// The one pragma allowed, and only while a migration runs: SQLite itself runs
+// PRAGMA quick_check(<table>) inside ALTER TABLE ... ADD COLUMN when the table
+// is STRICT or the new column has NOT NULL or CHECK. quick_check only reads;
+// it is admitted with no argument or a table name, nothing else.
+const QUICK_CHECK = 'quick_check';
+const TABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function authorizeMigration(action: number, pragma: string | null, argument: string | null): number {
+  if (
+    action === constants.SQLITE_PRAGMA &&
+    pragma !== null &&
+    pragma.toLowerCase() === QUICK_CHECK &&
+    (argument === null || TABLE_NAME.test(argument))
+  ) {
+    return constants.SQLITE_OK;
+  }
+  return DENIED_ACTIONS.has(action) ? constants.SQLITE_DENY : constants.SQLITE_OK;
+}
+
 interface AppliedRow {
   readonly version: number;
   readonly name: string;
@@ -84,7 +103,7 @@ function checkApplied(executor: Executor, migrations: readonly Migration[]): num
 }
 
 function execMigration(executor: Executor, migration: Migration): void {
-  executor.setAuthorizer((action) => (DENIED_ACTIONS.has(action) ? constants.SQLITE_DENY : constants.SQLITE_OK));
+  executor.setAuthorizer(authorizeMigration);
   try {
     executor.exec(migration.sql);
   } finally {

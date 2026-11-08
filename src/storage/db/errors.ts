@@ -47,6 +47,13 @@ export class StorageUsageError extends StorageError {
   }
 }
 
+/** A read would return more rows than the cap; nothing is silently truncated. Iterate instead. */
+export class StorageLimitError extends StorageError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super('storage_limit', message, options);
+  }
+}
+
 /** The migration set or the database's applied migrations were refused. */
 export class MigrationError extends StorageError {
   constructor(message: string, options?: { cause?: unknown }) {

@@ -10,6 +10,7 @@ import { StorageUsageError, translateSqliteError } from './errors.ts';
 
 export interface TableInfo {
   readonly columns: ReadonlySet<string>;
+  readonly notNull: ReadonlySet<string>;
   readonly primaryKey: readonly string[];
 }
 
@@ -58,20 +59,22 @@ export function createExecutor(connection: DatabaseSync): Executor {
     table(name) {
       if (!IDENTIFIER.test(name)) return undefined;
       if (!tables.has(name)) {
-        const rows = connection.prepare(`SELECT name, pk FROM pragma_table_info(?) ORDER BY cid`).all(name);
+        const rows = connection.prepare(`SELECT name, pk, "notnull" AS nn FROM pragma_table_info(?) ORDER BY cid`).all(name);
         if (rows.length === 0) {
           tables.set(name, undefined);
         } else {
           const columns = new Set<string>();
+          const notNull = new Set<string>();
           const keyed: { name: string; pk: number }[] = [];
           for (const row of rows) {
             const column = String(row['name']);
             columns.add(column);
+            if (Number(row['nn']) === 1) notNull.add(column);
             const pk = Number(row['pk']);
             if (pk > 0) keyed.push({ name: column, pk });
           }
           keyed.sort((a, b) => a.pk - b.pk);
-          tables.set(name, { columns, primaryKey: keyed.map((entry) => entry.name) });
+          tables.set(name, { columns, notNull, primaryKey: keyed.map((entry) => entry.name) });
         }
       }
       return tables.get(name);

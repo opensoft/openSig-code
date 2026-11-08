@@ -10,7 +10,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { openDatabase } from '../../../src/storage/db/index.ts';
-import { appendRestricted } from '../../../src/storage/db/restricted-writer.ts';
+import { claimRestrictedInsert } from '../../../src/storage/db/tenant-store.ts';
+
+let restrictedInsert;
+
+/**
+ * Append to a restricted (audit) table for schema tests. The one-shot
+ * restricted insert is claimed on first use, so only storage tests, which
+ * never load src/storage/audit/writer.ts, may call this.
+ */
+export function appendAudit(store, table, values) {
+  restrictedInsert ??= claimRestrictedInsert();
+  restrictedInsert(store, table, values);
+}
 
 export const BASE_TIME = Date.UTC(2026, 10, 8, 10, 0, 0);
 
@@ -378,8 +390,8 @@ export function seedGraph(db, tenantId) {
       type: 'envelope.completed',
       subject_digest: g.artDigest,
     });
-    for (const event of [e1, e2, e3]) appendRestricted(store, 'audit_events', event);
-    appendRestricted(store, 'audit_checkpoints', {
+    for (const event of [e1, e2, e3]) appendAudit(store, 'audit_events', event);
+    appendAudit(store, 'audit_checkpoints', {
       seq: 3,
       kind: 'completion',
       event_digest: e3.event_digest,
@@ -406,6 +418,7 @@ export function seedGraph(db, tenantId) {
       disposed_blob_refs_json: JSON.stringify([]),
       policy_ref: 'synthetic-retention-policy',
       server_time: ts(15),
+      kind: 'retention',
     });
     store.insert('webhook_registrations', {
       id: g.reg,

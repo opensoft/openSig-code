@@ -22,6 +22,7 @@ const PINNED_MIGRATIONS = Object.freeze([
   { version: 5, name: '0005-artifacts.sql', sha256: '79153c45dc4d16dfa6de4c87f1fe5b7c4742b868a21404cd119282d74d88329d' },
   { version: 6, name: '0006-audit-retention.sql', sha256: '1f7ad14b709cb88be3db0616d7e1ce5d6c4c693b34dfb6f1f9f6007ae51ee0e0' },
   { version: 7, name: '0007-outbox-webhooks-consumers.sql', sha256: '1f2d4c513318285ca5384f98eb691e42caa946e22649f6dc02ec521fac9b02ed' },
+  { version: 8, name: '0008-disposal-record-kind.sql', sha256: '4af3cab3c3e48f0eaf8238848bf1f420dabc1723d7d69b6d2febc00e2db1130a' },
 ]);
 
 const scratch = makeScratch();
@@ -170,6 +171,55 @@ test('[DB-10] a failing migration, or one that controls transactions, pragmas or
       assert.equal(rawRows(path, 'SELECT count(*) AS n FROM schema_migrations')[0].n, 1, `${label}: not recorded`);
       assert.equal(rawRows(path, 'PRAGMA user_version')[0].user_version, 1, `${label}: version unchanged`);
     }
+  } finally {
+    db.close();
+  }
+});
+
+test('[DB-27] a migration may add a constrained column (SQLite runs PRAGMA quick_check inside it), and every other pragma stays denied', () => {
+  const { db, path } = openTemp(scratch, { migrate: false });
+  try {
+    const first = migration(1, '0001-one.sql', "CREATE TABLE one (tenant_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'a') STRICT;\nINSERT INTO one (tenant_id) VALUES ('t');");
+    assert.deepEqual(db.migrate([first]).applied, [1]);
+
+    // ALTER TABLE ... ADD COLUMN with NOT NULL and CHECK on a STRICT table: SQLite
+    // runs PRAGMA quick_check(one) internally, which the runner admits.
+    const second = migration(2, '0002-two.sql', "ALTER TABLE one ADD COLUMN label TEXT NOT NULL DEFAULT 'x' CHECK (label IN ('x', 'y'));");
+    assert.deepEqual(db.migrate([first, second]).applied, [2]);
+    assert.deepEqual(rawRows(path, 'SELECT label FROM one').map((row) => row.label), ['x']);
+    // quick_check written out, bare or on a table, is admitted too: it only reads.
+    const third = migration(3, '0003-three.sql', 'PRAGMA quick_check;\nPRAGMA quick_check(one);\nCREATE TABLE three (tenant_id TEXT NOT NULL) STRICT;');
+    assert.deepEqual(db.migrate([first, second, third]).applied, [3]);
+    const applied = [first, second, third];
+
+    const denied = [
+      ['journal_mode', 'PRAGMA journal_mode = DELETE;'],
+      ['writable_schema', 'PRAGMA writable_schema = ON;'],
+      ['foreign_keys', 'PRAGMA foreign_keys = OFF;'],
+      ['user_version', 'PRAGMA user_version = 99;'],
+      ['integrity_check (read-only, but not admitted)', 'PRAGMA integrity_check;'],
+      ['quick_check with a non-table argument', "PRAGMA quick_check('one; x');"],
+      ['table_info', "SELECT * FROM pragma_table_info('one');"],
+    ];
+    for (const [label, sql] of denied) {
+      const extra = migration(4, '0004-four.sql', `CREATE TABLE partial (tenant_id TEXT NOT NULL) STRICT;\n${sql}`);
+      assert.throws(() => db.migrate([...applied, extra]), (error) => error instanceof MigrationError && /not authorized/.test(error.message), label);
+      assert.equal(db.inTransaction, false, `${label}: no transaction left open`);
+      assert.deepEqual(
+        rawRows(path, `SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name`).map((row) => row.name),
+        ['one', 'schema_migrations', 'three'],
+        `${label}: nothing created`,
+      );
+      assert.equal(rawRows(path, 'PRAGMA user_version')[0].user_version, 3, `${label}: version unchanged`);
+    }
+    assert.equal(rawRows(path, 'PRAGMA journal_mode')[0].journal_mode, 'wal', 'the runner-owned journal mode is untouched');
+
+    // The allowance exists only while a migration runs: the runner removes its
+    // authorizer afterwards, so its own PRAGMA user_version check (run before
+    // any migration) still works, and the next migration applies.
+    const fourth = migration(4, '0004-four.sql', "ALTER TABLE three ADD COLUMN note TEXT NOT NULL DEFAULT 'n' CHECK (length(note) <= 10);");
+    assert.deepEqual(db.migrate([...applied, fourth]).applied, [4]);
+    assert.equal(rawRows(path, 'PRAGMA user_version')[0].user_version, 4);
   } finally {
     db.close();
   }

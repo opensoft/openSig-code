@@ -181,3 +181,28 @@ test('[DB-21] the only unscoped lookups are the tenant registry and capability-h
     db.close();
   }
 });
+
+test('[DB-28] update() refuses a caller-supplied version, so only compareAndSet moves it', () => {
+  const { db, ga, a } = twoTenants();
+  try {
+    const before = a.get('envelopes', { id: ga.env });
+    const version = before?.version;
+    const tenantVersion = a.get('tenants', {})?.version;
+    assert.equal(typeof version, 'number');
+    for (const values of [{ version: 1, updated_at: ts(40) }, { version: version + 1 }, { version }]) {
+      assert.throws(() => db.transaction(() => a.update('envelopes', { id: ga.env }, values)), usage(/never sets the version column/), JSON.stringify(values));
+    }
+    assert.throws(() => db.transaction(() => a.update('tenants', {}, { version: 99 })), usage(/never sets the version column/));
+    const unchanged = a.get('envelopes', { id: ga.env });
+    assert.equal(unchanged?.version, version, 'the refused updates changed nothing');
+    assert.equal(unchanged?.updated_at, before?.updated_at);
+    assert.equal(a.get('tenants', {})?.version, tenantVersion);
+
+    db.transaction(() => assert.equal(a.update('envelopes', { id: ga.env }, { updated_at: ts(41) }), 1));
+    assert.equal(a.get('envelopes', { id: ga.env })?.version, version, 'a plain update leaves the version alone');
+    db.transaction(() => assert.equal(a.compareAndSet('envelopes', { id: ga.env }, version, { updated_at: ts(42) }), true));
+    assert.equal(a.get('envelopes', { id: ga.env })?.version, version + 1, 'compareAndSet moves it by exactly one');
+  } finally {
+    db.close();
+  }
+});

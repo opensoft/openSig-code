@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Public surface of the node:sqlite storage layer (T003). The restricted audit
-// writer (restricted-writer.ts) is deliberately not re-exported here.
+// Public surface of the node:sqlite storage layer (T003). The one-shot
+// restricted insert (claimRestrictedInsert in tenant-store.ts) is deliberately
+// not re-exported here: only src/storage/audit/writer.ts claims it.
 
 export {
   Database,
@@ -17,6 +18,7 @@ export {
   StorageBusyError,
   StorageConstraintError,
   StorageError,
+  StorageLimitError,
   StorageUsageError,
   type ConstraintKind,
 } from './errors.ts';
@@ -26,7 +28,9 @@ export {
   TENANT_ID_PATTERN,
   TenantStore,
   type Comparison,
+  type IterateOptions,
   type ListOptions,
+  type OrderBy,
   type Row,
   type SqlValue,
   type Values,

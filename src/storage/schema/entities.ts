@@ -21,8 +21,8 @@ export type Mutability = 'mutable' | 'guarded' | 'immutable';
 /**
  * Who may insert rows.
  * - store: any tenant-scoped store.
- * - restricted: only the restricted writer (src/storage/db/restricted-writer.ts),
- *   reserved for the audit chain.
+ * - restricted: only the audit writer (src/storage/audit/writer.ts), through the
+ *   one-shot claimRestrictedInsert() of src/storage/db/tenant-store.ts.
  */
 export type Writer = 'store' | 'restricted';
 

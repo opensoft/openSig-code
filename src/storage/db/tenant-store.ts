@@ -5,11 +5,15 @@
 // and column names are checked against the schema and the table policy map;
 // values are always bound parameters. Writes require an open transaction,
 // which Database.transaction() opens with BEGIN IMMEDIATE.
+//
+// Reads never truncate silently: list() without an explicit limit throws
+// StorageLimitError when more than MAX_LIST_LIMIT rows match, and iterate()
+// walks any number of rows by keyset pages with a stable order.
 
 import type { SQLInputValue, SQLOutputValue } from 'node:sqlite';
 
 import { tablePolicy, type TablePolicy } from '../schema/entities.ts';
-import { StorageUsageError, translateSqliteError } from './errors.ts';
+import { StorageLimitError, StorageUsageError, translateSqliteError } from './errors.ts';
 import type { Executor, TableInfo } from './executor.ts';
 
 export type SqlValue = null | number | bigint | string | Uint8Array;
@@ -25,9 +29,19 @@ export type Comparison =
 /** Column conditions joined with AND. A plain value means equality; null means IS NULL. */
 export type Where = Readonly<Record<string, SqlValue | Comparison>>;
 
+export type OrderBy = readonly (readonly [column: string, direction: 'asc' | 'desc'])[];
+
 export interface ListOptions {
-  readonly orderBy?: readonly (readonly [column: string, direction: 'asc' | 'desc'])[];
+  readonly orderBy?: OrderBy;
+  /** An explicit cap on the rows returned. Without it, more than MAX_LIST_LIMIT matches throw. */
   readonly limit?: number;
+}
+
+export interface IterateOptions {
+  /** Columns to order by; each must be NOT NULL. Ties are broken by rowid. */
+  readonly orderBy?: OrderBy;
+  /** Rows fetched per keyset page (default MAX_LIST_LIMIT). */
+  readonly pageSize?: number;
 }
 
 export const TENANT_ID_PATTERN = /^[A-Za-z0-9_-]{16,64}$/;
@@ -36,6 +50,7 @@ const MAX_IN_VALUES = 500;
 const TENANT_COLUMN = 'tenant_id';
 const VERSION_COLUMN = 'version';
 const COMPARISON_OPERATORS: ReadonlySet<string> = new Set(['=', '<>', '<', '<=', '>', '>=']);
+const KEYSET_ROWID = '__keyset_rowid';
 
 interface ResolvedTable {
   readonly name: string;
@@ -59,13 +74,28 @@ function isComparison(value: unknown): value is Comparison {
   return typeof value === 'object' && value !== null && !(value instanceof Uint8Array) && 'op' in value;
 }
 
-// Set by TenantStore's static block; only restricted-writer.ts should use it.
-let restrictedInsertHook: ((store: TenantStore, table: string, values: Values) => void) | undefined;
+export type RestrictedInsert = (store: TenantStore, table: string, values: Values) => void;
 
-/** Internal: the restricted writer's insert path (see restricted-writer.ts). */
-export function restrictedInsert(store: TenantStore, table: string, values: Values): void {
-  if (restrictedInsertHook === undefined) throw new StorageUsageError('restricted writer is unavailable');
-  restrictedInsertHook(store, table, values);
+// The insert path for tables whose writer is 'restricted' (the audit tables).
+// Set by TenantStore's static block and handed out exactly once.
+let restrictedInsertHook: RestrictedInsert | undefined;
+let restrictedInsertClaimed = false;
+
+/**
+ * One-shot: hand the restricted insert to its single owner,
+ * src/storage/audit/writer.ts, which claims it when it loads. Any second claim
+ * throws, so a module that claims it first makes the audit writer fail loudly
+ * instead of sharing the append path. tests/audit-chain/ checks statically that
+ * no other source file references this function.
+ */
+export function claimRestrictedInsert(): RestrictedInsert {
+  if (restrictedInsertClaimed || restrictedInsertHook === undefined) {
+    throw new StorageUsageError('the restricted insert has already been claimed');
+  }
+  restrictedInsertClaimed = true;
+  const hook = restrictedInsertHook;
+  restrictedInsertHook = undefined;
+  return hook;
 }
 
 export class TenantStore {
@@ -212,25 +242,99 @@ export class TenantStore {
     return rows[0];
   }
 
+  #orderBy(resolved: ResolvedTable, order: OrderBy): string[] {
+    return order.map(([column, direction]) => {
+      if (direction !== 'asc' && direction !== 'desc') throw new StorageUsageError('order direction must be asc or desc');
+      return `${this.#column(resolved, column)} ${direction.toUpperCase()}`;
+    });
+  }
+
+  /**
+   * Matching rows. With an explicit limit, at most that many rows are
+   * returned. Without one, more than MAX_LIST_LIMIT matches throw
+   * StorageLimitError instead of being cut off; use iterate() for large sets.
+   */
   list(table: string, where: Where = {}, options: ListOptions = {}): Row[] {
     const resolved = this.#table(table);
     const params: SQLInputValue[] = [];
     let sql = `SELECT * FROM ${quote(table)} WHERE ${this.#where(resolved, where, params)}`;
-    const order = options.orderBy ?? [];
-    if (order.length > 0) {
-      sql += ` ORDER BY ${order
-        .map(([column, direction]) => {
-          if (direction !== 'asc' && direction !== 'desc') throw new StorageUsageError('order direction must be asc or desc');
-          return `${this.#column(resolved, column)} ${direction.toUpperCase()}`;
-        })
-        .join(', ')}`;
-    }
+    const order = this.#orderBy(resolved, options.orderBy ?? []);
+    if (order.length > 0) sql += ` ORDER BY ${order.join(', ')}`;
+    const explicit = options.limit !== undefined;
     const limit = options.limit ?? MAX_LIST_LIMIT;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIST_LIMIT) {
       throw new StorageUsageError(`limit must be an integer in 1..${MAX_LIST_LIMIT}`);
     }
-    sql += ` LIMIT ${limit}`;
-    return this.#all(sql, params);
+    sql += ` LIMIT ${explicit ? limit : limit + 1}`;
+    const rows = this.#all(sql, params);
+    if (!explicit && rows.length > MAX_LIST_LIMIT) {
+      throw new StorageLimitError(`list of ${table} matched more than ${MAX_LIST_LIMIT} rows; use iterate()`);
+    }
+    return rows;
+  }
+
+  /**
+   * Every matching row exactly once, in a stable order: the orderBy columns
+   * (each must be NOT NULL), then rowid. Rows are fetched in keyset pages, so
+   * none is skipped or repeated at page boundaries, however many rows share a
+   * sort key.
+   */
+  iterate(table: string, where: Where = {}, options: IterateOptions = {}): Generator<Row, void, undefined> {
+    // Validate before the first page, so a bad call fails where it is made.
+    const resolved = this.#table(table);
+    const pageSize = options.pageSize ?? MAX_LIST_LIMIT;
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > MAX_LIST_LIMIT) {
+      throw new StorageUsageError(`page size must be an integer in 1..${MAX_LIST_LIMIT}`);
+    }
+    const order = options.orderBy ?? [];
+    this.#orderBy(resolved, order);
+    for (const [column] of order) {
+      if (!resolved.info.notNull.has(column)) throw new StorageUsageError(`iterate orders only by NOT NULL columns; ${table}.${column} is nullable`);
+    }
+    const keys: { readonly sql: string; readonly field: string; readonly descending: boolean }[] = [
+      ...order.map(([column, direction]) => ({ sql: quote(column), field: column, descending: direction === 'desc' })),
+      { sql: 'rowid', field: KEYSET_ROWID, descending: false },
+    ];
+    const orderSql = keys.map((key) => `${key.sql} ${key.descending ? 'DESC' : 'ASC'}`).join(', ');
+    const filterParams: SQLInputValue[] = [];
+    const filter = this.#where(resolved, where, filterParams);
+    return this.#pages(table, filter, filterParams, keys, orderSql, pageSize);
+  }
+
+  *#pages(
+    table: string,
+    filter: string,
+    filterParams: readonly SQLInputValue[],
+    keys: readonly { readonly sql: string; readonly field: string; readonly descending: boolean }[],
+    orderSql: string,
+    pageSize: number,
+  ): Generator<Row, void, undefined> {
+    let last: SQLInputValue[] | undefined;
+    for (;;) {
+      const params: SQLInputValue[] = [...filterParams];
+      let sql = `SELECT *, rowid AS ${quote(KEYSET_ROWID)} FROM ${quote(table)} WHERE ${filter}`;
+      if (last !== undefined) {
+        const after = last;
+        const branches = keys.map((key, index) => {
+          const equal = keys.slice(0, index).map((prior, priorIndex) => {
+            params.push(after[priorIndex] ?? null);
+            return `${prior.sql} = ?`;
+          });
+          params.push(after[index] ?? null);
+          return `(${[...equal, `${key.sql} ${key.descending ? '<' : '>'} ?`].join(' AND ')})`;
+        });
+        sql += ` AND (${branches.join(' OR ')})`;
+      }
+      sql += ` ORDER BY ${orderSql} LIMIT ${pageSize}`;
+      const rows = this.#all(sql, params);
+      const tail = rows[rows.length - 1];
+      if (tail !== undefined) last = keys.map((key) => tail[key.field] ?? null);
+      for (const row of rows) {
+        delete row[KEYSET_ROWID];
+        yield row;
+      }
+      if (rows.length < pageSize) return;
+    }
   }
 
   count(table: string, where: Where = {}): number {
@@ -247,6 +351,9 @@ export class TenantStore {
     this.#requireTransaction(`update of ${table}`);
     this.#requireNarrowing(resolved, where, 'update');
     this.#refuseTenantColumn(resolved, values);
+    if (Object.hasOwn(values, VERSION_COLUMN)) {
+      throw new StorageUsageError(`${table}: update never sets the version column; use compareAndSet`);
+    }
     const entries = Object.entries(values);
     if (entries.length === 0) throw new StorageUsageError(`update of ${table} sets no columns`);
     const params: SQLInputValue[] = [];
