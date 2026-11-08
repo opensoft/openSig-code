@@ -1,0 +1,20 @@
+{
+  "name": "opensig",
+  "version": "0.0.0",
+  "private": true,
+  "description": "openSig code leg: corporate signing MVP implementation and tests",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": "24.22.2"
+  },
+  "scripts": {
+    "verify": "tools/node/bin/node scripts/verify.mjs",
+    "typecheck": "tools/node/bin/node node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "test": "tools/node/bin/node scripts/verify.mjs all-unit"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "6.0.3"
+  }
+}
