@@ -766,7 +766,11 @@ function npmrcSettingLines(text) {
  * non-comment lines must be exactly the three frozen `key=true` lines, so a
  * quoted key, a section header or any extra key (script-shell, a registry,
  * an override) is a mismatch. Line content is never echoed; it may hold a
- * credential.
+ * credential. A-007 N3: CRLF is normalised to LF first, and any character
+ * other than tab, LF and printable ASCII is a mismatch, because npm's ini
+ * parser splits lines on [\r\n]+ and drops U+2028/U+2029: a lone CR or such a
+ * separator could otherwise hide a setting (script-shell=, ignore-scripts=false)
+ * inside what this comparison reads as a comment or a frozen line.
  */
 export function frozenConfigProblems(root) {
   const problems = [];
@@ -797,8 +801,11 @@ export function frozenConfigProblems(root) {
   } catch {
     problems.push('.npmrc is missing');
   }
-  if (npmrc !== null) {
-    const lines = npmrcSettingLines(npmrc);
+  const npmrcText = npmrc === null ? null : npmrc.replace(/\r\n/g, '\n');
+  if (npmrcText !== null && /[^\t\n\x20-\x7e]/.test(npmrcText)) {
+    problems.push('.npmrc holds a character other than tab, LF (or CRLF) and printable ASCII, such as a lone CR or U+2028; npm could read a setting there that the frozen comparison cannot see');
+  } else if (npmrcText !== null) {
+    const lines = npmrcSettingLines(npmrcText);
     const frozen = Object.entries(FROZEN_NPMRC).map(([key, value]) => `${key}=${value}`);
     const missing = frozen.filter((line) => !lines.includes(line));
     const unexpected = lines.map((line, index) => ({ line, index })).filter(({ line, index }) => !frozen.includes(line) || lines.indexOf(line) !== index);

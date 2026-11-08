@@ -4,7 +4,9 @@
 // case 27: preload flags in NODE_OPTIONS -> ENV_MISMATCH; cases 28-38: the
 // amendment A-006 hardening items M1, M2, M3, L1, L3, L4 and L6; L7 is checked
 // in case 20). Amendment A-007: case 28 names the seven release gates,
-// case 34 covers N1 (.npmrc compared as a whole) and case 17 covers N2.
+// case 34 covers N1 (.npmrc compared as a whole) and N3 (characters outside
+// tab, LF and printable ASCII), case 17 covers N2, and case 12 counts a zombie
+// test child as terminated (Codex [1]).
 //
 // FROZEN at the A-007 runner commit together with scripts/verify.mjs and
 // scripts/verify-modes.mjs.
@@ -14,7 +16,7 @@
 // override path; CLI argument handling is tested by spawning scripts/verify.mjs.
 
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -211,12 +213,53 @@ function sleepMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+/**
+ * True when `pid` no longer runs: it does not exist, or it is a zombie (state Z
+ * or X in /proc/<pid>/stat). A killed process whose parent never reaps it (an
+ * orphan under a container PID 1 that does not reap) stays a zombie, and
+ * `process.kill(pid, 0)` still succeeds for it, yet it has terminated.
+ */
 function processGone(pid) {
   try {
     process.kill(pid, 0);
-    return false;
   } catch (error) {
     return error.code === 'ESRCH';
+  }
+  let stat;
+  try {
+    stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+  } catch (error) {
+    return error.code === 'ENOENT';
+  }
+  const state = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0]; // the comm field may hold spaces or ')'
+  return state === 'Z' || state === 'X';
+}
+
+function processState(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0];
+  } catch {
+    return null;
+  }
+}
+
+/** Start an unreaped zombie: `sh` backgrounds a short sleep, then becomes a long sleep that never waits for it. */
+async function withZombie(check) {
+  const holder = spawn('sh', ['-c', 'sleep 0.1 & echo $!; exec sleep 30'], { stdio: ['ignore', 'pipe', 'ignore'] });
+  try {
+    const zombie = await new Promise((resolvePid, reject) => {
+      let out = '';
+      holder.stdout.on('data', (chunk) => {
+        out += chunk;
+        if (out.includes('\n')) resolvePid(Number(out.trim()));
+      });
+      holder.on('error', reject);
+    });
+    for (let i = 0; i < 100 && processState(zombie) !== 'Z'; i += 1) sleepMs(50);
+    await check(zombie);
+  } finally {
+    holder.kill('SIGKILL');
   }
 }
 
@@ -351,7 +394,7 @@ test('[RT-11] syntax or import error -> FAIL (1)', async () => {
   expectStatus(missingImport, STATUS.FAIL, 'import error');
 });
 
-test('[RT-12] timeout -> FAIL (1) and the process group is killed', async () => {
+test('[RT-12] timeout -> FAIL (1) and the process group is killed; a zombie counts as terminated (A-007 Codex [1])', async () => {
   executed += 1;
   const pidFile = join(scratch('pid'), 'pid');
   const source =
@@ -367,6 +410,14 @@ test('[RT-12] timeout -> FAIL (1) and the process group is killed', async () => 
   const pid = Number(readFileSync(pidFile, 'utf8'));
   for (let i = 0; i < 50 && !processGone(pid); i += 1) sleepMs(100);
   assert.ok(processGone(pid), `test process ${pid} was killed with its group`);
+
+  // Codex [1] (A-008): where PID 1 does not reap orphans, the killed test child
+  // stays a zombie and still answers signal 0. It has terminated, and counts so.
+  await withZombie((zombie) => {
+    assert.equal(processState(zombie), 'Z', 'a real unreaped zombie exists');
+    assert.doesNotThrow(() => process.kill(zombie, 0), 'signal 0 still reaches the zombie');
+    assert.ok(processGone(zombie), `zombie ${zombie} counts as terminated`);
+  });
 });
 
 test('[RT-13] below minTests -> VACUOUS (4)', async () => {
@@ -865,7 +916,7 @@ test('[RT-33] a tree changed during the run returns EVIDENCE_MISSING (M1)', asyn
   expectStatus(await engine(makeRoot({ 'tests/m/a.test.mjs': mutator }), aggregateRegistry, 'agg'), STATUS.EVIDENCE_MISSING, 'aggregate component');
 });
 
-test('[RT-34] frozen package.json, .npmrc and tsconfig.json values are enforced (M2, A-007 N1)', async () => {
+test('[RT-34] frozen package.json, .npmrc and tsconfig.json values are enforced (M2, A-007 N1, N3)', async () => {
   executed += 1;
   assert.deepEqual(frozenConfigProblems(REPO_ROOT), [], 'the code leg carries the frozen configuration');
   const registry = { m: leaf({ files: ['tests/m/**/*.test.mjs'] }) };
@@ -888,6 +939,9 @@ test('[RT-34] frozen package.json, .npmrc and tsconfig.json values are enforced 
     '.npmrc quoted value': { '.npmrc': 'engine-strict="true"\nsave-exact=true\nignore-scripts=true\n' },
     '.npmrc spaced assignment': { '.npmrc': 'engine-strict = true\nsave-exact=true\nignore-scripts=true\n' },
     '.npmrc duplicated frozen line': { '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=true\nsave-exact=true\n' },
+    // A-007 N3: npm's ini parser splits on [\r\n]+ and drops U+2028/U+2029.
+    '.npmrc CR-only line hides a key inside a comment': { '.npmrc': '# note\rscript-shell=/opt/synthetic-shell\nengine-strict=true\nsave-exact=true\nignore-scripts=true\n' },
+    '.npmrc U+2028 after a frozen line': { '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=true\u2028\n' },
     'tsconfig noCheck': { 'tsconfig.json': JSON.stringify({ ...tsconfig, compilerOptions: { ...tsconfig.compilerOptions, noCheck: true } }) },
     'tsconfig include narrowed': { 'tsconfig.json': JSON.stringify({ ...tsconfig, include: ['src'] }) },
   };
@@ -903,6 +957,18 @@ test('[RT-34] frozen package.json, .npmrc and tsconfig.json values are enforced 
   const quoted = frozenConfigProblems(makeRoot({ '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=true\nscript-shell=/opt/synthetic-shell\n' }));
   assert.ok(quoted.some((problem) => problem.startsWith('.npmrc must hold exactly the frozen lines')), quoted.join(' | '));
   assert.ok(!quoted.join(' ').includes('synthetic-shell'), 'the offending line is never echoed');
+  // N3: a CRLF file with the frozen lines passes; CR-only and U+2028/U+2029 variants do not, and nothing is echoed.
+  const crlf = 'engine-strict=true\r\nsave-exact=true\r\nignore-scripts=true\r\n';
+  assert.deepEqual(frozenConfigProblems(makeRoot({ '.npmrc': crlf })), [], 'CRLF line ends are normalised');
+  for (const text of [
+    '; note\rignore-scripts=false\nengine-strict=true\nsave-exact=true\nignore-scripts=true\n',
+    'engine-strict=true\nsave-exact=true\nignore-scripts=true\u2029\n',
+    'engine-strict=true\rsave-exact=true\rignore-scripts=true\r',
+  ]) {
+    const problems = frozenConfigProblems(makeRoot({ '.npmrc': text }));
+    assert.ok(problems.some((problem) => problem.startsWith('.npmrc holds a character other than tab')), JSON.stringify(problems));
+    assert.ok(!problems.join(' ').includes('ignore-scripts=false') && !/[\r\u2028\u2029]/.test(problems.join(' ')), 'no offending byte or line is echoed');
+  }
 });
 
 test('[RT-35] a mock identity at any depth of acceptance evidence returns FAIL (L1)', async () => {
