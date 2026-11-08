@@ -9,4 +9,4 @@ export { SUPPORTED_ALGORITHMS } from './jwt.ts';
 export { authorize, operationScheme, ROLE_MATRIX } from './matrix.ts';
 export type { AuthorizationResult, MatrixEntry, OperationId, Scheme } from './matrix.ts';
 export { createOperatorAuthenticator } from './operator.ts';
-export type { AuthenticationResult, HeaderBag, OperatorAuthenticator, OperatorPrincipal } from './operator.ts';
+export type { AuthenticationResult, HeaderBag, OperatorAuthenticator, OperatorAuthenticatorOptions, OperatorPrincipal, TenantPolicy } from './operator.ts';

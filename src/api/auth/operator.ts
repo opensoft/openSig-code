@@ -17,6 +17,17 @@
 //   `service`, and a human operator never holds `service`.
 // Failures are a uniform 401 with WWW-Authenticate: Bearer; the internal reason is for
 // tests and logs only and never echoes token content.
+//
+// Tenant role policy (A-008 P11): the canonical tenants table owns each tenant's
+// `allowed_roles`. This module never defines tenants a second time and never imports
+// storage; the caller injects a TenantPolicy that reads the canonical table. With a policy:
+// - a role outside the tenant's allowed_roles grants nothing: it is removed from the
+//   principal, so every operation that needs it is denied (403 from authorize());
+// - a tenant the policy does not know (no policy), a malformed policy value (anything but
+//   a list of known operator roles) or a policy that throws fails closed: 401, reason
+//   `tenant-policy`.
+// Without a policy the authenticator reports `policy: 'not-configured'`; the server wiring
+// (T031 follow-up, SEC-07) supplies the storage-backed policy and refuses to start without it.
 
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
@@ -41,6 +52,40 @@ export type AuthenticationResult =
   | { ok: false; status: 401; code: 'unauthenticated'; reason: string; wwwAuthenticate: string };
 
 export type HeaderBag = Readonly<Record<string, string | readonly string[] | undefined>>;
+
+/**
+ * The tenant role policy, read from the canonical tenants table by the caller. Returns the
+ * tenant's allowed operator roles, or null/undefined when the tenant is unknown.
+ */
+export interface TenantPolicy {
+  allowedRoles(tenantId: string): Iterable<string> | null | undefined;
+}
+
+export interface OperatorAuthenticatorOptions {
+  readonly tenantPolicy?: TenantPolicy;
+}
+
+const KNOWN_ROLES: readonly string[] = ['sender', 'tenant_admin', 'service'];
+const MAX_POLICY_ROLES = 16;
+
+/** The tenant's allowed roles, or null when the policy is missing, unknown or malformed. */
+function allowedRolesOf(policy: TenantPolicy, tenantId: string): ReadonlySet<OperatorRole> | null {
+  let value: unknown;
+  try {
+    value = policy.allowedRoles(tenantId);
+  } catch {
+    return null;
+  }
+  if (value === null || value === undefined || typeof value === 'string' || typeof (value as Iterable<unknown>)[Symbol.iterator] !== 'function') return null;
+  const roles = new Set<OperatorRole>();
+  let count = 0;
+  for (const role of value as Iterable<unknown>) {
+    count += 1;
+    if (count > MAX_POLICY_ROLES || typeof role !== 'string' || !KNOWN_ROLES.includes(role)) return null;
+    roles.add(role as OperatorRole);
+  }
+  return roles;
+}
 
 const BEARER = /^Bearer[ ]+([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/i;
 
@@ -123,13 +168,28 @@ function evaluate(decoded: DecodedToken, tenant: TenantIdentity, skew: number, n
 }
 
 export interface OperatorAuthenticator {
+  /** Whether a tenant role policy is enforced. */
+  readonly policy: 'enforced' | 'not-configured';
   /** Authenticate from request headers; only `authorization` is read. */
   authenticate(headers: HeaderBag, nowSeconds?: number): AuthenticationResult;
   /** Authenticate a bare compact token (the value after "Bearer "). */
   verifyToken(token: string, nowSeconds?: number): AuthenticationResult;
 }
 
-export function createOperatorAuthenticator(config: OperatorAuthConfig): OperatorAuthenticator {
+function applyPolicy(principal: OperatorPrincipal, policy: TenantPolicy | undefined): AuthenticationResult {
+  if (policy === undefined) return { ok: true, principal };
+  const allowed = allowedRolesOf(policy, principal.tenant_id);
+  if (allowed === null) return unauthenticated('tenant-policy', true);
+  const roles = principal.roles.filter((role) => allowed.has(role));
+  if (roles.length === principal.roles.length) return { ok: true, principal };
+  return { ok: true, principal: Object.freeze({ ...principal, roles: Object.freeze(roles) }) };
+}
+
+export function createOperatorAuthenticator(config: OperatorAuthConfig, options: OperatorAuthenticatorOptions = {}): OperatorAuthenticator {
+  const tenantPolicy = options.tenantPolicy;
+  if (tenantPolicy !== undefined && (typeof tenantPolicy !== 'object' || tenantPolicy === null || typeof tenantPolicy.allowedRoles !== 'function')) {
+    throw new TypeError('tenantPolicy must provide allowedRoles(tenantId)');
+  }
   const verifyToken = (token: string, nowSeconds: number = Date.now() / 1000): AuthenticationResult => {
     let decoded: DecodedToken;
     try {
@@ -143,13 +203,14 @@ export function createOperatorAuthenticator(config: OperatorAuthConfig): Operato
     let reason = 'issuer';
     for (const tenant of candidates) {
       const result = evaluate(decoded, tenant, config.clockSkewSeconds, nowSeconds);
-      if (typeof result !== 'string') return { ok: true, principal: result };
+      if (typeof result !== 'string') return applyPolicy(result, tenantPolicy);
       reason = result;
     }
     return unauthenticated(reason, true);
   };
 
   return {
+    policy: tenantPolicy === undefined ? 'not-configured' : 'enforced',
     verifyToken,
     authenticate(headers: HeaderBag, nowSeconds?: number): AuthenticationResult {
       let header = headers.authorization;
