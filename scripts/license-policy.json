@@ -1,0 +1,5 @@
+{
+  "description": "openSig application-dependency license gate (spec plan.md, Pending owner decision: application gate; FR-011). Applies to every shipped npm package and every third-party asset copied into dist/. Non-shipped development tools are inventoried and reported, not gated. Platform items are POLICY-PENDING and are not covered by this file.",
+  "allowed": ["MIT", "Apache-2.0"],
+  "allowedExceptions": []
+}
