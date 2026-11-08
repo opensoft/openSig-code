@@ -595,6 +595,66 @@ test('[NS-06] command substitution, ternary branches, type-only annotations and 
   assert.deepEqual(findingsOf(result), []);
 });
 
+test('[NS-08] a path deleted from both the index and the working tree has no findings; a remaining copy is still scanned', () => {
+  const repo = newRepo();
+  put(repo, '.env', `MODE=${randomValue()}\n`);
+  put(repo, 'store/client.p12', randomBytes(64));
+  put(repo, 'fixtures/synthetic/mark.png', pngBytes());
+  put(repo, 'conf/keep.p12', randomBytes(64));
+  put(repo, 'services/.env.local', 'MODE=synthetic\n');
+  put(repo, 'README.md', '# Synthetic repository\n');
+  track(repo, '.');
+  commit(repo);
+  git(repo, 'rm', '-q', '--', '.env', 'store/client.p12', 'fixtures/synthetic/mark.png'); // staged deletions, gone from disk
+  git(repo, 'rm', '-q', '--cached', '--', 'conf/keep.p12'); // staged removal, copy kept on disk
+  rmSync(join(repo, 'services', '.env.local')); // deleted on disk only, still in the index
+  const result = scan(repo);
+  assert.equal(result.code, 1, result.stdout);
+  for (const file of ['.env', 'store/client.p12', 'fixtures/synthetic/mark.png']) expectNoFinding(result, file);
+  expectFinding(result, 'pkcs12-content', 'conf/keep.p12', 'path');
+  expectFinding(result, 'env-file', 'services/.env.local', 'path');
+  assert.match(result.lines.at(-1), /^no-secrets: FAIL findings=\d+ files=2 scanned=3$/);
+
+  const onlyDeleted = newRepo();
+  put(onlyDeleted, '.env', 'MODE=synthetic\n');
+  put(onlyDeleted, 'README.md', '# Synthetic repository\n');
+  track(onlyDeleted, '.');
+  commit(onlyDeleted);
+  git(onlyDeleted, 'rm', '-q', '--', '.env');
+  const clean = scan(onlyDeleted);
+  assert.equal(clean.code, 0, clean.stdout);
+  assert.deepEqual(clean.lines, ['no-secrets: PASS findings=0 scanned=1']);
+});
+
+test('[NS-09] quoted literals spelt like variable names are reported; unquoted references and placeholders are not', () => {
+  const repo = newRepo();
+  const upper = (length) => [...randomBytes(length)].map((byte) => 'ABCDEFGHJKLMNPQRSTUVWXYZ'[byte % 24]).join('');
+  const digits = (length) => [...randomBytes(length)].map((byte) => String(byte % 10)).join('');
+  const values = [`${upper(4)}_${digits(10)}${upper(3)}`, `${upper(6)}_${upper(5)}_${upper(4)}`, `${upper(5)}_${digits(4)}`, `${upper(4)}_${upper(4)}`];
+  const samples = {
+    'conf/client.json': `{"password":"${values[0]}"}\n`,
+    'src/settings.ts': `export const apiKey = '${values[1]}';\n`,
+    'deploy/values.yaml': `api_token: "${values[2]}"\n`,
+    'app/settings.py': `CLIENT_SECRET = "${values[3]}"\n`,
+  };
+  for (const [file, content] of Object.entries(samples)) put(repo, file, content);
+  put(
+    repo,
+    'deploy/references.yaml',
+    ['api_token: OPENSIG_API_TOKEN', 'client_secret: process.env.OPENSIG_CLIENT_SECRET', 'webhook_secret: import.meta.env.OPENSIG_WEBHOOK_SECRET', 'api_key: "${OPENSIG_API_KEY}"', ''].join('\n'),
+  );
+  put(repo, 'scripts/env.sh', 'export API_KEY=$OPENSIG_API_KEY\nexport DB_PASSWORD="$OPENSIG_DB_PASSWORD"\n');
+  put(repo, 'conf/names.json', '{"password": "PASSWORD", "token_count": "SIXTEEN_TOKENS"}\n');
+  track(repo, '.');
+  const result = scan(repo);
+  assert.equal(result.code, 1);
+  for (const file of Object.keys(samples)) expectFinding(result, 'secret-assignment', file, 'index');
+  expectNoFinding(result, 'deploy/references.yaml');
+  expectNoFinding(result, 'scripts/env.sh');
+  expectNoFinding(result, 'conf/names.json');
+  expectNoContent(result, values);
+});
+
 test('staged and working-tree content of tracked files is scanned; untracked files are not', () => {
   const repo = newRepo();
   put(repo, 'conf/app.yaml', 'mode: development\n');

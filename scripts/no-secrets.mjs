@@ -7,7 +7,9 @@
 //
 // Paths scanned: `git ls-files` plus `git diff --cached --name-only`. For each
 // path the staged (index) content is scanned and, where it differs, the
-// working-tree content too. Untracked files are not scanned.
+// working-tree content too. Untracked files are not scanned. A path removed
+// from both the index and the working tree (a staged deletion) is skipped:
+// nothing of it remains to commit. A copy left in either place is scanned.
 //
 // Rules (stable names):
 //   private-key-pem    PEM private-key blocks of any type: on their own lines,
@@ -25,7 +27,12 @@
 //   secret-assignment  a known secret name assigned a literal value, including
 //                      typed declarations (TypeScript, Python, Rust, Go), Go
 //                      ":=", command-line flags (--password=..., -Dx.password=...)
-//                      and a password in URL userinfo (scheme://user:pw@host)
+//                      and a password in URL userinfo (scheme://user:pw@host).
+//                      A quoted value is always a literal, even when spelt
+//                      like a variable name; only unquoted values can be
+//                      variable references (OTHER_VAR, process.env.X).
+//                      Interpolation placeholders (${VAR}, $VAR, $(cmd),
+//                      {{x}}) are never literals.
 //
 // Content encodings. The PEM and PKCS#12 rules run on every file, binary or
 // not, and also on its UTF-16 decoding whenever it contains a NUL byte. Text
@@ -103,6 +110,16 @@ function readBlobs(root, shas) {
     pos = newline + 1 + length + 1;
   }
   return blobs;
+}
+
+/** True when anything (file, link, directory, special file) exists at `path` in the working tree. */
+function existsInWorktree(root, path) {
+  try {
+    lstatSync(join(root, path));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function readWorktree(root, path) {
@@ -422,8 +439,13 @@ const BARE_VALUE_EXTENSIONS = new Set(['', '.ini', '.cfg', '.conf', '.properties
 // Files where a backtick is shell command substitution, not a string literal.
 const SHELL_EXTENSIONS = new Set(['', '.sh', '.bash', '.zsh']);
 
-const REFERENCE_VALUE =
-  /^(?:\$\{[^}]*\}|\$\(.*\)|\$[A-Za-z_][A-Za-z0-9_]*|\{\{.*\}\}|<[^>]*>|%[A-Za-z_][A-Za-z0-9_]*%|(?:process\.env|import\.meta\.env)\b.*)$/;
+// Interpolation placeholders: they expand even inside quotes (${VAR}, $(command),
+// $VAR, {{name}}, <name>, %VAR%), so they never count as literals.
+const PLACEHOLDER_VALUE = /^(?:\$\{[^}]*\}|\$\(.*\)|\$[A-Za-z_][A-Za-z0-9_]*|\{\{.*\}\}|<[^>]*>|%[A-Za-z_][A-Za-z0-9_]*%)$/;
+// Variable references: only an unquoted value can refer to another variable
+// (OTHER_VAR, process.env.X, import.meta.env.X). Quoted, the same spelling is
+// a literal string (Codex [3], NS-09).
+const REFERENCE_EXPRESSION = /^(?:process\.env|import\.meta\.env)\b/;
 // A shell expansion or command substitution at the start of a value ($VAR,
 // ${VAR}, $(command)), even when an unquoted value is cut at its first space.
 const EXPANSION_PREFIX = /^\$[A-Za-z_({]/;
@@ -451,11 +473,16 @@ function namesVariable(value) {
   return value.includes('_') || (value.length < 16 && !/[0-9]/.test(value));
 }
 
-function isLiteralSecret(value, name) {
+/**
+ * Whether `value`, assigned to secret name `name`, is a literal secret.
+ * `quoted` says whether the value was written inside quotes: a variable
+ * reference is exempt only when it is unquoted.
+ */
+function isLiteralSecret(value, name, { quoted }) {
   if (value.length < 8) return false;
   if (value.includes('${') || EXPANSION_PREFIX.test(value)) return false;
-  if (REFERENCE_VALUE.test(value) || PLACEHOLDER_WORDS.test(value)) return false;
-  if (namesVariable(value)) return false;
+  if (PLACEHOLDER_VALUE.test(value) || PLACEHOLDER_WORDS.test(value)) return false;
+  if (!quoted && (namesVariable(value) || REFERENCE_EXPRESSION.test(value))) return false;
   if (/^(?:true|false|null|none|undefined)$/i.test(value)) return false;
   if (value.toLowerCase() === name.toLowerCase()) return false;
   return true;
@@ -463,7 +490,7 @@ function isLiteralSecret(value, name) {
 
 function isLiteralUrlPassword(user, password) {
   if (password.length < 4 || /^\d{1,5}$/.test(password)) return false; // too short, or host:port
-  if (password.includes('${') || EXPANSION_PREFIX.test(password) || REFERENCE_VALUE.test(password)) return false;
+  if (password.includes('${') || EXPANSION_PREFIX.test(password) || PLACEHOLDER_VALUE.test(password) || REFERENCE_EXPRESSION.test(password)) return false;
   if (PLACEHOLDER_WORDS.test(password) || URL_PASSWORD_PLACEHOLDER.test(password)) return false;
   return password.toLowerCase() !== user.toLowerCase();
 }
@@ -493,12 +520,12 @@ function assignmentIndexes(text, { bare, shell }) {
     const quoted = match[5] ?? match[6] ?? backtick;
     const bareCounts = bare || (flag !== undefined && operator === '=');
     const value = quoted ?? (bareCounts ? match[8] : undefined);
-    if (value === undefined || !isLiteralSecret(value, name)) continue;
+    if (value === undefined || !isLiteralSecret(value, name, { quoted: quoted !== undefined })) continue;
     if (add(match.index)) return indexes;
   }
   for (const match of text.matchAll(GO_TYPED)) {
     const value = match[2] ?? match[3];
-    if (!isSecretName(match[1]) || !isLiteralSecret(value, match[1])) continue;
+    if (!isSecretName(match[1]) || !isLiteralSecret(value, match[1], { quoted: true })) continue;
     if (add(match.index)) return indexes;
   }
   for (const match of text.matchAll(URL_CREDENTIALS)) {
@@ -612,7 +639,13 @@ export function scanRepository(dir) {
     findings.push(finding);
   };
 
+  let scanned = 0;
   for (const path of paths) {
+    // A path removed from both the index and the working tree (a staged
+    // deletion) has nothing left to commit, so no rule applies to it (Codex
+    // [4], NS-08). A copy left in either place is still scanned.
+    if (!byPath.has(path) && !existsInWorktree(root, path)) continue;
+    scanned += 1;
     for (const finding of pathFindings(path)) add({ ...finding, file: path, source: 'path' });
     const contents = [];
     for (const entry of byPath.get(path) ?? []) {
@@ -625,7 +658,7 @@ export function scanRepository(dir) {
       for (const finding of contentFindings(path, content.buffer)) add({ ...finding, file: path, source: content.source });
     }
   }
-  return { root, scanned: paths.length, findings };
+  return { root, scanned, findings };
 }
 
 function printablePath(path) {
