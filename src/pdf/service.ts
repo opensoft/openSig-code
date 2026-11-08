@@ -17,6 +17,13 @@
 //   rejection; the child is always gone when parsePdf() settles.
 // - Output: one JSON line, bounded by maxReportBytes, validated before it is returned.
 //
+// - Network (RECORDED DEVIATION, accepted for the MVP): the child has no OS-level network
+//   block. The Node 24 permission model has no network scope (a loopback connect from a
+//   --permission child still goes out), and no host-specific sandbox is added. Network
+//   isolation rests on the PL-12 import boundary (src/pdf/ imports no net, http, https,
+//   dns, tls, dgram or http2 module; the worker's closure is node:buffer and node:zlib) and
+//   on the empty child environment.
+//
 // Linux only (the pinned runtime is linux-x64).
 
 import { Buffer } from 'node:buffer';

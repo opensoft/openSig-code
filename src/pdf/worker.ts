@@ -9,6 +9,11 @@
 // stdin (bounded by maxBytes), parses them and writes exactly one JSON line to stdout.
 // It refuses to parse unless the Node permission model is active with no fs-write,
 // child-process or worker grant.
+//
+// RECORDED DEVIATION (MVP): the permission model does not block network access, and there is
+// no OS-level network block for this process. Isolation from the network rests on the PL-12
+// import boundary (this module's closure imports only node:buffer and node:zlib) and on
+// the empty environment; see src/pdf/service.ts.
 
 import { Buffer } from 'node:buffer';
 
