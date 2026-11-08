@@ -25,3 +25,12 @@ navigation; authority travels in grants, and a project that keeps spec and
 code in one repository is reviewed identically.
 
 Topic: `xf-project-opensig`.
+
+## Intended components
+
+- **openSig**: envelope workflow, API, permissions and evidence.
+- **openAutograph**: review, consent, authenticated human approval and visible signatures.
+- **openCryptograph**: certificate-backed signatures, organizational seals, timestamps and verification.
+- Consumer adapters for Hermes, openChart and openPractice; optional ledger adapters.
+
+All original implementation will use Apache-2.0, with MIT/Apache-only shipped third-party materials. This repository currently contains a scaffold, not a signing runtime. Canonical architecture, OpenSpec changes and Speckit feature plans belong in the spec leg; do not duplicate their task lists here. See the [implementation plan](https://github.com/opensoft/openSig-spec/blob/docs/opensig-foundation/ideation/brainstorm/opensig-implementation-plan.md).
