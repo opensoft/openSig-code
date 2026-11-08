@@ -1,0 +1,120 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 3 0 R >>
+endobj
+2 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+3 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 11 0 R 13 0 R] /Count 5 /MediaBox [0 0 612 792] /Rotate 90 >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 3 0 R /Resources << /Font << /F1 2 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 122 >>
+stream
+BT
+/F1 11 Tf
+15 TL
+72 720 Td
+(Rotated page fixture: page 1) Tj
+T*
+(Effective /Rotate 90, displayed 792 x 612 points) Tj
+ET
+endstream
+endobj
+6 0 obj
+<< /Type /Pages /Parent 3 0 R /Kids [7 0 R 9 0 R] /Count 2 /Rotate 270 >>
+endobj
+7 0 obj
+<< /Type /Page /Parent 6 0 R /Resources << /Font << /F1 2 0 R >> >> /Contents 8 0 R >>
+endobj
+8 0 obj
+<< /Length 123 >>
+stream
+BT
+/F1 11 Tf
+15 TL
+72 720 Td
+(Rotated page fixture: page 2) Tj
+T*
+(Effective /Rotate 270, displayed 792 x 612 points) Tj
+ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 6 0 R /Rotate 180 /Resources << /Font << /F1 2 0 R >> >> /Contents 10 0 R >>
+endobj
+10 0 obj
+<< /Length 123 >>
+stream
+BT
+/F1 11 Tf
+15 TL
+72 720 Td
+(Rotated page fixture: page 3) Tj
+T*
+(Effective /Rotate 180, displayed 612 x 792 points) Tj
+ET
+endstream
+endobj
+11 0 obj
+<< /Type /Page /Parent 3 0 R /MediaBox [0 0 842 595] /Rotate 0 /Resources << /Font << /F1 2 0 R >> >> /Contents 12 0 R >>
+endobj
+12 0 obj
+<< /Length 121 >>
+stream
+BT
+/F1 11 Tf
+15 TL
+72 523 Td
+(Rotated page fixture: page 4) Tj
+T*
+(Effective /Rotate 0, displayed 842 x 595 points) Tj
+ET
+endstream
+endobj
+13 0 obj
+<< /Type /Page /Parent 3 0 R /MediaBox [36 36 648 828] /Rotate -90 /Resources << /Font << /F1 2 0 R >> >> /Contents 14 0 R >>
+endobj
+14 0 obj
+<< /Length 124 >>
+stream
+BT
+/F1 11 Tf
+15 TL
+108 756 Td
+(Rotated page fixture: page 5) Tj
+T*
+(Effective /Rotate 270, displayed 792 x 612 points) Tj
+ET
+endstream
+endobj
+15 0 obj
+<< /Title (Synthetic rotated-pages fixture) /Producer (openSig synthetic fixture generator) >>
+endobj
+xref
+0 16
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000161 00000 n 
+0000000273 00000 n 
+0000000375 00000 n 
+0000000548 00000 n 
+0000000637 00000 n 
+0000000739 00000 n 
+0000000913 00000 n 
+0000001028 00000 n 
+0000001203 00000 n 
+0000001341 00000 n 
+0000001514 00000 n 
+0000001656 00000 n 
+0000001832 00000 n 
+trailer
+<< /Size 16 /Root 1 0 R /Info 15 0 R /ID [<49785688d763420f9260b9a4834f4a1a> <49785688d763420f9260b9a4834f4a1a>] >>
+startxref
+1943
+%%EOF

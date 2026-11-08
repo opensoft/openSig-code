@@ -1,0 +1,1714 @@
+{
+  "schema": "opensig.fixtures.documents.v1",
+  "generator": "scripts/gen-fixtures.mjs",
+  "synthetic": true,
+  "notice": "Synthetic documents generated deterministically for tests. No keys, no signature values, no images and no embedded fonts. Documents with committed=false are generated on demand.",
+  "limits": {
+    "max_bytes": 10485760,
+    "max_pages": 50
+  },
+  "documents": [
+    {
+      "file": "agreement-multipage.pdf",
+      "kind": "multi-page",
+      "committed": true,
+      "bytes": 2921,
+      "sha256": "4fe5e977eda4b1be87b6449810a01c7fe5221c286fd7fd65cd20a9df5b7f168e",
+      "xref": "table",
+      "pages": [
+        {
+          "number": 1,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 2,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 3,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        }
+      ],
+      "expect": {
+        "outcome": "accept",
+        "reason": null
+      },
+      "defect": null,
+      "derived_from": null,
+      "description": "Three-page synthetic corporate agreement with signature and date boxes for two recipients on page 3"
+    },
+    {
+      "file": "agreement-xref-stream.pdf",
+      "kind": "multi-page",
+      "committed": true,
+      "bytes": 2865,
+      "sha256": "9bd858332eb912fe160f6825983e9ed3840b041ebc2ac72bb486ca28c44b635b",
+      "xref": "stream",
+      "pages": [
+        {
+          "number": 1,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 2,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 3,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        }
+      ],
+      "expect": {
+        "outcome": "accept",
+        "reason": null
+      },
+      "defect": null,
+      "derived_from": null,
+      "description": "The same agreement serialized with an uncompressed cross-reference stream and object stream"
+    },
+    {
+      "file": "rotated-pages.pdf",
+      "kind": "rotated",
+      "committed": true,
+      "bytes": 2418,
+      "sha256": "6d57b80885db2c9c2dbb09379657344904e150611940f35e3516a80f1355ab33",
+      "xref": "table",
+      "pages": [
+        {
+          "number": 1,
+          "width": 792,
+          "height": 612,
+          "rotate": 90,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 2,
+          "width": 792,
+          "height": 612,
+          "rotate": 270,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 3,
+          "width": 612,
+          "height": 792,
+          "rotate": 180,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 4,
+          "width": 842,
+          "height": 595,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            842,
+            595
+          ]
+        },
+        {
+          "number": 5,
+          "width": 792,
+          "height": 612,
+          "rotate": 270,
+          "media_box": [
+            36,
+            36,
+            648,
+            828
+          ]
+        }
+      ],
+      "expect": {
+        "outcome": "accept",
+        "reason": null
+      },
+      "defect": null,
+      "derived_from": null,
+      "description": "Five pages with inherited and overridden /Rotate and /MediaBox, a landscape page, a non-zero media box origin and /Rotate -90"
+    },
+    {
+      "file": "single-page.pdf",
+      "kind": "single-page",
+      "committed": true,
+      "bytes": 881,
+      "sha256": "d02135eaf9e1b092a31b21a85e315482c92df92a83f324dc28d2ed6ca73475fd",
+      "xref": "table",
+      "pages": [
+        {
+          "number": 1,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        }
+      ],
+      "expect": {
+        "outcome": "accept",
+        "reason": null
+      },
+      "defect": null,
+      "derived_from": null,
+      "description": "Minimal valid single-page document; the base of the malformed variants"
+    },
+    {
+      "file": "pages-50.pdf",
+      "kind": "page-limit",
+      "committed": true,
+      "bytes": 15209,
+      "sha256": "b57eaab61b31108cbefaa380315e43590117c6c675adcc7d816ee30829f89de8",
+      "xref": "table",
+      "pages": [
+        {
+          "number": 1,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 2,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 3,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 4,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 5,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 6,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 7,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 8,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 9,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 10,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 11,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 12,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 13,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 14,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 15,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 16,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 17,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 18,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 19,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 20,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 21,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 22,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 23,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 24,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 25,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 26,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 27,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 28,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 29,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 30,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 31,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 32,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 33,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 34,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 35,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 36,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 37,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 38,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 39,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 40,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 41,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 42,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 43,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 44,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 45,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 46,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 47,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 48,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 49,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 50,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        }
+      ],
+      "expect": {
+        "outcome": "accept",
+        "reason": null
+      },
+      "defect": null,
+      "derived_from": null,
+      "description": "Exactly 50 pages (the limit) in a nested page tree"
+    },
+    {
+      "file": "pages-51.pdf",
+      "kind": "page-limit",
+      "committed": true,
+      "bytes": 15592,
+      "sha256": "55fef49f2223cb7d686cdeae74e9774541f72c1261593586085d7145ab714ec0",
+      "xref": "table",
+      "pages": [
+        {
+          "number": 1,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 2,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 3,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 4,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 5,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 6,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 7,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 8,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 9,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 10,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 11,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 12,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 13,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 14,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 15,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 16,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 17,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 18,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 19,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 20,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 21,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 22,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 23,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 24,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 25,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 26,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 27,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 28,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 29,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 30,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 31,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 32,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 33,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 34,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 35,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 36,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 37,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 38,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 39,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 40,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 41,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 42,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 43,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 44,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 45,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 46,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 47,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 48,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 49,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 50,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        },
+        {
+          "number": 51,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        }
+      ],
+      "expect": {
+        "outcome": "reject",
+        "reason": "page-limit"
+      },
+      "defect": null,
+      "derived_from": null,
+      "description": "51 pages, one over the limit, in a nested page tree"
+    },
+    {
+      "file": "encrypted-flag.pdf",
+      "kind": "encrypted-flag",
+      "committed": true,
+      "bytes": 1189,
+      "sha256": "3ab4428691c839ef79066205a319bfbce2f1c0b11de4654c1c53b5dc635b2921",
+      "xref": "table",
+      "pages": [
+        {
+          "number": 1,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        }
+      ],
+      "expect": {
+        "outcome": "reject",
+        "reason": "encrypted"
+      },
+      "defect": null,
+      "derived_from": null,
+      "description": "Single page whose trailer names a Standard security handler /Encrypt dictionary"
+    },
+    {
+      "file": "already-signed.pdf",
+      "kind": "already-signed",
+      "committed": true,
+      "bytes": 3407,
+      "sha256": "09a2cc51b3cd9cfdab37cade1c9b936a40028279bc090f207f3a545e23927e25",
+      "xref": "table",
+      "pages": [
+        {
+          "number": 1,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        }
+      ],
+      "expect": {
+        "outcome": "reject",
+        "reason": "already-signed"
+      },
+      "defect": null,
+      "derived_from": null,
+      "description": "Single page with an AcroForm signature field whose /Sig value has a real /ByteRange and a zero-filled /Contents"
+    },
+    {
+      "file": "malformed-missing-header.pdf",
+      "kind": "malformed",
+      "committed": true,
+      "bytes": 881,
+      "sha256": "4c962205ea2bcd0c572386080b91c8c23b0c7e54e9d35e33042bf066439b3f3b",
+      "xref": null,
+      "pages": null,
+      "expect": {
+        "outcome": "reject",
+        "reason": "malformed"
+      },
+      "defect": "missing-header",
+      "derived_from": "single-page.pdf",
+      "description": "The %PDF- header is replaced by same-length bytes; every offset is unchanged"
+    },
+    {
+      "file": "malformed-truncated.pdf",
+      "kind": "malformed",
+      "committed": true,
+      "bytes": 440,
+      "sha256": "0fddc8219cef438423b0cd94ac15b7b5bc31ead99f2c9dd214bc8334fe8d50a5",
+      "xref": null,
+      "pages": null,
+      "expect": {
+        "outcome": "reject",
+        "reason": "malformed"
+      },
+      "defect": "truncated",
+      "derived_from": "single-page.pdf",
+      "description": "The first half of single-page.pdf: no cross-reference section, trailer or %%EOF"
+    },
+    {
+      "file": "malformed-startxref-out-of-range.pdf",
+      "kind": "malformed",
+      "committed": true,
+      "bytes": 882,
+      "sha256": "fa7e1b88b5f2bf649b02bcc0a55d890afa5ab3bcac8f9e8315b5e97537603da0",
+      "xref": null,
+      "pages": null,
+      "expect": {
+        "outcome": "reject",
+        "reason": "malformed"
+      },
+      "defect": "startxref-out-of-range",
+      "derived_from": "single-page.pdf",
+      "description": "startxref points beyond the end of the file"
+    },
+    {
+      "file": "malformed-xref-offset-mismatch.pdf",
+      "kind": "malformed",
+      "committed": true,
+      "bytes": 881,
+      "sha256": "20f31f4eaff629b77315079622fa950da5c9c596bf6229980e4367c9d44ce896",
+      "xref": null,
+      "pages": null,
+      "expect": {
+        "outcome": "reject",
+        "reason": "malformed"
+      },
+      "defect": "xref-offset-mismatch",
+      "derived_from": "single-page.pdf",
+      "description": "The page object cross-reference entry is shifted by three bytes"
+    },
+    {
+      "file": "malformed-unterminated-dictionary.pdf",
+      "kind": "malformed",
+      "committed": true,
+      "bytes": 881,
+      "sha256": "35ed02790fc7f324b9ac59d7faa7a020c78223508660b5a05778e5c1af40cf43",
+      "xref": null,
+      "pages": null,
+      "expect": {
+        "outcome": "reject",
+        "reason": "malformed"
+      },
+      "defect": "unterminated-dictionary",
+      "derived_from": "single-page.pdf",
+      "description": "The page dictionary closing >> is replaced by spaces"
+    },
+    {
+      "file": "malformed-stream-length-overrun.pdf",
+      "kind": "malformed",
+      "committed": true,
+      "bytes": 881,
+      "sha256": "885eeaf8bf7f74d3989f51eea8e91a6a6e72c6c058a9817e3b6fc28a1a18efb9",
+      "xref": null,
+      "pages": null,
+      "expect": {
+        "outcome": "reject",
+        "reason": "malformed"
+      },
+      "defect": "stream-length-overrun",
+      "derived_from": "single-page.pdf",
+      "description": "The content stream /Length overruns the stream data"
+    },
+    {
+      "file": "malformed-xref-prev-cycle.pdf",
+      "kind": "malformed",
+      "committed": true,
+      "bytes": 1199,
+      "sha256": "420b1e0ca82b3ef9c72a751970338939e41f99b13e5025904b67156fe744fdfe",
+      "xref": null,
+      "pages": null,
+      "expect": {
+        "outcome": "reject",
+        "reason": "malformed"
+      },
+      "defect": "xref-prev-cycle",
+      "derived_from": "single-page.pdf",
+      "description": "An appended update whose trailer /Prev names its own cross-reference section"
+    },
+    {
+      "file": "malformed-page-tree-cycle.pdf",
+      "kind": "malformed",
+      "committed": true,
+      "bytes": 909,
+      "sha256": "1c2df5e112011c90029706b2ebd1e2a1c7e2b9dd066cd1f17d2e1eb6bfb49800",
+      "xref": null,
+      "pages": null,
+      "expect": {
+        "outcome": "reject",
+        "reason": "malformed"
+      },
+      "defect": "page-tree-cycle",
+      "derived_from": null,
+      "description": "The root page tree node lists itself in /Kids"
+    },
+    {
+      "file": "size-at-limit.pdf",
+      "kind": "size-limit",
+      "committed": false,
+      "bytes": 10485760,
+      "sha256": "d23d741c062399c7cc0db099533ca10ee3b235ab8658dc63664ab20b2b1d8625",
+      "xref": "table",
+      "pages": [
+        {
+          "number": 1,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        }
+      ],
+      "expect": {
+        "outcome": "accept",
+        "reason": null
+      },
+      "defect": null,
+      "derived_from": null,
+      "description": "Valid single page padded to exactly 10485760 bytes (the limit); generated on demand"
+    },
+    {
+      "file": "oversized.pdf",
+      "kind": "oversized",
+      "committed": false,
+      "bytes": 10485761,
+      "sha256": "1a72a55c204539ec20ba0a0def79e385a980cf3e1fd0b925bdce474b4bf2046a",
+      "xref": "table",
+      "pages": [
+        {
+          "number": 1,
+          "width": 612,
+          "height": 792,
+          "rotate": 0,
+          "media_box": [
+            0,
+            0,
+            612,
+            792
+          ]
+        }
+      ],
+      "expect": {
+        "outcome": "reject",
+        "reason": "size-limit"
+      },
+      "defect": null,
+      "derived_from": null,
+      "description": "Valid single page padded to 10485761 bytes, one over the limit; generated on demand"
+    }
+  ]
+}
