@@ -17,21 +17,37 @@
 // scripts/license-policy.json (exactly MIT and Apache-2.0): an OR passes when
 // one alternative is fully allowed, an AND needs every term allowed, WITH
 // exceptions and `+` are not allowed. Missing or unknown licenses fail. A
-// shipped package may carry at most one root license file (LICENSE*, LICENCE*
-// or COPYING*) and at most one root NOTICE*; any other such file anywhere in
-// the package is an extra license file and fails.
+// legacy `licenses` array with several entries means all of them (AND), and
+// a package declaring both `license` and `licenses` is held to both.
+//
+// License texts. A license text is any file whose name contains licence,
+// license, notice, copying, copyright or third-party/thirdparty (source-code
+// files such as license.js excepted), and any file under a licenses/ or
+// licences/ directory. A shipped package may carry one root license file
+// (LICENSE*, LICENCE* or COPYING*) and one root NOTICE*; a package declaring
+// exactly MIT and Apache-2.0 (with OR or AND) may carry one root license file
+// for each. Every other license text anywhere in the package (a bundle's
+// .LICENSE sidecar, ThirdPartyNotices.txt, licenses/OFL.txt, fonts/COPYRIGHT)
+// is an extra license file and fails. A root license text that is recognisably
+// a different license from the declared one fails as a text mismatch.
+//
+// dist/. Every regular file in dist/ is compared with the installed package
+// files. A symbolic link anywhere in dist/ fails the gate; read errors stop the
+// run (exit 2) rather than being skipped.
 //
 // Outputs (in --out, default .verify-out/license-inventory/): sbom.cdx.json
 // (CycloneDX 1.6), inventory.json, and platform-inventory.json (status
-// POLICY-PENDING). NOTICE at the repository root is regenerated with
-// --write-notice; without it, a stale NOTICE fails the run.
+// POLICY-PENDING). Both files carry the same application-gate value, NOTICE
+// check included, and the SBOM serial number covers every classification.
+// NOTICE at the repository root is regenerated with --write-notice; without
+// it, a stale NOTICE fails the run.
 //
 // Exit status: 0 gate passes and NOTICE is current, 1 policy failure or stale
-// NOTICE, 2 usage error or an incomplete or inconsistent install.
+// NOTICE, 2 usage error, a read error, or an incomplete or inconsistent install.
 
 import { createHash } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { basename, dirname, extname, join, resolve } from 'node:path';
+import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { collectPlatformInventory, PLATFORM_STATUS, writePlatformInventory } from './platform-inventory.mjs';
@@ -171,14 +187,28 @@ export function evaluateLicense(value, policy) {
     : { expression, status: 'disallowed', detail: `does not satisfy ${policy.allowed.join(' / ')}` };
 }
 
+/**
+ * The declared license of an installed package.json. The legacy `licenses`
+ * array lists licenses that all apply, so several entries are joined with AND
+ * (never OR); an entry that is not a non-empty string or { type } makes the
+ * declaration unknown. A package declaring both `license` and `licenses` is
+ * held to both (AND).
+ */
 function declaredLicense(pkg) {
-  if (typeof pkg.license === 'string') return pkg.license;
-  if (pkg.license && typeof pkg.license === 'object' && typeof pkg.license.type === 'string') return pkg.license.type;
+  let primary = null;
+  if (typeof pkg.license === 'string') primary = pkg.license.trim() === '' ? null : pkg.license;
+  else if (pkg.license && typeof pkg.license === 'object' && typeof pkg.license.type === 'string') primary = pkg.license.type;
+  else if (pkg.license !== undefined && pkg.license !== null) return { unknown: 'license field is neither a string nor { type }' };
+  let legacy = null;
   if (Array.isArray(pkg.licenses) && pkg.licenses.length > 0) {
     const types = pkg.licenses.map((entry) => (typeof entry === 'string' ? entry : entry?.type));
-    if (types.every((type) => typeof type === 'string' && type !== '')) return types.length === 1 ? types[0] : `(${types.join(' OR ')})`;
+    if (!types.every((type) => typeof type === 'string' && type.trim() !== '')) return { unknown: 'legacy licenses array has an unreadable entry' };
+    legacy = types.length === 1 ? types[0].trim() : types.map((type) => `(${type.trim()})`).join(' AND ');
+  } else if (pkg.licenses !== undefined && pkg.licenses !== null && !(Array.isArray(pkg.licenses) && pkg.licenses.length === 0)) {
+    return { unknown: 'legacy licenses field is not an array' };
   }
-  return null;
+  if (primary !== null && legacy !== null && primary.trim() !== legacy) return `(${primary.trim()}) AND (${legacy})`;
+  return primary ?? legacy;
 }
 
 // ---------------------------------------------------------------------------
@@ -251,62 +281,205 @@ function productionClosure(rootPkg, packages) {
   return shipped;
 }
 
-const LICENSE_FILE = /^(?:licen[cs]e|notice|copying)/i;
-const CODE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.mts', '.cts', '.jsx', '.tsx', '.map', '.json']);
+// A license, notice or copyright text: the file name contains one of these
+// words (source-code files such as license.js excepted), or the file lies
+// under a licenses/ (licences/) directory.
+const LICENSE_NAME = /licen[cs]e|notice|copying|copyright|third[-_ ]?party/i;
+const LICENSE_DIRECTORY = /^licen[cs]es$/i;
+const CODE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.mts', '.cts', '.jsx', '.tsx', '.map']);
+// The package's own texts: at most one root license file and one root NOTICE.
+const ROOT_LICENSE = /^(?:licen[cs]e|copying)/i;
+const ROOT_NOTICE = /^notice/i;
+const THIRD_PARTY = /third[-_ ]?party/i;
 
-function walkPackage(dir, rel, out) {
-  let entries;
+export function isLicenseText(file) {
+  const parts = file.split('/');
+  if (parts.slice(0, -1).some((dir) => LICENSE_DIRECTORY.test(dir))) return true;
+  return LICENSE_NAME.test(parts.at(-1)) && !CODE_EXTENSIONS.has(extname(file).toLowerCase());
+}
+
+// Recognisable license texts, matched on lower-cased text with whitespace
+// collapsed. `ids` are the declared SPDX identifiers (lower case, prefix match
+// when ending in "-") that agree with the text.
+const LICENSE_TEXTS = [
+  { family: 'Apache-2.0', ids: ['apache-2.0'], test: (t) => t.includes('apache license') && t.includes('version 2.0') },
+  {
+    family: 'MIT',
+    ids: ['mit'],
+    test: (t) => t.includes('permission is hereby granted, free of charge, to any person obtaining a copy') && t.includes('the above copyright notice and this permission notice shall be included'),
+  },
+  {
+    family: 'MIT-0',
+    ids: ['mit-0'],
+    test: (t) => t.includes('permission is hereby granted, free of charge, to any person obtaining a copy') && !t.includes('the above copyright notice and this permission notice shall be included'),
+  },
+  { family: 'ISC-or-0BSD', ids: ['isc', '0bsd'], test: (t) => t.includes('permission to use, copy, modify, and/or distribute this software for any purpose') },
+  { family: 'BSD', ids: ['bsd-'], test: (t) => t.includes('redistribution and use in source and binary forms') },
+  { family: 'AGPL', ids: ['agpl-'], test: (t) => t.includes('gnu affero general public license') },
+  { family: 'LGPL', ids: ['lgpl-'], test: (t) => t.includes('gnu lesser general public license') || t.includes('gnu library general public license') },
+  {
+    family: 'GPL',
+    ids: ['gpl-'],
+    test: (t) => t.includes('gnu general public license') && !t.includes('gnu lesser general public license') && !t.includes('gnu affero general public license'),
+  },
+  { family: 'MPL', ids: ['mpl-'], test: (t) => t.includes('mozilla public license') },
+  { family: 'BlueOak', ids: ['blueoak-'], test: (t) => t.includes('blue oak model license') },
+  { family: 'Unlicense', ids: ['unlicense'], test: (t) => t.includes('this is free and unencumbered software released into the public domain') },
+  { family: 'CC0', ids: ['cc0-'], test: (t) => t.includes('cc0 1.0 universal') },
+  { family: 'Zlib', ids: ['zlib'], test: (t) => t.includes("this software is provided 'as-is'") && t.includes('altered source versions must be plainly marked') },
+  { family: 'OFL', ids: ['ofl-'], test: (t) => t.includes('sil open font license') },
+];
+
+/** License families recognisable in a text file (an empty list when none is recognised). */
+export function recognizeLicenseText(text) {
+  const normalized = text.toLowerCase().replace(/\s+/g, ' ');
+  return LICENSE_TEXTS.filter((entry) => entry.test(normalized)).map((entry) => entry.family);
+}
+
+function familyAgrees(family, declaredIds) {
+  const { ids } = LICENSE_TEXTS.find((entry) => entry.family === family);
+  return declaredIds.some((id) => ids.some((accepted) => (accepted.endsWith('-') ? id.startsWith(accepted) : id === accepted)));
+}
+
+/** Lower-cased license identifiers of a parsed SPDX tree, or null if it does not parse. */
+function declaredIds(expression) {
+  if (typeof expression !== 'string') return null;
+  let tree;
   try {
-    entries = readdirSync(dir, { withFileTypes: true });
+    tree = parseSpdx(expression);
   } catch {
-    return;
+    return null;
   }
-  for (const entry of entries) {
-    const path = rel === '' ? entry.name : `${rel}/${entry.name}`;
-    if (entry.isDirectory()) {
-      if (entry.name !== 'node_modules') walkPackage(join(dir, entry.name), path, out);
-    } else if (entry.isFile()) {
-      out.push(path);
+  const ids = [];
+  const visit = (node) => {
+    if (node.op === 'AND' || node.op === 'OR') {
+      visit(node.left);
+      visit(node.right);
+    } else {
+      ids.push({ id: node.license.toLowerCase(), withException: node.op === 'WITH' });
     }
+  };
+  visit(tree);
+  return ids;
+}
+
+/** Exactly MIT and Apache-2.0, combined with OR or AND (no WITH). */
+function isMitApacheDual(expression) {
+  const ids = declaredIds(expression);
+  if (ids === null || ids.some((entry) => entry.withException)) return false;
+  const set = new Set(ids.map((entry) => entry.id));
+  return set.size === 2 && set.has('mit') && set.has('apache-2.0');
+}
+
+function readPackageText(dir, file) {
+  try {
+    return readFileSync(join(dir, file), 'latin1');
+  } catch (error) {
+    throw new InventoryError(`${join(dir, file)} could not be read: ${error.code ?? error.message}`);
   }
 }
 
-/** License-like files of an installed package, split into its own texts and extras. */
-function licenseFiles(dir) {
-  const files = [];
-  walkPackage(dir, '', files);
-  const matching = files.filter((file) => LICENSE_FILE.test(basename(file)) && !CODE_EXTENSIONS.has(extname(file).toLowerCase())).sort();
+function readDirectory(dir, what) {
+  try {
+    return readdirSync(dir, { withFileTypes: true });
+  } catch (error) {
+    throw new InventoryError(`${what} could not be read: ${error.code ?? error.message}`);
+  }
+}
+
+/** Files of an installed package (nested node_modules excluded), with its symbolic links listed apart. */
+function walkPackage(dir, rel, out) {
+  for (const entry of readDirectory(dir, `${dir}`)) {
+    const path = rel === '' ? entry.name : `${rel}/${entry.name}`;
+    if (entry.isSymbolicLink()) out.symlinks.push(path);
+    else if (entry.isDirectory()) {
+      if (entry.name !== 'node_modules') walkPackage(join(dir, entry.name), path, out);
+    } else if (entry.isFile()) out.files.push(path);
+    else out.symlinks.push(path); // sockets, FIFOs, devices: not ordinary package content
+  }
+  return out;
+}
+
+/**
+ * License texts of an installed package, split into its own texts and extras,
+ * with the recognised license family of each own license file.
+ */
+function licenseFiles(dir, expression) {
+  const { files, symlinks } = walkPackage(dir, '', { files: [], symlinks: [] });
+  const matching = files.filter(isLicenseText).sort();
   const root = matching.filter((file) => !file.includes('/'));
-  const ownLicense = root.find((file) => !/^notice/i.test(file)) ?? null;
-  const ownNotice = root.find((file) => /^notice/i.test(file)) ?? null;
-  const extra = matching.filter((file) => file !== ownLicense && file !== ownNotice);
-  return { all: matching, ownLicense, ownNotice, extra, files };
+  const rootLicenses = root.filter((file) => ROOT_LICENSE.test(file) && !THIRD_PARTY.test(file));
+  const ownNotice = root.find((file) => ROOT_NOTICE.test(file)) ?? null;
+  const families = new Map(rootLicenses.map((file) => [file, recognizeLicenseText(readPackageText(dir, file))]));
+
+  let ownLicenses = rootLicenses.slice(0, 1);
+  if (rootLicenses.length === 2 && isMitApacheDual(expression)) {
+    // One text for each license of a dual MIT / Apache-2.0 package: by the
+    // recognised text, else by the file name (LICENSE-MIT, LICENSE-APACHE).
+    const kind = (file) => {
+      const found = families.get(file);
+      if (found.length === 1 && (found[0] === 'MIT' || found[0] === 'Apache-2.0')) return found[0];
+      if (found.length === 0 && /mit/i.test(file) && !/apache/i.test(file)) return 'MIT';
+      if (found.length === 0 && /apache/i.test(file) && !/mit/i.test(file)) return 'Apache-2.0';
+      return null;
+    };
+    const kinds = rootLicenses.map(kind);
+    if (kinds.includes('MIT') && kinds.includes('Apache-2.0')) ownLicenses = rootLicenses;
+  }
+  const own = new Set([...ownLicenses, ownNotice].filter(Boolean));
+  const extra = matching.filter((file) => !own.has(file));
+
+  const ids = declaredIds(expression);
+  const texts = ownLicenses.map((file) => ({ file, recognized: families.get(file) }));
+  const mismatched =
+    ids === null
+      ? []
+      : texts.filter((text) => text.recognized.some((family) => !familyAgrees(family, ids.map((entry) => entry.id)))).map((text) => text.file);
+  return { all: matching, ownLicenses, ownNotice, extra, texts, mismatched, files, symlinks };
 }
 
 function sha256File(path) {
-  return createHash('sha256').update(readFileSync(path)).digest('hex');
+  try {
+    return createHash('sha256').update(readFileSync(path)).digest('hex');
+  } catch (error) {
+    throw new InventoryError(`${path} could not be read: ${error.code ?? error.message}`);
+  }
 }
 
-function walkAll(dir, rel, out) {
-  let entries;
+/** Regular files and symbolic links under dist/ (an absent dist/ is empty; other read errors stop the run). */
+function walkDist(root) {
+  const dist = join(root, 'dist');
+  const out = { files: [], symlinks: [] };
+  let top;
   try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
+    top = lstatSync(dist);
+  } catch (error) {
+    if (error.code === 'ENOENT') return out;
+    throw new InventoryError(`dist/ could not be read: ${error.code ?? error.message}`);
   }
-  for (const entry of entries) {
-    const path = rel === '' ? entry.name : `${rel}/${entry.name}`;
-    const abs = join(dir, entry.name);
-    if (entry.isDirectory()) walkAll(abs, path, out);
-    else if (entry.isFile() || entry.isSymbolicLink()) out.push(path);
+  if (top.isSymbolicLink()) {
+    out.symlinks.push('dist');
+    return out;
   }
+  if (!top.isDirectory()) throw new InventoryError('dist is not a directory');
+  const walk = (dir, rel) => {
+    for (const entry of readDirectory(dir, `dist/${rel}`)) {
+      const path = rel === '' ? entry.name : `${rel}/${entry.name}`;
+      if (entry.isSymbolicLink()) out.symlinks.push(`dist/${path}`);
+      else if (entry.isDirectory()) walk(join(dir, entry.name), path);
+      else if (entry.isFile()) out.files.push(path);
+      else out.symlinks.push(`dist/${path}`); // not a regular file: reported with the links
+    }
+  };
+  walk(dist, '');
+  out.files.sort();
+  out.symlinks.sort();
+  return out;
 }
 
 /** Packages owning a file copied byte-for-byte into dist/: Map(lockPath -> [dist files]). */
-function distAssetOwners(root, records) {
+function distAssetOwners(root, records, distFiles) {
   const owners = new Map();
-  const distFiles = [];
-  walkAll(join(root, 'dist'), '', distFiles);
   if (distFiles.length === 0) return owners;
   const byDigest = new Map();
   for (const record of records) {
@@ -316,8 +489,8 @@ function distAssetOwners(root, records) {
       let size;
       try {
         size = statSync(abs).size;
-      } catch {
-        continue;
+      } catch (error) {
+        throw new InventoryError(`${abs} could not be read: ${error.code ?? error.message}`);
       }
       if (size === 0) continue;
       const digest = sha256File(abs);
@@ -325,15 +498,16 @@ function distAssetOwners(root, records) {
       byDigest.get(digest).add(record.path);
     }
   }
-  for (const file of distFiles.sort()) {
-    let digest;
+  for (const file of distFiles) {
+    const abs = join(root, 'dist', file);
+    let size;
     try {
-      if (statSync(join(root, 'dist', file)).size === 0) continue;
-      digest = sha256File(join(root, 'dist', file));
-    } catch {
-      continue;
+      size = statSync(abs).size;
+    } catch (error) {
+      throw new InventoryError(`dist/${file} could not be read: ${error.code ?? error.message}`);
     }
-    for (const path of byDigest.get(digest) ?? []) {
+    if (size === 0) continue;
+    for (const path of byDigest.get(sha256File(abs)) ?? []) {
       if (!owners.has(path)) owners.set(path, []);
       owners.get(path).push(`dist/${file}`);
     }
@@ -347,7 +521,7 @@ function distAssetOwners(root, records) {
 
 /**
  * Build the inventory for the project at `root`.
- * Throws InventoryError for an incomplete or inconsistent install.
+ * Throws InventoryError for an incomplete or inconsistent install or a read error.
  */
 export function buildInventory(root = REPO_ROOT, { policy = loadPolicy() } = {}) {
   const { data: rootPkg } = readJsonFile(join(root, 'package.json'), 'package.json');
@@ -365,17 +539,29 @@ export function buildInventory(root = REPO_ROOT, { policy = loadPolicy() } = {})
     if (entry.link) throw new InventoryError(`${path} is a linked package, which the inventory does not support`);
     const dir = join(root, path);
     let installed = null;
+    let manifest = null;
     try {
-      installed = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
-    } catch {
-      installed = null;
+      manifest = readFileSync(join(dir, 'package.json'), 'utf8');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw new InventoryError(`${path}/package.json could not be read: ${error.code ?? error.message}`);
+    }
+    if (manifest !== null) {
+      try {
+        installed = JSON.parse(manifest);
+      } catch {
+        throw new InventoryError(`${path}/package.json is not valid JSON`);
+      }
     }
     if (installed === null && !entry.optional) throw new InventoryError(`${path} is locked but not installed; run npm ci`);
     if (installed !== null && installed.version !== entry.version) {
       throw new InventoryError(`${path} is installed as ${installed.version} but locked as ${entry.version}`);
     }
-    const files = installed ? licenseFiles(dir) : { all: [], ownLicense: null, ownNotice: null, extra: [], files: [] };
-    const license = evaluateLicense(installed ? declaredLicense(installed) : entry.license ?? null, policy);
+    const declared = installed ? declaredLicense(installed) : entry.license ?? null;
+    const license =
+      declared !== null && typeof declared === 'object' ? { expression: null, status: 'unknown', detail: declared.unknown } : evaluateLicense(declared, policy);
+    const files = installed
+      ? licenseFiles(dir, license.expression)
+      : { all: [], ownLicenses: [], ownNotice: null, extra: [], texts: [], mismatched: [], files: [], symlinks: [] };
     records.push({
       path,
       name: installed?.name ?? entry.name ?? packageName(path),
@@ -387,9 +573,13 @@ export function buildInventory(root = REPO_ROOT, { policy = loadPolicy() } = {})
       policy: license.status,
       policy_detail: license.detail,
       license_files: files.all,
-      own_license_file: files.ownLicense,
+      own_license_file: files.ownLicenses[0] ?? null,
+      own_license_files: files.ownLicenses,
       own_notice_file: files.ownNotice,
       extra_license_files: files.extra,
+      license_texts: files.texts,
+      license_text_mismatch: files.mismatched,
+      symlinks: files.symlinks,
       lockfile_dev: entry.dev === true,
       integrity: entry.integrity ?? null,
       resolved: entry.resolved ?? null,
@@ -397,7 +587,8 @@ export function buildInventory(root = REPO_ROOT, { policy = loadPolicy() } = {})
     });
   }
 
-  for (const [path, distFiles] of distAssetOwners(root, records)) {
+  const dist = walkDist(root);
+  for (const [path, distFiles] of distAssetOwners(root, records, dist.files)) {
     const record = records.find((candidate) => candidate.path === path);
     if (record.classification !== 'shipped') {
       record.classification = 'shipped';
@@ -407,9 +598,14 @@ export function buildInventory(root = REPO_ROOT, { policy = loadPolicy() } = {})
   }
 
   const findings = [];
+  for (const link of dist.symlinks) {
+    findings.push({ rule: 'dist-symlink', record: null, file: link, detail: 'dist/ holds a symbolic link or other non-regular file; its target is not inventoried' });
+  }
   for (const record of records.filter((r) => r.classification === 'shipped')) {
     if (record.policy !== 'allowed') findings.push({ rule: `license-${record.policy}`, record, detail: record.policy_detail });
     for (const file of record.extra_license_files) findings.push({ rule: 'extra-license-file', record, file, detail: 'separately licensed material inside a shipped package' });
+    for (const file of record.license_text_mismatch) findings.push({ rule: 'license-text-mismatch', record, file, detail: 'the license text is not the declared license' });
+    for (const file of record.symlinks) findings.push({ rule: 'package-symlink', record, file, detail: 'a shipped package holds a symbolic link or other non-regular file' });
   }
   for (const record of records) delete record.files;
 
@@ -418,6 +614,7 @@ export function buildInventory(root = REPO_ROOT, { policy = loadPolicy() } = {})
     rootPkg,
     packages,
     records,
+    dist,
     findings,
     gate: findings.length === 0 ? 'PASS' : 'FAIL',
     policy,
@@ -461,10 +658,10 @@ export function renderNotice(inventory) {
   }
   for (const record of shipped) {
     lines.push(`${record.name} ${record.version} (${record.license ?? 'no license declared'})`, `  location: ${record.path}`);
-    for (const file of [record.own_notice_file, record.own_license_file]) {
+    for (const file of [record.own_notice_file, ...record.own_license_files]) {
       if (!file) continue;
       const text = readText(join(inventory.root, record.path, file));
-      if (text === null) continue;
+      if (text === null) throw new InventoryError(`${record.path}/${file} could not be read for NOTICE`);
       lines.push(`  --- ${file} ---`, ...text.split('\n').map((line) => (line === '' ? '' : `  ${line}`)));
     }
     lines.push('');
@@ -493,7 +690,30 @@ function deterministicUuid(seed) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
-/** CycloneDX 1.6 JSON SBOM for every locked package, with its classification. */
+/** Digest of every classification, license result, license-file split and finding. */
+export function classificationDigest(inventory) {
+  const records = inventory.records.map((record) => [
+    record.path,
+    record.classification,
+    record.reasons,
+    record.license,
+    record.policy,
+    record.own_license_files,
+    record.own_notice_file,
+    record.extra_license_files,
+    record.license_text_mismatch,
+    record.symlinks,
+  ]);
+  const findings = inventory.findings.map((finding) => [finding.rule, finding.record?.path ?? null, finding.file ?? null]);
+  return createHash('sha256').update(JSON.stringify({ records, findings })).digest('hex');
+}
+
+/**
+ * CycloneDX 1.6 JSON SBOM for every locked package, with its classification.
+ * `inventory.gate` and `inventory.findings` are the run's final values (the
+ * CLI passes them with the NOTICE check included), so the SBOM and
+ * inventory.json carry the same application-gate value.
+ */
 export function renderCycloneDx(inventory) {
   const ref = (path) => `npm:${path}`;
   const components = inventory.records.map((record) => {
@@ -513,6 +733,7 @@ export function renderCycloneDx(inventory) {
         { name: 'opensig:lockfile-path', value: record.path },
         ...record.reasons.map((reason) => ({ name: 'opensig:classification-reason', value: reason })),
         ...record.extra_license_files.map((file) => ({ name: 'opensig:extra-license-file', value: file })),
+        ...record.license_text_mismatch.map((file) => ({ name: 'opensig:license-text-mismatch', value: file })),
       ],
     };
     for (const key of Object.keys(component)) if (component[key] === undefined) delete component[key];
@@ -535,10 +756,11 @@ export function renderCycloneDx(inventory) {
       .filter(Boolean);
     dependencies.push({ ref: ref(record.path), dependsOn: [...new Set(dependsOn)].sort().map(ref) });
   }
+  const classification = classificationDigest(inventory);
   return {
     bomFormat: 'CycloneDX',
     specVersion: '1.6',
-    serialNumber: `urn:uuid:${deterministicUuid(`${inventory.lockfileSha256}:${inventory.policy.sha256}:${inventory.gate}`)}`,
+    serialNumber: `urn:uuid:${deterministicUuid(`${inventory.lockfileSha256}:${inventory.policy.sha256}:${inventory.gate}:${classification}`)}`,
     version: 1,
     metadata: {
       tools: { components: [{ type: 'application', name: 'opensig-license-inventory', version: '1' }] },
@@ -553,6 +775,7 @@ export function renderCycloneDx(inventory) {
         { name: 'opensig:lockfile-sha256', value: inventory.lockfileSha256 },
         { name: 'opensig:license-policy-sha256', value: inventory.policy.sha256 },
         { name: 'opensig:application-gate', value: inventory.gate },
+        { name: 'opensig:classification-sha256', value: classification },
         { name: 'opensig:platform-status', value: PLATFORM_STATUS },
       ],
     },
@@ -595,8 +818,10 @@ function main(argv) {
     return;
   }
   let inventory;
+  let notice;
   try {
     inventory = buildInventory(options.root);
+    notice = renderNotice(inventory);
   } catch (error) {
     if (!(error instanceof InventoryError)) throw error;
     process.stdout.write(`license-inventory: ERROR ${error.message}\n`);
@@ -606,7 +831,6 @@ function main(argv) {
 
   const findings = [...inventory.findings];
   const noticePath = join(options.root, 'NOTICE');
-  const notice = renderNotice(inventory);
   let noticeStatus;
   if (options.writeNotice) {
     writeFileSync(noticePath, notice);
@@ -619,13 +843,17 @@ function main(argv) {
 
   const platform = collectPlatformInventory(options.root);
   writePlatformInventory(options.out, platform);
-  writeJson(join(options.out, 'sbom.cdx.json'), renderCycloneDx(inventory));
+  // One gate value for both outputs: the SBOM carries the NOTICE check too.
+  const sbom = renderCycloneDx({ ...inventory, findings, gate });
+  writeJson(join(options.out, 'sbom.cdx.json'), sbom);
   writeJson(join(options.out, 'inventory.json'), {
     kind: 'opensig-license-inventory',
     application_gate: gate,
     platform_status: platform.status,
     policy: { file: 'scripts/license-policy.json', allowed: inventory.policy.allowed, sha256: inventory.policy.sha256 },
     lockfile_sha256: inventory.lockfileSha256,
+    sbom_serial_number: sbom.serialNumber,
+    classification_sha256: classificationDigest({ ...inventory, findings }),
     notice: { path: 'NOTICE', status: noticeStatus },
     shipped: inventory.records.filter((r) => r.classification === 'shipped').length,
     non_shipped: inventory.records.filter((r) => r.classification === 'non-shipped').length,

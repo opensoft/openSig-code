@@ -18,16 +18,22 @@ Authority: spec leg `specs/001-corporate-signing-mvp/plan.md` § Technical Conte
   - Operators must be upper case.
   - Identifiers match case-insensitively.
   - A missing license fails. So does an unknown one: `SEE LICENSE IN …`, `UNLICENSED`, `LicenseRef-…`, or a malformed expression.
-- **License files.** A shipped package may carry at most one root license text (`LICENSE*`, `LICENCE*` or `COPYING*`) and at most one root `NOTICE*`. Any other such file anywhere in the package fails as an extra license file, for example a separately licensed font or wasm asset. Source files such as `license.js` are not license files.
+  - A legacy `licenses` array with several entries means all of them: `[MIT, GPL-3.0]` is read as `(MIT) AND (GPL-3.0)` and fails, never as an `OR`. An unreadable entry makes the license unknown. A package declaring both `license` and `licenses` is held to both.
+- **License files.** A license text is any file whose name contains `licence`, `license`, `notice`, `copying`, `copyright`, `third-party` or `thirdparty` (case-insensitive), and any file under a `licenses/` or `licences/` directory. Source-code files (`.js`, `.mjs`, `.cjs`, `.ts`, `.mts`, `.cts`, `.jsx`, `.tsx`, `.map`) such as `license.js` are code, not license texts.
+  - A shipped package may carry one root license text (`LICENSE*`, `LICENCE*` or `COPYING*`) and one root `NOTICE*`. A package that declares exactly `MIT` and `Apache-2.0` (`MIT OR Apache-2.0` or `MIT AND Apache-2.0`) may carry one root license text for each, such as `LICENSE-MIT` and `LICENSE-APACHE`. Each is matched to its license by its recognised text, or else by its name.
+  - Every other license text anywhere in a shipped package fails as an extra license file. Examples: a bundle's `<bundle>.js.LICENSE` sidecar, `ThirdPartyNotices.txt`, `licenses/OFL.txt`, `fonts/COPYRIGHT`, or a separately licensed font or wasm asset.
+  - A root license text that is recognisably a different license from the declared one fails as `license-text-mismatch`, for example a package declared `MIT` whose `LICENSE` is the Apache-2.0 text. A text the tool cannot recognise is not reported as a mismatch.
+  - A symbolic link inside a shipped package fails (`package-symlink`).
+- **`dist/`.** Every regular file in `dist/` is compared byte for byte with the installed package files. A symbolic link anywhere in `dist/`, or `dist` itself as a link, fails the gate (`dist-symlink`); links are never followed. Read errors stop the run with exit 2; they are never skipped.
 - **Outputs** go to `--out`, by default `.verify-out/license-inventory/`, which is gitignored:
-  - `sbom.cdx.json`: CycloneDX 1.6. Shipped packages have `scope: required`, non-shipped ones `excluded`. Each component carries its classification, policy result and SHA-512 lockfile integrity.
-  - `inventory.json`
+  - `sbom.cdx.json`: CycloneDX 1.6. Shipped packages have `scope: required`, non-shipped ones `excluded`. Each component carries its classification, policy result and SHA-512 lockfile integrity. Its `opensig:application-gate` value is the run's final gate, `NOTICE` check included, the same value as `inventory.json`. Its serial number is derived from the lockfile, the policy, the gate and a digest of every classification, license-file split and finding (`opensig:classification-sha256`).
+  - `inventory.json`, which records the SBOM serial number and the classification digest.
   - `platform-inventory.json`
 - **NOTICE.** `NOTICE` at the repository root is regenerated with `--write-notice`. Without that flag, a stale `NOTICE` fails the run.
 - **Exit status:**
   - 0: the gate passes and `NOTICE` is current.
   - 1: a policy failure or a stale `NOTICE`.
-  - 2: a usage error, or an incomplete or inconsistent install (a package locked but not installed, a version drift, an unresolvable dependency, or a missing lockfile).
+  - 2: a usage error, a read error (an unreadable package file or `dist/` entry, or a `dist` that is not a directory), or an incomplete or inconsistent install (a package locked but not installed, a version drift, an unresolvable dependency, or a missing lockfile).
 - **Verification.** `npm run verify -- license-inventory` runs cases LI-01..LI-10 on synthetic `node_modules` trees, plus the gate on this repository.
 
 ## Current result (T027: complete package set)
@@ -63,7 +69,7 @@ These packages are build- or test-time tools. They contribute no bytes to any di
   - `playwright/lib/transform/babelBundle.js.LICENSE`: 68 packages, mostly MIT with ISC, and Apache mentions.
   - `playwright/lib/transform/esmLoader.js.LICENSE`: 13 packages, MIT, ISC and one BSD-style text.
 
-The T002 gate's license-file rule (`LICENSE*`/`NOTICE*`/`COPYING*` names) does not match these `<bundle>.js.LICENSE` sidecars. That has no effect here, because both packages are non-shipped. If a future amendment ever ships a package that bundles code this way, the sidecars would need a gate rule.
+The T002 gate's license-file rule matches these `<bundle>.js.LICENSE` sidecars and the `ThirdPartyNotices.txt`/`ThirdPartyNoticeText.txt` files: `inventory.json` records them as `extra_license_files` of playwright (4), playwright-core (3) and typescript (1). They fail nothing here, because all three packages are non-shipped. If a package carrying them were ever shipped, each would fail the gate as an extra license file.
 
 ### Playwright pin and browser revision
 

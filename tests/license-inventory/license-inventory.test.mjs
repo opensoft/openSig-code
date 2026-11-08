@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
@@ -292,6 +292,152 @@ test('[LI-10] the CycloneDX SBOM classifies every package and NOTICE is regenera
   const stale = inventory(root, []);
   assert.equal(stale.code, 1);
   assert.ok(stale.lines.includes('license-inventory: FAIL rule=notice-stale'));
+});
+
+// Opening phrases of well-known license texts (enough to recognise each one).
+const MIT_TEXT = [
+  'MIT License',
+  '',
+  'Copyright (c) 2026 Synthetic Authors',
+  '',
+  'Permission is hereby granted, free of charge, to any person obtaining a copy',
+  'of this software and associated documentation files (the "Software").',
+  '',
+  'The above copyright notice and this permission notice shall be included in all',
+  'copies or substantial portions of the Software.',
+  '',
+].join('\n');
+const APACHE_TEXT = '                                 Apache License\n                           Version 2.0, January 2004\n\n   Synthetic terms.\n';
+const GPL_TEXT = '                    GNU GENERAL PUBLIC LICENSE\n                       Version 3, 29 June 2007\n';
+const BSD_TEXT = 'Redistribution and use in source and binary forms, with or without\nmodification, are permitted provided that the conditions are met.\n';
+
+test('[LI-07] bundled license texts anywhere in a shipped package fail: sidecars, notices, licenses/ and COPYRIGHT', () => {
+  const bundled = [
+    'lib/bundle.js.LICENSE',
+    'lib/vendor.js.LICENSE.txt',
+    'ThirdPartyNotices.txt',
+    'docs/third_party_licenses.json',
+    'licenses/OFL.txt',
+    'LICENSES/Apache-2.0.txt',
+    'fonts/COPYRIGHT',
+    'COPYRIGHT',
+    'assets/notices.html',
+  ];
+  for (const file of bundled) {
+    const result = inventory(shippedOnly('MIT', { files: { LICENSE: MIT_TEXT, [file]: 'Separately licensed material.\n', 'lib/index.js': 'module.exports = 1;\n' } }));
+    expectFinding(result, 'extra-license-file', 'pkg-a@1.0.0');
+    assert.ok(result.lines.some((line) => line.includes('rule=extra-license-file') && line.endsWith(`file=${file}`)), `${file} is reported: ${result.stdout}`);
+  }
+  const code = inventory(
+    shippedOnly('MIT', { files: { LICENSE: MIT_TEXT, 'lib/license.js': 'export const id = 1;\n', 'lib/notice-banner.ts': 'export const banner = 1;\n' } }),
+  );
+  assert.equal(code.code, 0, `source files named after licenses are code, not license texts: ${code.stdout}`);
+});
+
+test('[LI-06] a multi-entry legacy licenses array means all of them (AND), never OR', () => {
+  const mixed = inventory(shippedOnly(null, { licenses: ['MIT', { type: 'GPL-3.0' }] }));
+  expectFinding(mixed, 'license-disallowed', 'pkg-a@1.0.0');
+  assert.equal(record(mixed, 'pkg-a').license, '(MIT) AND (GPL-3.0)');
+
+  const allowed = inventory(shippedOnly(null, { licenses: [{ type: 'MIT' }, { type: 'Apache-2.0' }] }));
+  assert.equal(allowed.code, 0, allowed.stdout);
+  assert.equal(record(allowed, 'pkg-a').license, '(MIT) AND (Apache-2.0)');
+
+  const both = inventory(shippedOnly('MIT', { licenses: [{ type: 'GPL-3.0' }] }));
+  expectFinding(both, 'license-disallowed', 'pkg-a@1.0.0');
+  assert.equal(record(both, 'pkg-a').license, '(MIT) AND (GPL-3.0)', 'a package declaring license and licenses is held to both');
+
+  expectFinding(inventory(shippedOnly(null, { licenses: [{ type: 'MIT' }, { url: 'https://example.test/terms' }] })), 'license-unknown', 'pkg-a@1.0.0');
+});
+
+test('[LI-06] a root license text that is recognisably not the declared license fails', () => {
+  const apacheText = inventory(shippedOnly('MIT', { files: { LICENSE: APACHE_TEXT } }));
+  expectFinding(apacheText, 'license-text-mismatch', 'pkg-a@1.0.0');
+  assert.deepEqual(record(apacheText, 'pkg-a').license_texts, [{ file: 'LICENSE', recognized: ['Apache-2.0'] }]);
+  expectFinding(inventory(shippedOnly('Apache-2.0', { files: { 'LICENSE.md': GPL_TEXT } })), 'license-text-mismatch', 'pkg-a@1.0.0');
+  expectFinding(inventory(shippedOnly('MIT', { files: { LICENSE: `${MIT_TEXT}\n${BSD_TEXT}` } })), 'license-text-mismatch', 'pkg-a@1.0.0');
+
+  const matching = inventory(shippedOnly('Apache-2.0', { files: { LICENSE: APACHE_TEXT } }));
+  assert.equal(matching.code, 0, matching.stdout);
+  const unrecognised = inventory(shippedOnly('MIT', { files: { LICENSE: 'Synthetic license text.\n' } }));
+  assert.equal(unrecognised.code, 0, `an unrecognisable text is not a detectable mismatch: ${unrecognised.stdout}`);
+});
+
+test('[LI-05] a dual MIT / Apache-2.0 package may carry LICENSE-MIT and LICENSE-APACHE', () => {
+  const dualFiles = { 'LICENSE-MIT': MIT_TEXT, 'LICENSE-APACHE': APACHE_TEXT };
+  for (const expression of ['MIT OR Apache-2.0', '(MIT AND Apache-2.0)', 'Apache-2.0 OR MIT']) {
+    const root = shippedOnly(expression, { files: dualFiles });
+    const result = inventory(root);
+    assert.equal(result.code, 0, `${expression}: ${result.stdout}`);
+    assert.deepEqual(record(result, 'pkg-a').own_license_files, ['LICENSE-APACHE', 'LICENSE-MIT']);
+    const notice = readFileSync(join(root, 'NOTICE'), 'utf8');
+    assert.ok(notice.includes('--- LICENSE-MIT ---') && notice.includes('--- LICENSE-APACHE ---'), 'NOTICE carries both texts');
+  }
+  // Recognised by text when the names do not say which is which.
+  assert.equal(inventory(shippedOnly('MIT OR Apache-2.0', { files: { 'LICENSE.txt': MIT_TEXT, LICENSE: APACHE_TEXT } })).code, 0);
+  // Not a dual declaration, or not one text for each license: the second file is an extra.
+  expectFinding(inventory(shippedOnly('MIT', { files: dualFiles })), 'extra-license-file', 'pkg-a@1.0.0');
+  expectFinding(inventory(shippedOnly('MIT OR Apache-2.0', { files: { 'LICENSE-MIT': MIT_TEXT, 'LICENSE-BSD': BSD_TEXT } })), 'extra-license-file', 'pkg-a@1.0.0');
+  expectFinding(inventory(shippedOnly('MIT OR Apache-2.0', { files: { 'LICENSE-MIT': MIT_TEXT, 'LICENSE-MIT.txt': MIT_TEXT } })), 'extra-license-file', 'pkg-a@1.0.0');
+});
+
+test('a symbolic link in dist/ fails the gate and read errors stop the run', () => {
+  const devKit = {
+    devDependencies: { 'dev-kit': '1.0.0' },
+    packages: { 'node_modules/dev-kit': { version: '1.0.0', license: '0BSD', dev: true, files: { LICENSE: 'Synthetic 0BSD text.\n', 'lib/runtime.js': `${randomBytes(64).toString('hex')}\n` } } },
+  };
+  const directory = project({ ...devKit, dist: { 'app.js': 'export const app = 1;\n' } });
+  symlinkSync('../node_modules/dev-kit', join(directory, 'dist', 'vendor'));
+  const linkedDirectory = inventory(directory);
+  assert.equal(linkedDirectory.code, 1, linkedDirectory.stdout);
+  assert.ok(linkedDirectory.lines.includes('license-inventory: FAIL rule=dist-symlink file=dist/vendor'), linkedDirectory.stdout);
+  assert.equal(linkedDirectory.json().application_gate, 'FAIL');
+
+  const file = project({ ...devKit, dist: { 'app.js': 'export const app = 1;\n' } });
+  symlinkSync('../../node_modules/dev-kit/lib/runtime.js', join(file, 'dist', 'runtime.js'));
+  assert.ok(inventory(file).lines.includes('license-inventory: FAIL rule=dist-symlink file=dist/runtime.js'));
+
+  const whole = project(devKit);
+  symlinkSync('node_modules/dev-kit', join(whole, 'dist'));
+  assert.ok(inventory(whole).lines.includes('license-inventory: FAIL rule=dist-symlink file=dist'));
+
+  const notDirectory = project(devKit);
+  writeFileSync(join(notDirectory, 'dist'), 'not a directory\n');
+  const unreadable = inventory(notDirectory);
+  assert.equal(unreadable.code, 2, unreadable.stdout);
+  assert.match(unreadable.last, /^license-inventory: ERROR dist is not a directory/);
+});
+
+test('[LI-10] the SBOM and inventory.json carry one gate value, and the SBOM serial covers classifications', () => {
+  const root = project({ dependencies: { 'pkg-a': '1.0.0' }, packages: { 'node_modules/pkg-a': { version: '1.0.0', license: 'MIT' } } });
+  const current = inventory(root);
+  assert.equal(current.code, 0, current.stdout);
+  const gateOf = (result) => result.sbom().metadata.properties.find((p) => p.name === 'opensig:application-gate').value;
+  assert.equal(gateOf(current), 'PASS');
+  assert.equal(current.json().sbom_serial_number, current.sbom().serialNumber);
+
+  writeFileSync(join(root, 'NOTICE'), 'edited by hand\n');
+  const stale = inventory(root, []);
+  assert.equal(stale.code, 1);
+  assert.equal(stale.json().application_gate, 'FAIL');
+  assert.equal(gateOf(stale), 'FAIL', 'a stale NOTICE fails the SBOM gate value too');
+
+  // Same lockfile and policy; only the dist/ classification differs.
+  const asset = randomBytes(256);
+  const devAsset = (dist) =>
+    project({
+      devDependencies: { 'font-kit': '1.0.0' },
+      packages: { 'node_modules/font-kit': { version: '1.0.0', license: 'MIT', dev: true, files: { LICENSE: 'Synthetic MIT text.\n', 'fonts/glyphs.bin': asset } } },
+      dist,
+    });
+  const unshipped = inventory(devAsset({ 'app.bin': randomBytes(64) }));
+  const shipped = inventory(devAsset({ 'glyphs.bin': asset }));
+  assert.equal(unshipped.code, 0, unshipped.stdout);
+  assert.equal(shipped.code, 0, shipped.stdout);
+  assert.equal(record(unshipped, 'font-kit').classification, 'non-shipped');
+  assert.equal(record(shipped, 'font-kit').classification, 'shipped');
+  assert.equal(unshipped.json().lockfile_sha256, shipped.json().lockfile_sha256);
+  assert.notEqual(unshipped.sbom().serialNumber, shipped.sbom().serialNumber, 'the serial number covers the classification');
 });
 
 test('SPDX expressions follow operator precedence and the exact allowlist', () => {
