@@ -6,11 +6,12 @@
 //   npm run verify -- <mode>
 //
 // Contract: spec leg specs/001-corporate-signing-mvp/plan.md, section
-// "Verification runner contract", including amendment A-006 (T001 hardening
-// round). This file, scripts/verify-modes.mjs and
-// tests/tooling/verification-runner.test.mjs are FROZEN at the T001 hardening
-// commit. Only a recorded architect amendment may change them, through a new
-// [O] task that lists these three files, re-runs the self-tests and re-freezes.
+// "Verification runner contract", including amendments A-006 (T001 hardening
+// round) and A-007 (platform gate removal, N1, N2). This file,
+// scripts/verify-modes.mjs and tests/tooling/verification-runner.test.mjs are
+// FROZEN at the A-007 runner commit. Only a recorded architect amendment may
+// change them, through a new [O] task that lists these three files, re-runs the
+// self-tests and re-freezes.
 //
 // Exit statuses (one final stdout line, plus .verify-out/<mode>/result.json):
 //   0 PASS  1 FAIL  2 USAGE  3 CAPABILITY_ABSENT  4 VACUOUS
@@ -125,13 +126,14 @@ export const KNOWN_MOCKS = Object.freeze(['hermes-stub', 'fake-verifier', 'jsdom
 /**
  * Release gates outside the local acceptance run. None has a closing mechanism
  * in the plan yet, so the release mode `acceptance` can only return FAIL.
+ * Amendment A-007 removed the platform-inventory gate: the owner decided the
+ * platform license scope ("MIT/Apache application and libraries; inventory
+ * platform licenses separately"), so platforms are inventoried, not gated.
+ * A-007 also added parser-network-sandbox: it closes only with evidence from
+ * the deployment environment that the PDF parse worker's namespace sandbox is
+ * active; local evidence never closes it.
  */
 export const EXTERNAL_GATES = Object.freeze([
-  Object.freeze({
-    gate: 'platform-inventory',
-    status: 'POLICY-PENDING',
-    detail: 'owner decision on platform license scope (plan.md "Pending owner decision")',
-  }),
   Object.freeze({ gate: 'trusted-certificate-key-custody', status: 'OPEN', detail: 'trusted organization certificate and managed key custody' }),
   Object.freeze({ gate: 'validated-oidc-smtp', status: 'OPEN', detail: 'validated real operator OIDC issuer and SMTP relay' }),
   Object.freeze({
@@ -148,11 +150,16 @@ export const EXTERNAL_GATES = Object.freeze([
   }),
   Object.freeze({ gate: 'real-ci', status: 'OPEN', capability: 'ci-run', detail: 'a real CI run of the release gates' }),
   Object.freeze({ gate: 'production-hermes', status: 'OPEN', detail: 'production Hermes (only isolated-local Hermes is exercised)' }),
+  Object.freeze({
+    gate: 'parser-network-sandbox',
+    status: 'OPEN',
+    detail: 'deployment-environment evidence that the PDF parse worker runs in an active network namespace sandbox (local evidence never closes it)',
+  }),
 ]);
 
 /**
- * Configuration frozen by amendment A-006 (M2). The runner returns
- * ENV_MISMATCH when the tree differs from any of these values.
+ * Configuration frozen by amendments A-006 (M2) and A-007 (N1). The runner
+ * returns ENV_MISMATCH when the tree differs from any of these values.
  */
 export const FROZEN_PACKAGE_SCRIPTS = Object.freeze({
   verify: 'tools/node/bin/node scripts/verify.mjs',
@@ -744,27 +751,22 @@ function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
-function parseNpmrc(text) {
-  const values = new Map();
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (line === '' || line.startsWith('#') || line.startsWith(';')) continue;
-    const eq = line.indexOf('=');
-    if (eq < 0) {
-      values.set(line, 'true');
-      continue;
-    }
-    let value = line.slice(eq + 1).trim();
-    if (/^(["']).*\1$/.test(value)) value = value.slice(1, -1);
-    values.set(line.slice(0, eq).trim(), value); // the last assignment wins, as in npm
-  }
-  return values;
+/** The .npmrc lines that carry configuration: not blank and not a # or ; comment. */
+function npmrcSettingLines(text) {
+  return text
+    .split(/\r?\n/)
+    .map((raw) => raw.trim())
+    .filter((line) => line !== '' && !line.startsWith('#') && !line.startsWith(';'));
 }
 
 /**
  * A-006 M2: package.json scripts.verify/test/typecheck and engines.node,
- * .node-version, the three .npmrc keys and the whole tsconfig.json (so any
- * noCheck) must equal the frozen values.
+ * .node-version and the whole tsconfig.json (so any noCheck) must equal the
+ * frozen values. A-007 N1: .npmrc is compared as a whole too: its non-blank,
+ * non-comment lines must be exactly the three frozen `key=true` lines, so a
+ * quoted key, a section header or any extra key (script-shell, a registry,
+ * an override) is a mismatch. Line content is never echoed; it may hold a
+ * credential.
  */
 export function frozenConfigProblems(root) {
   const problems = [];
@@ -796,9 +798,15 @@ export function frozenConfigProblems(root) {
     problems.push('.npmrc is missing');
   }
   if (npmrc !== null) {
-    const values = parseNpmrc(npmrc);
-    for (const [key, expected] of Object.entries(FROZEN_NPMRC)) {
-      if (values.get(key) !== expected) problems.push(`.npmrc ${key} is ${values.has(key) ? JSON.stringify(values.get(key)) : 'unset'}; frozen value ${expected}`);
+    const lines = npmrcSettingLines(npmrc);
+    const frozen = Object.entries(FROZEN_NPMRC).map(([key, value]) => `${key}=${value}`);
+    const missing = frozen.filter((line) => !lines.includes(line));
+    const unexpected = lines.map((line, index) => ({ line, index })).filter(({ line, index }) => !frozen.includes(line) || lines.indexOf(line) !== index);
+    if (missing.length > 0 || unexpected.length > 0) {
+      const parts = [];
+      if (missing.length > 0) parts.push(`missing ${missing.join(', ')}`);
+      if (unexpected.length > 0) parts.push(`${unexpected.length} other setting line(s)`);
+      problems.push(`.npmrc must hold exactly the frozen lines ${frozen.join(', ')} besides blank and comment lines: ${parts.join('; ')}`);
     }
   }
   let tsconfig;

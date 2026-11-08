@@ -5,7 +5,8 @@
 // Source: spec leg specs/001-corporate-signing-mvp/plan.md, section
 // "Verification runner contract" > "Mode registry" (43 modes).
 //
-// FROZEN at the T001 hardening commit (amendment A-006) together with
+// FROZEN at the A-007 runner commit (amendment A-007, which supersedes the
+// A-006 baseline) together with
 // scripts/verify.mjs and tests/tooling/verification-runner.test.mjs. Only a
 // recorded architect amendment can add or change a mode, through a new [O] task
 // that lists these three files, re-runs the self-tests and re-freezes at that
@@ -300,6 +301,10 @@ export const MODES = Object.freeze({
       { path: 'docs/evidence/acceptance.json', committed: true, labels: { tree_digest: true } },
     ],
   }),
+  // Release gate. Besides acceptance-local, scripts/verify.mjs EXTERNAL_GATES
+  // names the open gates (A-007), in this order: trusted-certificate-key-custody,
+  // validated-oidc-smtp, external-pdf-reader, declared-hardware, real-ci,
+  // production-hermes, parser-network-sandbox. It returns FAIL while any is OPEN.
   acceptance: mode({
     task: '(release gate)',
     kind: 'release',

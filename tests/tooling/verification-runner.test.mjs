@@ -3,10 +3,11 @@
 // Self-tests of the frozen verification runner (plan.md "Self-tests", cases 1-26;
 // case 27: preload flags in NODE_OPTIONS -> ENV_MISMATCH; cases 28-38: the
 // amendment A-006 hardening items M1, M2, M3, L1, L3, L4 and L6; L7 is checked
-// in case 20).
+// in case 20). Amendment A-007: case 28 names the seven release gates,
+// case 34 covers N1 (.npmrc compared as a whole) and case 17 covers N2.
 //
-// FROZEN at the T001 hardening commit (A-006) together with scripts/verify.mjs
-// and scripts/verify-modes.mjs.
+// FROZEN at the A-007 runner commit together with scripts/verify.mjs and
+// scripts/verify-modes.mjs.
 //
 // Fixture suites are generated in temp directories at run time. Engine behaviour
 // is tested by importing runMode() with synthetic registries, so the CLI needs no
@@ -452,6 +453,10 @@ test('[RT-17] runtime mismatch -> ENV_MISMATCH (6)', async () => {
   const registry = { m: leaf({ files: ['tests/m/**/*.test.mjs'] }) };
   const runtime = await engine(makeRoot({ 'tests/m/a.test.mjs': passing('A-01') }, { nodeVersion: '0.0.1' }), registry, 'm');
   expectStatus(runtime, STATUS.ENV_MISMATCH, '.node-version differs from the running node');
+  assert.ok(
+    runtime.reasons.some((reason) => reason.startsWith('runtime ')),
+    `the runtime-version check itself is the reason (A-007 N2): ${runtime.reasons.join(' | ')}`,
+  );
   assert.equal(runtime.tests, 0);
   const lock = {
     ...EMPTY_LOCK,
@@ -697,10 +702,21 @@ test('[RT-27] preload flags in NODE_OPTIONS -> ENV_MISMATCH (6)', async () => {
 
 // --- Amendment A-006 hardening cases -----------------------------------------
 
-const ALL_GATES_OPEN =
-  'open=platform-inventory(POLICY-PENDING),trusted-certificate-key-custody,validated-oidc-smtp,external-pdf-reader,declared-hardware,real-ci,production-hermes';
+// A-007: the platform-inventory gate is removed (owner decision on platform
+// license scope) and parser-network-sandbox is added; exactly these seven
+// gates are open, in this order.
+const RELEASE_GATES = [
+  'trusted-certificate-key-custody',
+  'validated-oidc-smtp',
+  'external-pdf-reader',
+  'declared-hardware',
+  'real-ci',
+  'production-hermes',
+  'parser-network-sandbox',
+];
+const ALL_GATES_OPEN = `open=${RELEASE_GATES.join(',')}`;
 
-test('[RT-28] the release gate returns FAIL naming all 7 open gates (M3)', async () => {
+test('[RT-28] the release gate returns FAIL naming all 7 open gates (M3, A-007)', async () => {
   executed += 1;
   const marker = join(scratch('release'), 'component-ran');
   const capabilities = ['external-pdf-reader', 'declared-hardware', 'ci-run'];
@@ -722,11 +738,19 @@ test('[RT-28] the release gate returns FAIL naming all 7 open gates (M3)', async
     const result = await engine(root, registry, 'rel');
     expectStatus(result, STATUS.FAIL, `release gate with capability probes ${probesPresent ? 'present' : 'absent'}`);
     assert.equal(formatStatusLine(result), `verify: rel FAIL exit=1 files=0 tests=0 pass=0 fail=0 skip=0 todo=0 cases=0/0 ${ALL_GATES_OPEN}`);
-    assert.equal(result.gates.length, 7);
+    assert.deepEqual(
+      result.gates.map((gate) => gate.gate),
+      RELEASE_GATES,
+    );
+    assert.ok(result.reasons.some((reason) => reason.startsWith('release gate: 7 gate(s) are not closed')), result.reasons.join(' | '));
     const receipt = JSON.parse(readFileSync(join(root, '.verify-out', 'rel', 'receipt.json'), 'utf8'));
     assert.equal(receipt.release_ready, false);
-    assert.equal(receipt.gates.length, 7);
-    assert.ok(receipt.gates.every((gate) => gate.status === 'OPEN' || gate.status === 'POLICY-PENDING'));
+    assert.deepEqual(
+      receipt.gates.map((gate) => gate.gate),
+      RELEASE_GATES,
+    );
+    assert.ok(receipt.gates.every((gate) => gate.status === 'OPEN'));
+    assert.ok(!JSON.stringify(receipt).includes('platform-inventory'), 'no platform gate remains');
     assert.equal(existsSync(marker), false, 'no component runs while a gate is open');
   }
 });
@@ -767,8 +791,11 @@ test('[RT-30] the aggregate receipt says release_ready false; committed evidence
   assert.equal(receipt.release_ready, false);
   assert.equal(receipt.tree_digest, digest);
   assert.deepEqual(receipt.covered_cases, ['SC9-01']);
-  assert.equal(receipt.external_gates.length, 7);
-  assert.ok(receipt.external_gates.every((gate) => gate.status === 'OPEN' || gate.status === 'POLICY-PENDING'));
+  assert.deepEqual(
+    receipt.external_gates.map((gate) => gate.gate),
+    RELEASE_GATES,
+  );
+  assert.ok(receipt.external_gates.every((gate) => gate.status === 'OPEN'));
 
   writeTree(root, { 'docs/evidence/acceptance.json': JSON.stringify({ tree_digest: digest }) });
   expectStatus(await engine(root, registry, 'agg'), STATUS.EVIDENCE_MISSING, 'evidence written but not committed');
@@ -838,7 +865,7 @@ test('[RT-33] a tree changed during the run returns EVIDENCE_MISSING (M1)', asyn
   expectStatus(await engine(makeRoot({ 'tests/m/a.test.mjs': mutator }), aggregateRegistry, 'agg'), STATUS.EVIDENCE_MISSING, 'aggregate component');
 });
 
-test('[RT-34] frozen package.json, .npmrc and tsconfig.json values are enforced (M2)', async () => {
+test('[RT-34] frozen package.json, .npmrc and tsconfig.json values are enforced (M2, A-007 N1)', async () => {
   executed += 1;
   assert.deepEqual(frozenConfigProblems(REPO_ROOT), [], 'the code leg carries the frozen configuration');
   const registry = { m: leaf({ files: ['tests/m/**/*.test.mjs'] }) };
@@ -853,6 +880,14 @@ test('[RT-34] frozen package.json, .npmrc and tsconfig.json values are enforced 
     '.npmrc ignore-scripts false': { '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=false\n' },
     '.npmrc save-exact missing': { '.npmrc': 'engine-strict=true\nignore-scripts=true\n' },
     '.npmrc key overridden later': { '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=true\nengine-strict=false\n' },
+    // A-007 N1: the setting lines are compared as a whole.
+    '.npmrc quoted key override': { '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=true\n"ignore-scripts"=false\n' },
+    '.npmrc frozen lines under a section header': { '.npmrc': '[synthetic]\nengine-strict=true\nsave-exact=true\nignore-scripts=true\n' },
+    '.npmrc extra script-shell key': { '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=true\nscript-shell=/bin/sh\n' },
+    '.npmrc extra registry key': { '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=true\nregistry=https://registry.example.test/\n' },
+    '.npmrc quoted value': { '.npmrc': 'engine-strict="true"\nsave-exact=true\nignore-scripts=true\n' },
+    '.npmrc spaced assignment': { '.npmrc': 'engine-strict = true\nsave-exact=true\nignore-scripts=true\n' },
+    '.npmrc duplicated frozen line': { '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=true\nsave-exact=true\n' },
     'tsconfig noCheck': { 'tsconfig.json': JSON.stringify({ ...tsconfig, compilerOptions: { ...tsconfig.compilerOptions, noCheck: true } }) },
     'tsconfig include narrowed': { 'tsconfig.json': JSON.stringify({ ...tsconfig, include: ['src'] }) },
   };
@@ -863,6 +898,11 @@ test('[RT-34] frozen package.json, .npmrc and tsconfig.json values are enforced 
   rmSync(join(noPackage, 'package.json'));
   expectStatus(await engine(noPackage, registry, 'm'), STATUS.ENV_MISMATCH, 'package.json missing');
   expectStatus(await engine(makeRoot({ 'tests/m/a.test.mjs': passing('A-01') }), registry, 'm'), STATUS.PASS, 'frozen configuration');
+  const commented = '# synthetic comment\n\nignore-scripts=true\n; another comment\n  save-exact=true\nengine-strict=true\n';
+  expectStatus(await engine(makeRoot({ 'tests/m/a.test.mjs': passing('A-01'), '.npmrc': commented }), registry, 'm'), STATUS.PASS, 'reordered frozen lines with comments');
+  const quoted = frozenConfigProblems(makeRoot({ '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=true\nscript-shell=/opt/synthetic-shell\n' }));
+  assert.ok(quoted.some((problem) => problem.startsWith('.npmrc must hold exactly the frozen lines')), quoted.join(' | '));
+  assert.ok(!quoted.join(' ').includes('synthetic-shell'), 'the offending line is never echoed');
 });
 
 test('[RT-35] a mock identity at any depth of acceptance evidence returns FAIL (L1)', async () => {
