@@ -6,10 +6,11 @@
 //   npm run verify -- <mode>
 //
 // Contract: spec leg specs/001-corporate-signing-mvp/plan.md, section
-// "Verification runner contract". This file, scripts/verify-modes.mjs and
-// tests/tooling/verification-runner.test.mjs are FROZEN after T001. Only a
-// recorded architect amendment may change them, through a new [O] task that
-// lists these three files, re-runs the self-tests and re-freezes.
+// "Verification runner contract", including amendment A-006 (T001 hardening
+// round). This file, scripts/verify-modes.mjs and
+// tests/tooling/verification-runner.test.mjs are FROZEN at the T001 hardening
+// commit. Only a recorded architect amendment may change them, through a new
+// [O] task that lists these three files, re-runs the self-tests and re-freezes.
 //
 // Exit statuses (one final stdout line, plus .verify-out/<mode>/result.json):
 //   0 PASS  1 FAIL  2 USAGE  3 CAPABILITY_ABSENT  4 VACUOUS
@@ -149,6 +150,36 @@ export const EXTERNAL_GATES = Object.freeze([
   Object.freeze({ gate: 'production-hermes', status: 'OPEN', detail: 'production Hermes (only isolated-local Hermes is exercised)' }),
 ]);
 
+/**
+ * Configuration frozen by amendment A-006 (M2). The runner returns
+ * ENV_MISMATCH when the tree differs from any of these values.
+ */
+export const FROZEN_PACKAGE_SCRIPTS = Object.freeze({
+  verify: 'tools/node/bin/node scripts/verify.mjs',
+  test: 'tools/node/bin/node scripts/verify.mjs all-unit',
+  typecheck: 'tools/node/bin/node node_modules/typescript/bin/tsc --noEmit -p tsconfig.json',
+});
+export const FROZEN_NODE_VERSION = '24.22.2';
+export const FROZEN_NPMRC = Object.freeze({ 'engine-strict': 'true', 'save-exact': 'true', 'ignore-scripts': 'true' });
+export const FROZEN_TSCONFIG = Object.freeze({
+  compilerOptions: Object.freeze({
+    target: 'es2024',
+    lib: Object.freeze(['es2024']),
+    module: 'nodenext',
+    moduleResolution: 'nodenext',
+    strict: true,
+    noUncheckedIndexedAccess: true,
+    noEmit: true,
+    allowImportingTsExtensions: true,
+    erasableSyntaxOnly: true,
+    verbatimModuleSyntax: true,
+    types: Object.freeze(['node']),
+    allowJs: true,
+    checkJs: false,
+  }),
+  include: Object.freeze(['src', 'tests', 'scripts']),
+});
+
 export const FILE_TIMEOUT_MS = 10 * 60 * 1000;
 const SENTINEL_TIMEOUT_MS = 2 * 60 * 1000;
 const PROBE_TIMEOUT_MS = 2 * 60 * 1000;
@@ -166,7 +197,8 @@ const LEAF_KINDS = new Set(['tooling', 'unit', 'harness', 'contract', 'acceptanc
 const ONLY_DIAGNOSTIC = "'only' and 'runOnly' require the --test-only";
 
 // Test-filter flags change which tests run; preload flags can rewrite node:test
-// itself. Either one in NODE_OPTIONS or in the runner's own argv is ENV_MISMATCH.
+// itself. Either one in NODE_OPTIONS is ENV_MISMATCH. The runner's own argv must
+// carry no node flag at all (A-006 L3).
 const FORBIDDEN_NODE_FLAG =
   /^(?:--test(?:$|[-=])|--experimental-test|--import(?:$|=)|--require(?:$|=)|-r|--loader(?:$|=)|--experimental-loader(?:$|=))/;
 
@@ -215,6 +247,8 @@ const DRIVER_SOURCE = [
   '      });',
   "    } else if (event.type === 'test:diagnostic') {",
   '      await send({ t: event.type, message: String(data.message), file: data.file || null });',
+  "    } else if (event.type === 'test:summary' && data.file) {",
+  '      await send({ t: event.type, file: data.file, counts: data.counts || {} });',
   '    }',
   '  }',
   "  await send({ t: 'end' });",
@@ -302,6 +336,7 @@ function newResult(mode, def) {
     gates: [],
     reasons: [],
     tree_digest: null,
+    tree_digest_after: null,
     node: process.version,
     platform: `${process.platform}-${process.arch}`,
     started_at: new Date().toISOString(),
@@ -529,14 +564,35 @@ export function validateRegistry(registry, modeNames) {
   return problems;
 }
 
-/** Every tests/**\/*.test.mjs file must be claimed by exactly one mode. */
+function walkTree(root, relDir, files, links) {
+  let entries;
+  try {
+    entries = readdirSync(join(root, relDir), { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const rel = `${relDir}/${entry.name}`;
+    if (entry.isSymbolicLink()) links.push(rel);
+    else if (entry.isDirectory()) walkTree(root, rel, files, links);
+    else if (entry.isFile()) files.push(rel);
+  }
+}
+
+/**
+ * Every tests/**\/*.test.mjs file must be claimed by exactly one mode, and no
+ * symlink may exist under tests/ (it would be neither run nor claimed).
+ */
 export function findClaimProblems(root, registry) {
   const matchers = Object.entries(registry)
     .filter(([, def]) => Array.isArray(def?.files) && def.files.length > 0)
     .map(([name, def]) => [name, def.files.map(globToRegExp)]);
-  const all = [];
-  walkFiles(root, 'tests', all);
   const problems = [];
+  if (lstatSafe(join(root, 'tests'))?.isSymbolicLink()) return ['tests/ itself is a symlink'];
+  const all = [];
+  const links = [];
+  walkTree(root, 'tests', all, links);
+  for (const link of links.sort()) problems.push(`symlink under tests/ is not allowed: ${link}`);
   for (const file of all.filter((f) => f.endsWith('.test.mjs')).sort()) {
     const owners = matchers.filter(([, patterns]) => patterns.some((p) => p.test(file))).map(([name]) => name);
     if (owners.length === 0) problems.push(`test file ${file} is claimed by no mode`);
@@ -568,6 +624,35 @@ function childEnvFrom(env) {
   return child;
 }
 
+/** Top-level package directories under node_modules (scoped as "@scope/name"). */
+function topLevelPackages(root) {
+  const dir = join(root, 'node_modules');
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const names = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith('.') || !(entry.isDirectory() || entry.isSymbolicLink())) continue;
+    if (!entry.name.startsWith('@')) {
+      names.push(entry.name);
+      continue;
+    }
+    let scoped = [];
+    try {
+      scoped = readdirSync(join(dir, entry.name), { withFileTypes: true });
+    } catch {
+      scoped = [];
+    }
+    for (const member of scoped) {
+      if (!member.name.startsWith('.') && (member.isDirectory() || member.isSymbolicLink())) names.push(`${entry.name}/${member.name}`);
+    }
+  }
+  return names.sort();
+}
+
 function lockfileProblems(root) {
   let lock;
   try {
@@ -588,9 +673,15 @@ function lockfileProblems(root) {
     }
     if (!installed || typeof installed !== 'object') return ['node_modules/.package-lock.json has no "packages" map; run npm ci'];
   }
-  if (lockedKeys.length === 0 && installed === null) return [];
-  if (installed === null) return ['node_modules/.package-lock.json is missing; run npm ci'];
+  const present = topLevelPackages(root);
+  if (installed === null) {
+    if (lockedKeys.length === 0 && present.length === 0) return [];
+    return ['node_modules/.package-lock.json is missing; run npm ci'];
+  }
   const problems = [];
+  for (const name of present) {
+    if (!Object.hasOwn(installed, `node_modules/${name}`)) problems.push(`node_modules/${name} is installed but missing from node_modules/.package-lock.json`);
+  }
   const same = (a, b) => a.version === b.version && a.resolved === b.resolved && a.integrity === b.integrity;
   for (const key of lockedKeys) {
     const want = locked[key];
@@ -634,11 +725,93 @@ function environmentProblems(ctx) {
   if (process.platform !== 'linux' || process.arch !== 'x64') {
     problems.push(`platform ${process.platform}-${process.arch} is not linux-x64`);
   }
+  problems.push(...frozenConfigProblems(ctx.root));
   problems.push(...lockfileProblems(ctx.root));
   const fromOptions = forbiddenFlags(nodeOptionTokens(ctx.env));
   if (fromOptions.length > 0) problems.push(`NODE_OPTIONS carries test-filter or preload flags: ${fromOptions.join(' ')}`);
-  const fromArgv = forbiddenFlags(ctx.execArgv);
-  if (fromArgv.length > 0) problems.push(`the runner was started with test-filter or preload flags: ${fromArgv.join(' ')}`);
+  if (ctx.execArgv.length > 0) problems.push(`the runner must be started without node flags; got: ${ctx.execArgv.join(' ')}`);
+  return problems;
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function parseNpmrc(text) {
+  const values = new Map();
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#') || line.startsWith(';')) continue;
+    const eq = line.indexOf('=');
+    if (eq < 0) {
+      values.set(line, 'true');
+      continue;
+    }
+    let value = line.slice(eq + 1).trim();
+    if (/^(["']).*\1$/.test(value)) value = value.slice(1, -1);
+    values.set(line.slice(0, eq).trim(), value); // the last assignment wins, as in npm
+  }
+  return values;
+}
+
+/**
+ * A-006 M2: package.json scripts.verify/test/typecheck and engines.node,
+ * .node-version, the three .npmrc keys and the whole tsconfig.json (so any
+ * noCheck) must equal the frozen values.
+ */
+export function frozenConfigProblems(root) {
+  const problems = [];
+  let pkg = null;
+  try {
+    pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  } catch {
+    problems.push('package.json is missing or not valid JSON');
+  }
+  if (pkg !== null) {
+    for (const [name, expected] of Object.entries(FROZEN_PACKAGE_SCRIPTS)) {
+      const actual = pkg?.scripts?.[name];
+      if (actual !== expected) problems.push(`package.json scripts.${name} is ${JSON.stringify(actual ?? null)}; frozen value ${JSON.stringify(expected)}`);
+    }
+    const engine = pkg?.engines?.node;
+    if (engine !== FROZEN_NODE_VERSION) problems.push(`package.json engines.node is ${JSON.stringify(engine ?? null)}; frozen value "${FROZEN_NODE_VERSION}"`);
+  }
+  let pinned = null;
+  try {
+    pinned = readFileSync(join(root, '.node-version'), 'utf8').trim();
+  } catch {
+    pinned = null;
+  }
+  if (pinned !== null && pinned !== FROZEN_NODE_VERSION) problems.push(`.node-version is ${pinned}; frozen value ${FROZEN_NODE_VERSION}`);
+  let npmrc = null;
+  try {
+    npmrc = readFileSync(join(root, '.npmrc'), 'utf8');
+  } catch {
+    problems.push('.npmrc is missing');
+  }
+  if (npmrc !== null) {
+    const values = parseNpmrc(npmrc);
+    for (const [key, expected] of Object.entries(FROZEN_NPMRC)) {
+      if (values.get(key) !== expected) problems.push(`.npmrc ${key} is ${values.has(key) ? JSON.stringify(values.get(key)) : 'unset'}; frozen value ${expected}`);
+    }
+  }
+  let tsconfig;
+  try {
+    tsconfig = JSON.parse(readFileSync(join(root, 'tsconfig.json'), 'utf8'));
+  } catch {
+    problems.push('tsconfig.json is missing or not plain JSON');
+    return problems;
+  }
+  if (canonicalJson(tsconfig) !== canonicalJson(FROZEN_TSCONFIG)) {
+    const noCheck = tsconfig?.compilerOptions?.noCheck !== undefined ? ' (compilerOptions.noCheck is set)' : '';
+    problems.push(`tsconfig.json differs from the frozen configuration${noCheck}`);
+  }
   return problems;
 }
 
@@ -887,8 +1060,15 @@ function tally(events, absFile, root) {
     failures: [],
     passedIds: [],
   };
+  // A cancellation error can lose its failureType when it crosses the process
+  // boundary, so the child's own per-file summary count is also consulted.
+  let summaryCancelled = 0;
   for (const event of events) {
     if (!event || typeof event !== 'object') continue;
+    if (event.t === 'test:summary') {
+      summaryCancelled = Math.max(summaryCancelled, Number(event.counts?.cancelled ?? 0) || 0);
+      continue;
+    }
     if (event.t === 'test:diagnostic') {
       if (typeof event.message === 'string' && event.message.includes(ONLY_DIAGNOSTIC)) counts.only += 1;
       continue;
@@ -903,7 +1083,7 @@ function tally(events, absFile, root) {
     }
     if (event.t === 'test:fail') {
       counts.fail += 1;
-      if (event.failureType === 'cancelledByParent') counts.cancelled += 1;
+      if (event.failureType === 'cancelledByParent' || event.failureType === 'testAborted') counts.cancelled += 1;
       if (isTest) counts.tests += 1;
       counts.failures.push({ name: wrapper ? '(file)' : event.name, failureType: event.failureType, message: event.message });
       continue;
@@ -920,6 +1100,7 @@ function tally(events, absFile, root) {
     const match = CASE_ID.exec(event.name);
     if (match) counts.passedIds.push(match[1]);
   }
+  counts.cancelled = Math.max(counts.cancelled, summaryCancelled);
   return counts;
 }
 
@@ -1017,6 +1198,16 @@ function describeRequirement(requirement) {
   return `must match /${requirement.pattern}/`;
 }
 
+/** Every string value in a parsed JSON document, at any depth (A-006 L1). */
+function stringLeaves(value, where, out) {
+  if (typeof value === 'string') out.push([where || '(root)', value]);
+  else if (Array.isArray(value)) value.forEach((item, index) => stringLeaves(item, `${where}[${index}]`, out));
+  else if (value !== null && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) stringLeaves(item, where ? `${where}.${key}` : key, out);
+  }
+  return out;
+}
+
 function checkEvidence(ctx, def, runStartMs) {
   const checks = [];
   const missing = [];
@@ -1057,10 +1248,9 @@ function checkEvidence(ctx, def, runStartMs) {
       if (!labelSatisfied(requirement, data[label])) note(`label ${label} ${describeRequirement(requirement)} (found ${JSON.stringify(data[label] ?? null)})`);
     }
     if (def.kind === 'acceptance') {
-      for (const [label, value] of Object.entries(data)) {
-        if (typeof value !== 'string') continue;
+      for (const [where, value] of stringLeaves(data, '', [])) {
         const mock = KNOWN_MOCKS.find((name) => value.toLowerCase().includes(name));
-        if (mock) note(`label ${label}=${JSON.stringify(value)} names the known mock ${mock}`, false_claims);
+        if (mock) note(`value at ${where} names the known mock ${mock}`, false_claims);
       }
     }
     if (ev.noCredentials) {
@@ -1132,6 +1322,17 @@ function writeResult(ctx, result) {
   writeJson(join(ctx.root, '.verify-out', dirName, 'result.json'), result);
 }
 
+/**
+ * A-006 M1: recompute the tree digest after the tests and before any evidence
+ * or committed-receipt check. Results and evidence bind to one tree only.
+ */
+function treeChangedReason(ctx, result) {
+  const after = computeTreeDigest(ctx.root);
+  result.tree_digest_after = after;
+  if (after === ctx.treeDigest) return null;
+  return `tree changed during run: the tree digest was ${ctx.treeDigest} before the tests and ${after} after`;
+}
+
 async function runLeaf(ctx, name, def, { standalone }) {
   const result = newResult(name, def);
   result.tree_digest = ctx.treeDigest;
@@ -1178,6 +1379,8 @@ async function runLeaf(ctx, name, def, { standalone }) {
   const verdict = classify(def, executed, files.length);
   result.cases = { found: verdict.found, required: def.requiredCases.length, missing: verdict.missing };
   if (verdict.code !== STATUS.PASS) return settle(result, verdict.code, ...verdict.reasons);
+  const changed = treeChangedReason(ctx, result);
+  if (changed) return settle(result, STATUS.EVIDENCE_MISSING, changed);
   if (def.evidence.length > 0) {
     const evidence = checkEvidence(ctx, def, runStartMs);
     result.evidence = evidence.checks;
@@ -1218,6 +1421,8 @@ async function runAggregate(ctx, name, def) {
     // A harness or contract component never counts as success-criterion evidence.
     if (!NON_EVIDENCE_KINDS.has(member.kind)) for (const id of componentResult.passed_case_ids) covered.add(id);
   }
+  const changed = treeChangedReason(ctx, result);
+  if (changed) return settle(result, STATUS.EVIDENCE_MISSING, changed);
   const missing = def.requiredCases.filter((id) => !covered.has(id));
   result.cases = { found: def.requiredCases.length - missing.length, required: def.requiredCases.length, missing };
   result.passed_case_ids = [...covered].sort();
@@ -1364,6 +1569,7 @@ export async function runMode(name, options = {}) {
 
 function emit(result) {
   for (const reason of result.reasons) process.stderr.write(`verify: - ${reason}\n`);
+  process.exitCode = result.exit; // set before writing (A-006 L5)
   process.stdout.write(`${formatStatusLine(result)}\n`, () => process.exit(result.exit));
 }
 

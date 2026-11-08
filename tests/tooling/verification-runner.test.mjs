@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Self-tests of the frozen verification runner (plan.md "Self-tests", cases 1-26,
-// plus case 27: preload flags in NODE_OPTIONS -> ENV_MISMATCH, accepted by the
-// orchestrator on 2026-11-08).
+// Self-tests of the frozen verification runner (plan.md "Self-tests", cases 1-26;
+// case 27: preload flags in NODE_OPTIONS -> ENV_MISMATCH; cases 28-38: the
+// amendment A-006 hardening items M1, M2, M3, L1, L3, L4 and L6; L7 is checked
+// in case 20).
 //
-// FROZEN after T001 together with scripts/verify.mjs and scripts/verify-modes.mjs.
+// FROZEN at the T001 hardening commit (A-006) together with scripts/verify.mjs
+// and scripts/verify-modes.mjs.
 //
 // Fixture suites are generated in temp directories at run time. Engine behaviour
 // is tested by importing runMode() with synthetic registries, so the CLI needs no
@@ -13,7 +15,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,11 +24,16 @@ import { after, test } from 'node:test';
 import {
   CAPABILITY_NAMES,
   FROZEN_MODE_NAMES,
+  FROZEN_NODE_VERSION,
+  FROZEN_NPMRC,
+  FROZEN_PACKAGE_SCRIPTS,
+  FROZEN_TSCONFIG,
   MODE_KINDS,
   STATUS,
   computeTreeDigest,
   findClaimProblems,
   formatStatusLine,
+  frozenConfigProblems,
   runMode,
   validateRegistry,
 } from '../../scripts/verify.mjs';
@@ -36,7 +43,7 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const VERIFY_CLI = join(REPO_ROOT, 'scripts', 'verify.mjs');
 
 // Count guard: every declared self-test must execute (case 22).
-const EXPECTED_TESTS = 27;
+const EXPECTED_TESTS = 38;
 let executed = 0;
 after(() => {
   assert.equal(executed, EXPECTED_TESTS, `executed ${executed} self-tests but ${EXPECTED_TESTS} are declared`);
@@ -103,6 +110,42 @@ function scratch(label) {
 
 const EMPTY_LOCK = { name: 'fixture', lockfileVersion: 3, requires: true, packages: { '': { name: 'fixture' } } };
 
+// Temp roots carry the A-006 frozen configuration so only the case under test differs.
+const FROZEN_FILES = {
+  'package.json': JSON.stringify({
+    name: 'fixture',
+    private: true,
+    type: 'module',
+    engines: { node: FROZEN_NODE_VERSION },
+    scripts: { ...FROZEN_PACKAGE_SCRIPTS },
+  }),
+  '.npmrc': `${Object.entries(FROZEN_NPMRC)
+    .map(([key, value]) => `${key}=${value}`)
+    .join('\n')}\n`,
+  'tsconfig.json': JSON.stringify(FROZEN_TSCONFIG, null, 2),
+};
+
+const GIT_COMMIT_ENV = (() => {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
+  return {
+    ...env,
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 'Synthetic Author',
+    GIT_AUTHOR_EMAIL: 'author@example.test',
+    GIT_COMMITTER_NAME: 'Synthetic Committer',
+    GIT_COMMITTER_EMAIL: 'committer@example.test',
+  };
+})();
+
+function commitAll(root) {
+  for (const args of [['add', '-A', '-f', '--', '.'], ['commit', '-q', '--no-gpg-sign', '-m', 'synthetic']]) {
+    const run = spawnSync('git', args, { cwd: root, env: GIT_COMMIT_ENV, encoding: 'utf8' });
+    assert.equal(run.status, 0, `git ${args[0]} failed: ${run.stderr}`);
+  }
+}
+
 function writeTree(root, files) {
   for (const [rel, content] of Object.entries(files)) {
     const abs = join(root, rel);
@@ -113,7 +156,7 @@ function writeTree(root, files) {
 
 function makeRoot(files = {}, { nodeVersion = process.version.slice(1), lock = EMPTY_LOCK } = {}) {
   const root = scratch('root');
-  writeTree(root, { '.node-version': `${nodeVersion}\n`, 'package-lock.json': JSON.stringify(lock), ...files });
+  writeTree(root, { ...FROZEN_FILES, '.node-version': `${nodeVersion}\n`, 'package-lock.json': JSON.stringify(lock), ...files });
   const init = spawnSync('git', ['init', '-q'], { cwd: root, encoding: 'utf8' });
   assert.equal(init.status, 0, `git init failed: ${init.stderr}`);
   return root;
@@ -493,9 +536,19 @@ test('[RT-20] registry names equal the frozen list and every test file is claime
     (name) => ['unit', 'harness', 'contract'].includes(MODES[name].kind) && MODES[name].capabilities.length === 0,
   );
   assert.deepEqual([...MODES['all-unit'].components], expectedAllUnit);
+  // A-006 L7: acceptance-local runs in the order of the task lines in tasks.md (spec e35b968).
+  const taskOrder = [
+    'no-secrets', 'license-inventory', 'qualification', 'storage', 'blobs', 'audit-chain', 'outbox-restore', 'dev', 'auth',
+    'server', 'notifications', 'parser-limits', 'envelope-contract', 'envelopes', 'recipients', 'envelope-api', 'approval',
+    'ui-build', 'autograph', 'us1', 'integrity-contract', 'cms', 'compose', 'cryptograph', 'verification', 'completion',
+    'recovery', 'zip', 'artifacts', 'us2-local', 'hermes-contract', 'webhooks', 'healthcare-contracts', 'anchoring-disabled',
+    'hermes-runtime', 'us3', 'release-gates', 'operations',
+  ];
+  assert.deepEqual([...MODES['acceptance-local'].components], taskOrder);
   assert.deepEqual(
-    [...MODES['acceptance-local'].components],
-    leafNames.filter((name) => name !== 'tooling' && name !== 'us3-real-model'),
+    [...taskOrder].sort(),
+    leafNames.filter((name) => name !== 'tooling' && name !== 'us3-real-model').sort(),
+    'acceptance-local holds every leaf mode except tooling and us3-real-model',
   );
   for (const name of ['all-unit', 'acceptance-local']) {
     assert.ok(!MODES[name].components.includes('us3-real-model'), `${name} excludes us3-real-model`);
@@ -640,4 +693,248 @@ test('[RT-27] preload flags in NODE_OPTIONS -> ENV_MISMATCH (6)', async () => {
     expectStatus(await engine(root, registry, 'm', { env: { ...ENGINE_ENV, NODE_OPTIONS: options } }), STATUS.ENV_MISMATCH, `NODE_OPTIONS ${options}`);
   }
   expectStatus(await engine(root, registry, 'm', { env: { ...ENGINE_ENV, NODE_OPTIONS: '--max-old-space-size=256' } }), STATUS.PASS, 'benign NODE_OPTIONS');
+});
+
+// --- Amendment A-006 hardening cases -----------------------------------------
+
+const ALL_GATES_OPEN =
+  'open=platform-inventory(POLICY-PENDING),trusted-certificate-key-custody,validated-oidc-smtp,external-pdf-reader,declared-hardware,real-ci,production-hermes';
+
+test('[RT-28] the release gate returns FAIL naming all 7 open gates (M3)', async () => {
+  executed += 1;
+  const marker = join(scratch('release'), 'component-ran');
+  const capabilities = ['external-pdf-reader', 'declared-hardware', 'ci-run'];
+  const registry = {
+    u: leaf({ files: ['tests/u/**/*.test.mjs'] }),
+    agg: aggregate({ components: ['u'] }),
+    rel: leaf({
+      kind: 'release',
+      minTests: 0,
+      components: ['agg'],
+      capabilities,
+      evidence: [{ path: '.verify-out/rel/receipt.json', receipt: true }],
+    }),
+  };
+  for (const probesPresent of [false, true]) {
+    const files = { 'tests/u/a.test.mjs': markerWriter(marker) };
+    if (probesPresent) for (const name of capabilities) files[`scripts/capabilities/${name}.mjs`] = 'process.exit(0);\n';
+    const root = makeRoot(files);
+    const result = await engine(root, registry, 'rel');
+    expectStatus(result, STATUS.FAIL, `release gate with capability probes ${probesPresent ? 'present' : 'absent'}`);
+    assert.equal(formatStatusLine(result), `verify: rel FAIL exit=1 files=0 tests=0 pass=0 fail=0 skip=0 todo=0 cases=0/0 ${ALL_GATES_OPEN}`);
+    assert.equal(result.gates.length, 7);
+    const receipt = JSON.parse(readFileSync(join(root, '.verify-out', 'rel', 'receipt.json'), 'utf8'));
+    assert.equal(receipt.release_ready, false);
+    assert.equal(receipt.gates.length, 7);
+    assert.ok(receipt.gates.every((gate) => gate.status === 'OPEN' || gate.status === 'POLICY-PENDING'));
+    assert.equal(existsSync(marker), false, 'no component runs while a gate is open');
+  }
+});
+
+test('[RT-29] an aggregate returns CAPABILITY_ABSENT at top level before any component runs (M3)', async () => {
+  executed += 1;
+  const marker = join(scratch('agg-capability'), 'component-ran');
+  const registry = {
+    u: leaf({ files: ['tests/u/**/*.test.mjs'] }),
+    'acceptance-local': aggregate({ components: ['u'], capabilities: ['hermes-runtime'], requiredCases: ['M-01'] }),
+  };
+  const result = await engine(makeRoot({ 'tests/u/a.test.mjs': markerWriter(marker) }), registry, 'acceptance-local');
+  expectStatus(result, STATUS.CAPABILITY_ABSENT, 'aggregate capability absent');
+  assert.equal(result.tests, 0);
+  assert.deepEqual(result.components, []);
+  assert.equal(existsSync(marker), false, 'no component ran');
+});
+
+test('[RT-30] the aggregate receipt says release_ready false; committed evidence must match the tree (M3)', async () => {
+  executed += 1;
+  const registry = {
+    u: leaf({ files: ['tests/u/**/*.test.mjs'] }),
+    agg: aggregate({
+      components: ['u'],
+      requiredCases: ['SC9-01'],
+      evidence: [
+        { path: '.verify-out/agg/receipt.json', receipt: true },
+        { path: 'docs/evidence/acceptance.json', committed: true, labels: { tree_digest: true } },
+      ],
+    }),
+  };
+  const root = makeRoot({ 'tests/u/a.test.mjs': passing('SC9-01') });
+  commitAll(root);
+  const digest = computeTreeDigest(root);
+
+  expectStatus(await engine(root, registry, 'agg'), STATUS.EVIDENCE_MISSING, 'committed evidence absent');
+  const receipt = JSON.parse(readFileSync(join(root, '.verify-out', 'agg', 'receipt.json'), 'utf8'));
+  assert.equal(receipt.release_ready, false);
+  assert.equal(receipt.tree_digest, digest);
+  assert.deepEqual(receipt.covered_cases, ['SC9-01']);
+  assert.equal(receipt.external_gates.length, 7);
+  assert.ok(receipt.external_gates.every((gate) => gate.status === 'OPEN' || gate.status === 'POLICY-PENDING'));
+
+  writeTree(root, { 'docs/evidence/acceptance.json': JSON.stringify({ tree_digest: digest }) });
+  expectStatus(await engine(root, registry, 'agg'), STATUS.EVIDENCE_MISSING, 'evidence written but not committed');
+  commitAll(root);
+  expectStatus(await engine(root, registry, 'agg'), STATUS.PASS, 'committed evidence carries the tree digest');
+
+  writeTree(root, { 'docs/evidence/acceptance.json': JSON.stringify({ tree_digest: 'e'.repeat(64) }) });
+  expectStatus(await engine(root, registry, 'agg'), STATUS.EVIDENCE_MISSING, 'working copy differs from HEAD');
+  commitAll(root);
+  expectStatus(await engine(root, registry, 'agg'), STATUS.EVIDENCE_MISSING, 'committed tree digest mismatch');
+});
+
+test('[RT-31] a typecheck error returns FAIL (M3)', async () => {
+  executed += 1;
+  const lock = JSON.parse(readFileSync(join(REPO_ROOT, 'package-lock.json'), 'utf8'));
+  const registry = { m: leaf({ files: ['tests/m/**/*.test.mjs'], typecheck: true }) };
+  const build = (source) => {
+    const root = makeRoot({ 'tests/m/a.test.mjs': passing('A-01'), 'src/sample.ts': source }, { lock });
+    symlinkSync(join(REPO_ROOT, 'node_modules'), join(root, 'node_modules'));
+    symlinkSync(join(REPO_ROOT, 'tools'), join(root, 'tools'));
+    return root;
+  };
+  const broken = await engine(build("export const count: number = 'not a number';\n"), registry, 'm');
+  expectStatus(broken, STATUS.FAIL, 'type error');
+  assert.ok(broken.reasons.some((reason) => reason.startsWith('typecheck failed')), 'the typecheck is named');
+  assert.equal(broken.tests, 0, 'no test runs after a failed typecheck');
+  expectStatus(await engine(build('export const count: number = 1;\n'), registry, 'm'), STATUS.PASS, 'clean typecheck');
+});
+
+test('[RT-32] a cancelled test returns FAIL (M3)', async () => {
+  executed += 1;
+  // The test's own signal aborts while it runs, so node:test cancels it.
+  const source =
+    `${HEAD}const controller = new AbortController();\n` +
+    "test('[C-01] cancelled while running', { signal: controller.signal }, async () => {\n" +
+    '  setTimeout(() => controller.abort(), 20);\n' +
+    '  await new Promise((resolve) => setTimeout(resolve, 2000));\n' +
+    '});\n';
+  const result = await engine(makeRoot({ 'tests/m/a.test.mjs': source }), { m: leaf({ files: ['tests/m/**/*.test.mjs'] }) }, 'm');
+  expectStatus(result, STATUS.FAIL, 'cancelled subtest');
+  assert.ok(result.cancelled >= 1, `the cancellation is counted (cancelled=${result.cancelled})`);
+});
+
+test('[RT-33] a tree changed during the run returns EVIDENCE_MISSING (M1)', async () => {
+  executed += 1;
+  const mutator =
+    `${HEAD}import { mkdirSync, writeFileSync } from 'node:fs';\n` +
+    "test('[T-01] writes into src/', () => {\n  mkdirSync('src', { recursive: true });\n  writeFileSync('src/written-during-run.ts', 'export {};\\n');\n});\n";
+  const plain = { m: leaf({ files: ['tests/m/**/*.test.mjs'] }) };
+  const leafResult = await engine(makeRoot({ 'tests/m/a.test.mjs': mutator }), plain, 'm');
+  expectStatus(leafResult, STATUS.EVIDENCE_MISSING, 'leaf mode');
+  assert.ok(leafResult.reasons.some((reason) => reason.startsWith('tree changed during run')));
+  assert.notEqual(leafResult.tree_digest_after, leafResult.tree_digest);
+
+  const evidenceThenMutate =
+    `${HEAD}import { mkdirSync, writeFileSync } from 'node:fs';\n` +
+    "test('[T-01] writes evidence, then changes the tree', () => {\n" +
+    '  mkdirSync(process.env.OPENSIG_VERIFY_OUT, { recursive: true });\n' +
+    "  writeFileSync(process.env.OPENSIG_VERIFY_OUT + '/evidence.json', JSON.stringify({ tree_digest: process.env.OPENSIG_VERIFY_TREE_DIGEST }));\n" +
+    "  mkdirSync('fixtures', { recursive: true });\n  writeFileSync('fixtures/generated.txt', 'changed');\n});\n";
+  const withEvidence = {
+    m: leaf({ files: ['tests/m/**/*.test.mjs'], evidence: [{ path: '.verify-out/m/evidence.json', labels: { tree_digest: true } }] }),
+  };
+  expectStatus(await engine(makeRoot({ 'tests/m/a.test.mjs': evidenceThenMutate }), withEvidence, 'm'), STATUS.EVIDENCE_MISSING, 'evidence-bearing mode');
+
+  const aggregateRegistry = { m: leaf({ files: ['tests/m/**/*.test.mjs'] }), agg: aggregate({ components: ['m'] }) };
+  expectStatus(await engine(makeRoot({ 'tests/m/a.test.mjs': mutator }), aggregateRegistry, 'agg'), STATUS.EVIDENCE_MISSING, 'aggregate component');
+});
+
+test('[RT-34] frozen package.json, .npmrc and tsconfig.json values are enforced (M2)', async () => {
+  executed += 1;
+  assert.deepEqual(frozenConfigProblems(REPO_ROOT), [], 'the code leg carries the frozen configuration');
+  const registry = { m: leaf({ files: ['tests/m/**/*.test.mjs'] }) };
+  const pkg = JSON.parse(FROZEN_FILES['package.json']);
+  const tsconfig = JSON.parse(FROZEN_FILES['tsconfig.json']);
+  const withScripts = (scripts) => JSON.stringify({ ...pkg, scripts: { ...pkg.scripts, ...scripts } });
+  const mutations = {
+    'scripts.typecheck replaced': { 'package.json': withScripts({ typecheck: 'exit 0' }) },
+    'scripts.verify rerouted': { 'package.json': withScripts({ verify: 'node scripts/other.mjs' }) },
+    'scripts.test changed': { 'package.json': withScripts({ test: 'tools/node/bin/node scripts/verify.mjs tooling' }) },
+    'engines.node widened': { 'package.json': JSON.stringify({ ...pkg, engines: { node: '>=24' } }) },
+    '.npmrc ignore-scripts false': { '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=false\n' },
+    '.npmrc save-exact missing': { '.npmrc': 'engine-strict=true\nignore-scripts=true\n' },
+    '.npmrc key overridden later': { '.npmrc': 'engine-strict=true\nsave-exact=true\nignore-scripts=true\nengine-strict=false\n' },
+    'tsconfig noCheck': { 'tsconfig.json': JSON.stringify({ ...tsconfig, compilerOptions: { ...tsconfig.compilerOptions, noCheck: true } }) },
+    'tsconfig include narrowed': { 'tsconfig.json': JSON.stringify({ ...tsconfig, include: ['src'] }) },
+  };
+  for (const [label, files] of Object.entries(mutations)) {
+    expectStatus(await engine(makeRoot({ 'tests/m/a.test.mjs': passing('A-01'), ...files }), registry, 'm'), STATUS.ENV_MISMATCH, label);
+  }
+  const noPackage = makeRoot({ 'tests/m/a.test.mjs': passing('A-01') });
+  rmSync(join(noPackage, 'package.json'));
+  expectStatus(await engine(noPackage, registry, 'm'), STATUS.ENV_MISMATCH, 'package.json missing');
+  expectStatus(await engine(makeRoot({ 'tests/m/a.test.mjs': passing('A-01') }), registry, 'm'), STATUS.PASS, 'frozen configuration');
+});
+
+test('[RT-35] a mock identity at any depth of acceptance evidence returns FAIL (L1)', async () => {
+  executed += 1;
+  const registry = {
+    m: leaf({
+      kind: 'acceptance',
+      files: ['tests/m/**/*.test.mjs'],
+      evidence: [{ path: '.verify-out/m/evidence.json', labels: { verifier_name: true, tree_digest: true } }],
+    }),
+  };
+  const run = (labels) => engine(makeRoot({ 'tests/m/a.test.mjs': evidenceWriter(labels) }), registry, 'm');
+  expectStatus(await run({ verifier_name: 'openssl-cms 3.0', reader: { name: 'fake-verifier' } }), STATUS.FAIL, 'nested object');
+  expectStatus(await run({ verifier_name: 'openssl-cms 3.0', tools: ['chromium 140', 'jsdom 26'] }), STATUS.FAIL, 'array element');
+  expectStatus(await run({ verifier_name: 'openssl-cms 3.0', runs: [{ steps: [{ runtime: 'hermes-stub v1' }] }] }), STATUS.FAIL, 'deep nesting');
+  expectStatus(await run({ verifier_name: 'openssl-cms 3.0', reader: { name: 'external reader' }, tools: ['chromium 140'] }), STATUS.PASS, 'no mock anywhere');
+});
+
+test('[RT-36] any node flag on the runner itself returns ENV_MISMATCH (L3)', async () => {
+  executed += 1;
+  const root = makeRoot({ 'tests/m/a.test.mjs': passing('A-01') });
+  const registry = { m: leaf({ files: ['tests/m/**/*.test.mjs'] }) };
+  for (const flags of [['--max-old-space-size=128'], ['--experimental-config-file=node.config.json'], ['--no-warnings']]) {
+    expectStatus(await engine(root, registry, 'm', { execArgv: flags }), STATUS.ENV_MISMATCH, `runner flags ${flags.join(' ')}`);
+  }
+  expectStatus(await engine(root, registry, 'm', { execArgv: [] }), STATUS.PASS, 'no runner flags');
+});
+
+test('[RT-37] a symlink under tests/ returns RUNNER_ERROR (L4)', async () => {
+  executed += 1;
+  const registry = { m: leaf({ files: ['tests/m/**/*.test.mjs'] }), n: leaf({ files: ['tests/n/**/*.test.mjs'] }) };
+  const fileLink = makeRoot({ 'tests/m/a.test.mjs': passing('A-01') });
+  symlinkSync('a.test.mjs', join(fileLink, 'tests', 'm', 'b.test.mjs'));
+  const linked = await engine(fileLink, registry, 'm');
+  expectStatus(linked, STATUS.RUNNER_ERROR, 'symlinked test file');
+  assert.ok(linked.reasons.some((reason) => reason.includes('tests/m/b.test.mjs')), 'the symlink is named');
+  const dirLink = makeRoot({ 'tests/m/a.test.mjs': passing('A-01') });
+  symlinkSync(join(dirLink, 'tests', 'm'), join(dirLink, 'tests', 'n'));
+  expectStatus(await engine(dirLink, registry, 'm'), STATUS.RUNNER_ERROR, 'symlinked test directory');
+});
+
+test('[RT-38] lockfile version or integrity drift and unlisted installed packages return ENV_MISMATCH (L6)', async () => {
+  executed += 1;
+  const registry = { m: leaf({ files: ['tests/m/**/*.test.mjs'] }) };
+  const entry = {
+    version: '1.0.0',
+    resolved: 'https://registry.npmjs.org/pkg-a/-/pkg-a-1.0.0.tgz',
+    integrity: `sha512-${'A'.repeat(86)}==`,
+    dev: true,
+    license: 'MIT',
+  };
+  const lock = { ...EMPTY_LOCK, packages: { '': { name: 'fixture' }, 'node_modules/pkg-a': entry } };
+  const tree = (overrides = {}, extra = {}) => ({
+    'tests/m/a.test.mjs': passing('A-01'),
+    'node_modules/.package-lock.json': JSON.stringify({ name: 'fixture', lockfileVersion: 3, requires: true, packages: { 'node_modules/pkg-a': { ...entry, ...overrides } } }),
+    'node_modules/pkg-a/package.json': JSON.stringify({ name: 'pkg-a', version: '1.0.0' }),
+    ...extra,
+  });
+  expectStatus(await engine(makeRoot(tree(), { lock }), registry, 'm'), STATUS.PASS, 'installed tree equals the lockfile');
+  expectStatus(await engine(makeRoot(tree({ version: '1.0.1' }), { lock }), registry, 'm'), STATUS.ENV_MISMATCH, 'version drift');
+  expectStatus(await engine(makeRoot(tree({ integrity: `sha512-${'B'.repeat(86)}==` }), { lock }), registry, 'm'), STATUS.ENV_MISMATCH, 'integrity drift');
+  expectStatus(
+    await engine(makeRoot(tree({}, { 'node_modules/pkg-a/package.json': JSON.stringify({ name: 'pkg-a', version: '1.0.2' }) }), { lock }), registry, 'm'),
+    STATUS.ENV_MISMATCH,
+    'installed package.json differs',
+  );
+  const rogue = await engine(makeRoot(tree({}, { 'node_modules/rogue/package.json': '{"name":"rogue","version":"0.0.1"}' }), { lock }), registry, 'm');
+  expectStatus(rogue, STATUS.ENV_MISMATCH, 'unlisted top-level package');
+  assert.ok(rogue.reasons.some((reason) => reason.includes('node_modules/rogue')), 'the unlisted package is named');
+  expectStatus(
+    await engine(makeRoot(tree({}, { 'node_modules/@scope/rogue/package.json': '{"name":"@scope/rogue","version":"0.0.1"}' }), { lock }), registry, 'm'),
+    STATUS.ENV_MISMATCH,
+    'unlisted scoped package',
+  );
 });

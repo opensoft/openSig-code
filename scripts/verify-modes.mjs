@@ -5,10 +5,11 @@
 // Source: spec leg specs/001-corporate-signing-mvp/plan.md, section
 // "Verification runner contract" > "Mode registry" (43 modes).
 //
-// FROZEN after T001 together with scripts/verify.mjs and
-// tests/tooling/verification-runner.test.mjs. Only a recorded architect
-// amendment can add or change a mode, through a new [O] task that lists these
-// three files, re-runs the self-tests and re-freezes at that task's commit.
+// FROZEN at the T001 hardening commit (amendment A-006) together with
+// scripts/verify.mjs and tests/tooling/verification-runner.test.mjs. Only a
+// recorded architect amendment can add or change a mode, through a new [O] task
+// that lists these three files, re-runs the self-tests and re-freezes at that
+// task's commit.
 //
 // Every mode is pre-registered. Before a mode's own task lands, its globs match
 // nothing and the runner returns VACUOUS (exit 4), never PASS.
@@ -228,8 +229,49 @@ const ALL_UNIT_COMPONENTS = LEAF_NAMES.filter((name) => {
   return ['unit', 'harness', 'contract'].includes(m.kind) && m.capabilities.length === 0;
 });
 
-// acceptance-local: every mode above except tooling and us3-real-model, in task order.
-const ACCEPTANCE_LOCAL_COMPONENTS = LEAF_NAMES.filter((name) => name !== 'tooling' && name !== 'us3-real-model');
+// acceptance-local: every leaf mode except tooling and us3-real-model, in the
+// order of the task lines in tasks.md at spec e35b968 (amendment A-006 L7:
+// recipients, T008, runs before envelope-api, T034, which depends on it).
+const ACCEPTANCE_LOCAL_COMPONENTS = [
+  'no-secrets',
+  'license-inventory',
+  'qualification',
+  'storage',
+  'blobs',
+  'audit-chain',
+  'outbox-restore',
+  'dev',
+  'auth',
+  'server',
+  'notifications',
+  'parser-limits',
+  'envelope-contract',
+  'envelopes',
+  'recipients',
+  'envelope-api',
+  'approval',
+  'ui-build',
+  'autograph',
+  'us1',
+  'integrity-contract',
+  'cms',
+  'compose',
+  'cryptograph',
+  'verification',
+  'completion',
+  'recovery',
+  'zip',
+  'artifacts',
+  'us2-local',
+  'hermes-contract',
+  'webhooks',
+  'healthcare-contracts',
+  'anchoring-disabled',
+  'hermes-runtime',
+  'us3',
+  'release-gates',
+  'operations',
+];
 
 const ACCEPTANCE_LOCAL_REQUIRED = [
   ...caseRange('SC001', 1, 10),
