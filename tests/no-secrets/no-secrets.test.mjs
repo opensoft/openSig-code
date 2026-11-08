@@ -150,12 +150,45 @@ function svgText() {
   return '<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="40" height="10"><path d="M0 5 L40 5"/></svg>\n';
 }
 
+/** The same PFX in BER indefinite-length form (SEQUENCE 0x30 0x80 ... 0x00 0x00). */
+function pfxBerBytes() {
+  const ber = (tag, ...parts) => Buffer.concat([Buffer.from([tag, 0x80]), ...parts, Buffer.from([0x00, 0x00])]);
+  const pkcs7Data = Buffer.from([0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01]);
+  const authSafe = ber(0x30, pkcs7Data, ber(0xa0, der(0x04, randomBytes(320))));
+  const sha1Algorithm = der(0x30, Buffer.from([0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00]));
+  const macData = der(0x30, Buffer.concat([der(0x30, Buffer.concat([sha1Algorithm, der(0x04, randomBytes(20))])), der(0x04, randomBytes(8))]));
+  return ber(0x30, der(0x02, Buffer.from([0x03])), authSafe, macData);
+}
+
 function randomValue() {
   return randomBytes(18).toString('base64url');
 }
 
+/** A random base32 (RFC 4648) string, the shape of a TOTP shared secret. */
+function randomBase32(length) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  return [...randomBytes(length)].map((byte) => alphabet[byte % 32]).join('');
+}
+
 function wrap64(text) {
   return text.match(/.{1,64}/g).join('\n');
+}
+
+function utf16be(text) {
+  return Buffer.from(text, 'utf16le').swap16();
+}
+
+/** A 512-byte header block shaped like an uncompressed tar member header (name, NUL padding). */
+function tarHeader(name) {
+  const header = Buffer.alloc(512);
+  header.write(name, 0, 'latin1');
+  header.write('0000644\0', 100, 'latin1');
+  return header;
+}
+
+function pemParts(pem) {
+  const lines = pem.trim().split('\n');
+  return { lines, header: lines[0], body: lines.slice(1, -1).join(''), footer: lines.at(-1) };
 }
 
 // --- cases ---------------------------------------------------------------------
@@ -366,6 +399,200 @@ test('[NS-07] findings exit non-zero naming file and rule only; a clean reposito
   const cleanResult = scan(clean);
   assert.equal(cleanResult.code, 0);
   assert.deepEqual(cleanResult.lines, ['no-secrets: PASS findings=0 scanned=2']);
+});
+
+test('[NS-01] PEM keys split across string pieces, joined arrays or one line are reported', () => {
+  const repo = newRepo();
+  const pkcs8 = generateKeyPairSync('ed25519').privateKey.export({ type: 'pkcs8', format: 'pem' });
+  const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs1', format: 'pem' });
+  const ed = pemParts(pkcs8);
+  const rs = pemParts(rsa);
+  const chunks16 = ed.body.match(/.{1,16}/g);
+  const publicPem = pemParts(generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }));
+  // Line-by-line concatenation with escaped newlines (JavaScript, Java, C#).
+  put(repo, 'src/concat.ts', `export const material =\n  ${rs.lines.map((line) => JSON.stringify(`${line}\n`)).join(' +\n  ')};\n`);
+  // An array of lines joined at run time.
+  put(repo, 'src/joined.mjs', `const parts = ${JSON.stringify(ed.lines)};\nexport const material = parts.join('\\n');\n`);
+  // Flattened onto one line, separated by spaces.
+  put(repo, 'conf/one-line.conf', `key = ${ed.lines.join(' ')}\n`);
+  // Python implicit concatenation of 16-character pieces.
+  put(repo, 'app/key.py', `KEY = (\n    "${ed.header}\\n"\n${chunks16.map((chunk) => `    "${chunk}"\n`).join('')}    "\\n${ed.footer}"\n)\n`);
+  // 16-character pieces joined with + on one line.
+  put(repo, 'src/pieces.js', `module.exports = ${[ed.header, ...chunks16, ed.footer].map((piece) => `'${piece}'`).join(' + ')};\n`);
+  // A YAML list with one quoted line per item.
+  put(repo, 'conf/list.yaml', `key_lines:\n${rs.lines.map((line) => `  - "${line}"\n`).join('')}`);
+  // Not keys: a public key flattened onto one line, and prose that names the header.
+  put(repo, 'conf/public-one-line.conf', `key = ${publicPem.lines.join(' ')}\n`);
+  put(repo, 'docs/keys.md', `Files that contain a ${ed.header} line are rejected, and the scanner reports only the file and the rule name.\n`);
+  track(repo, '.');
+  const result = scan(repo);
+  assert.equal(result.code, 1);
+  for (const file of ['src/concat.ts', 'src/joined.mjs', 'conf/one-line.conf', 'app/key.py', 'src/pieces.js', 'conf/list.yaml']) {
+    expectFinding(result, 'private-key-pem', file, 'index');
+  }
+  expectNoFinding(result, 'conf/public-one-line.conf');
+  expectNoFinding(result, 'docs/keys.md');
+  expectNoContent(result, [ed.body.slice(0, 32), rs.body.slice(0, 32), ...chunks16.slice(0, 2)]);
+});
+
+test('[NS-01] UTF-16 PEM, PEM after a binary prefix and base64-encoded PEM are reported', () => {
+  const repo = newRepo();
+  const pem = generateKeyPairSync('ed25519').privateKey.export({ type: 'pkcs8', format: 'pem' });
+  const publicPem = generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' });
+  const b64 = (text) => Buffer.from(text, 'latin1').toString('base64');
+  put(repo, 'keys/utf16le-bom.txt', Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(pem, 'utf16le')]));
+  put(repo, 'keys/utf16be.txt', utf16be(pem));
+  put(repo, 'bundle/archive.tar', Buffer.concat([tarHeader('key.pem'), Buffer.from(pem, 'latin1'), Buffer.alloc(1024)]));
+  // UTF-16 text at an odd offset inside binary content.
+  put(repo, 'bundle/blob.bin', Buffer.concat([Buffer.alloc(333, 0x00), Buffer.from(pem, 'utf16le'), Buffer.alloc(64)]));
+  // Kubernetes Secret value (base64 of the whole PEM file).
+  put(repo, 'deploy/secret.yaml', `apiVersion: v1\nkind: Secret\ntype: kubernetes.io/tls\ndata:\n  tls.key: ${b64(pem)}\n`);
+  // Base64 wrapped at 76 columns in a block scalar.
+  put(repo, 'deploy/wrapped.yaml', `key: |\n${b64(pem)
+    .match(/.{1,76}/g)
+    .map((line) => `  ${line}`)
+    .join('\n')}\n`);
+  // The PEM after a one-byte and a two-byte preamble (the other base64 alignments), in JSON strings.
+  put(repo, 'deploy/shift-1.json', `${JSON.stringify({ blob: b64(`\n${pem}`) })}\n`);
+  put(repo, 'deploy/shift-2.json', `${JSON.stringify({ blob: b64(`#\n${pem}`) })}\n`);
+  // Base64 of base64.
+  put(repo, 'deploy/nested.txt', `${b64(b64(pem))}\n`);
+  // Not keys: a public key in the same encodings.
+  put(repo, 'deploy/public.yaml', `data:\n  tls.crt: ${b64(publicPem)}\n`);
+  put(repo, 'keys/public-utf16.txt', Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(publicPem, 'utf16le')]));
+  track(repo, '.');
+  const result = scan(repo);
+  assert.equal(result.code, 1);
+  for (const file of [
+    'keys/utf16le-bom.txt',
+    'keys/utf16be.txt',
+    'bundle/archive.tar',
+    'bundle/blob.bin',
+    'deploy/secret.yaml',
+    'deploy/wrapped.yaml',
+    'deploy/shift-1.json',
+    'deploy/shift-2.json',
+    'deploy/nested.txt',
+  ]) {
+    expectFinding(result, 'private-key-pem', file, 'index');
+  }
+  expectNoFinding(result, 'deploy/public.yaml');
+  expectNoFinding(result, 'keys/public-utf16.txt');
+  expectNoContent(result, [pem.split('\n')[1], b64(pem).slice(0, 40)]);
+});
+
+test('[NS-02] BER indefinite-length PKCS#12 is reported raw, base64-encoded and in UTF-16', () => {
+  const repo = newRepo();
+  const pfx = pfxBerBytes();
+  const base64 = pfx.toString('base64');
+  put(repo, 'store/indefinite.bin', pfx);
+  put(repo, 'conf/bundle.yaml', `bundle: ${base64}\n`);
+  put(repo, 'conf/wrapped.yaml', `bundle: |\n${wrap64(base64)
+    .split('\n')
+    .map((line) => `  ${line}`)
+    .join('\n')}\n`);
+  put(repo, 'conf/utf16.txt', Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(`bundle=${base64}\n`, 'utf16le')]));
+  put(repo, 'bundle/archive.tar', Buffer.concat([tarHeader('bundle.b64'), Buffer.from(`${base64}\n`, 'latin1'), Buffer.alloc(512)]));
+  put(repo, 'conf/spki.txt', `${generateKeyPairSync('rsa', { modulusLength: 2048 }).publicKey.export({ type: 'spki', format: 'der' }).toString('base64')}\n`);
+  track(repo, '.');
+  const result = scan(repo);
+  assert.equal(result.code, 1);
+  for (const file of ['store/indefinite.bin', 'conf/bundle.yaml', 'conf/wrapped.yaml', 'conf/utf16.txt', 'bundle/archive.tar']) {
+    expectFinding(result, 'pkcs12-content', file, 'index');
+  }
+  expectNoFinding(result, 'conf/spki.txt');
+  expectNoContent(result, [base64.slice(0, 40)]);
+});
+
+test('[NS-04] images under fixture directories in any spelling are reported', () => {
+  const repo = newRepo();
+  const png = pngBytes();
+  put(repo, 'src/__fixtures__/mark.png', png);
+  put(repo, 'tests/Fixtures/stroke.svg', svgText());
+  put(repo, 'tests/pdf-fixtures/page.bin', png);
+  put(repo, 'tests/fixture/drawing.xml', svgText());
+  put(repo, 'tests/Fixtures/utf16.xml', Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(svgText(), 'utf16le')]));
+  put(repo, 'docs/fixturesque/diagram.png', png);
+  put(repo, 'src/fixture.svg', svgText());
+  track(repo, '.');
+  const result = scan(repo);
+  assert.equal(result.code, 1);
+  for (const file of ['src/__fixtures__/mark.png', 'tests/Fixtures/stroke.svg', 'tests/pdf-fixtures/page.bin', 'tests/fixture/drawing.xml', 'tests/Fixtures/utf16.xml']) {
+    expectFinding(result, 'fixture-image', file);
+  }
+  expectNoFinding(result, 'docs/fixturesque/diagram.png');
+  expectNoFinding(result, 'src/fixture.svg');
+});
+
+test('[NS-05] .env-local, prod.env and other .env spellings are reported', () => {
+  const repo = newRepo();
+  for (const file of ['.env-local', 'deploy/prod.env', 'services/.env_staging', 'config/.prod.env', 'config/.ENV']) put(repo, file, 'MODE=synthetic\n');
+  put(repo, 'src/dotenv.ts', 'export const loader = "dotenv";\n');
+  put(repo, 'docs/environment.md', 'Environment files are never committed.\n');
+  track(repo, '.');
+  const result = scan(repo);
+  assert.equal(result.code, 1);
+  for (const file of ['.env-local', 'deploy/prod.env', 'services/.env_staging', 'config/.prod.env', 'config/.ENV']) expectFinding(result, 'env-file', file, 'path');
+  expectNoFinding(result, 'src/dotenv.ts');
+  expectNoFinding(result, 'docs/environment.md');
+});
+
+test('[NS-06] typed declarations, Go :=, flags, URL credentials and upper-case secrets are reported', () => {
+  const repo = newRepo();
+  const v = Array.from({ length: 13 }, randomValue);
+  const totp = [randomBase32(32), randomBase32(16)];
+  const samples = {
+    'src/typed.ts': `\nconst signingKey: string = '${v[0]}';\n`,
+    'src/service.ts': `export class Service {\n  private readonly apiKey: string = "${v[1]}";\n}\n`,
+    'src/union.ts': `export const webhookSecret: string | undefined = '${v[2]}';\n`,
+    'app/settings.py': `api_key: str = "${v[3]}"\n`,
+    'app/final.py': `CLIENT_SECRET: Final[str] = '${v[4]}'\n`,
+    'src/main.rs': `const API_KEY: &str = "${v[5]}";\n`,
+    'cmd/main.go': `func main() {\n\tapiKey := "${v[6]}"\n\t_ = apiKey\n}\n`,
+    'cmd/vars.go': `var dbPassword string = "${v[7]}"\n`,
+    'scripts/run.sh': `tool --password=${v[8]} --verbose\n`,
+    'src/spawn.mjs': `spawn('db-tool', ['--db-password=${v[9]}']);\n`,
+    'docs/run.md': `Run java -Dapp.password=${v[10]} -jar app.jar locally.\n`,
+    'conf/db.yaml': `url: postgres://svc:${v[11]}@db.example.test:5432/app\n`,
+    'src/client.ts': `const endpoint = "https://deploy:${v[12]}@registry.example.test/v2";\n`,
+    'conf/totp.yaml': `totp_secret: ${totp[0]}\n`,
+    'src/totp.ts': `export const mfaSecret = '${totp[1]}';\n`,
+  };
+  for (const [file, content] of Object.entries(samples)) put(repo, file, content);
+  track(repo, '.');
+  const result = scan(repo);
+  assert.equal(result.code, 1);
+  for (const file of Object.keys(samples)) expectFinding(result, 'secret-assignment', file, 'index');
+  assert.equal(findingsOf(result).find((f) => f.file === 'src/typed.ts').line, 2, 'the line number is reported');
+  expectNoContent(result, [...v, ...totp]);
+});
+
+test('[NS-06] command substitution, ternary branches, type-only annotations and placeholder URLs are not reported', () => {
+  const repo = newRepo();
+  const v = randomValue();
+  const bt = String.fromCharCode(0x60); // shell command substitution quote, kept out of this file's own scan
+  put(repo, 'scripts/gen.sh', `export X_SECRET=$(openssl rand -hex 32)\nexport Y_SECRET=${bt}openssl rand -hex 32${bt}\nZ_PASSWORD=$HOME/.config/synthetic\n`);
+  put(repo, 'src/choose.ts', `const chosen = ready ? password : '${v}';\n`);
+  put(repo, 'src/types.ts', 'export function connect(password: string): void {}\nexport interface Options { apiKey?: string; clientSecret: string | undefined }\n');
+  put(repo, 'app/types.py', 'def connect(password: str) -> None: ...\napi_key: Optional[str] = None\n');
+  put(
+    repo,
+    'conf/urls.yaml',
+    [
+      'docs: https://user:password@db.example.test/',
+      'sample: https://user:pass@api.example.test/v1',
+      'templated: postgres://svc:${DB_PASSWORD}@db.example.test/app',
+      'variable: redis://cache:$REDIS_PASSWORD@cache.example.test:6379',
+      'port: https://registry.example.test:8443/v2',
+      'reference: webhook_secret is OPENSIG_WEBHOOK_SECRET',
+      'upper: api_password: PASSWORD',
+      '',
+    ].join('\n'),
+  );
+  track(repo, '.');
+  const result = scan(repo);
+  assert.equal(result.code, 0, result.stdout);
+  assert.deepEqual(findingsOf(result), []);
 });
 
 test('staged and working-tree content of tracked files is scanned; untracked files are not', () => {
