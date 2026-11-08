@@ -3,16 +3,38 @@
 // Retention and disposal (T029): AC-05 DisposalRecord plus audit event under
 // an injected clock, with completed evidence never mutated; RET-01 unset and
 // invalid policies, scope "all", and resumption after a crash between the
-// record's commit and the blob removal.
+// record's commit and the blob removal; RET-02 the exported disposal path and
+// its in-transaction re-check; RET-03 only retention records end retention;
+// RET-04 retained final artifacts keep protecting their blobs; RET-05 more
+// than 10,000 eligible envelopes; RET-06 every shared reference is seen.
 
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
 import { canonicalDigest } from '../../src/domain/canonical/index.ts';
 import { eventDigest, eventFromRow, verifyChain } from '../../src/storage/audit/index.ts';
-import { DISPOSAL_RECORD_SCHEMA, RetentionPolicyError, RetentionService, parseRetentionPolicy } from '../../src/storage/retention/index.ts';
+import { MAX_LIST_LIMIT, StorageConstraintError, StorageUsageError } from '../../src/storage/db/index.ts';
+import {
+  BlobDisposer,
+  DISPOSAL_RECORD_SCHEMA,
+  RETENTION_BATCH_SIZE,
+  RetentionPolicyError,
+  RetentionService,
+  parseRetentionPolicy,
+} from '../../src/storage/retention/index.ts';
 import { makeScratch } from '../storage/support/fixtures.mjs';
-import { BASE_TIME, createTenant, environment, fixedClock, sid, steppingClock, terminalEnvelope } from './support/chain.mjs';
+import {
+  BASE_TIME,
+  createTenant,
+  envelopeRow,
+  environment,
+  fixedClock,
+  sid,
+  steppingClock,
+  syntheticBytes,
+  terminalEnvelope,
+  ts,
+} from './support/chain.mjs';
 
 const scratch = makeScratch();
 after(() => scratch.cleanup());
@@ -73,6 +95,8 @@ test('[AC-05] retention writes a DisposalRecord and an audit event, removes only
     for (const disposal of run.disposals) {
       const record = store.get('disposal_records', { id: disposal.disposalId });
       assert.equal(record.envelope_id, disposal.envelopeId);
+      assert.equal(record.kind, 'retention');
+      assert.equal(disposal.kind, 'retention');
       assert.equal(record.policy_ref, 'synthetic-retention-30d');
       assert.equal(record.server_time, RUN_AT, 'server_time comes from the injected clock');
       assert.deepEqual(JSON.parse(record.disposed_blob_refs_json), disposal.disposedBlobRefs);
@@ -82,6 +106,7 @@ test('[AC-05] retention writes a DisposalRecord and an audit event, removes only
         tenant_id: tenant,
         id: record.id,
         envelope_id: record.envelope_id,
+        kind: 'retention',
         retained_artifact_digests: JSON.parse(record.retained_artifact_digests_json),
         disposed_blob_refs: JSON.parse(record.disposed_blob_refs_json),
         policy_ref: record.policy_ref,
@@ -94,8 +119,11 @@ test('[AC-05] retention writes a DisposalRecord and an audit event, removes only
       assert.deepEqual(JSON.parse(event.metadata_json), {
         disposal_id: disposal.disposalId,
         disposed_blob_count: disposal.disposedBlobRefs.length,
+        kept_blob_count: disposal.keptBlobRefs.length,
+        kind: 'retention',
         policy_ref: 'synthetic-retention-30d',
         retained_artifact_count: disposal.retainedArtifactDigests.length,
+        scope: 'documents',
       });
       assert.equal(eventDigest(eventFromRow(event)), event.event_digest);
     }
@@ -187,6 +215,267 @@ test('[RET-01] unset retention disposes nothing, an invalid policy fails closed,
     assert.deepEqual(resumed2.disposals, []);
     assert.equal(blobs.check(crash2, live.doc.digest), 'ok', 'content referenced by a live envelope survives resumption');
     assert.throws(() => new RetentionService({ db, blobs, audit }), /injected clock/);
+  } finally {
+    db.close();
+  }
+});
+
+/** An envelope in `state` whose single document revision is the existing blob `blob`. */
+function envelopeWithDocument(db, tenant, blob, { state = 'declined', updatedMinutes = 10, revisions = 1 } = {}) {
+  const store = db.forTenant(tenant);
+  const env = sid('env');
+  db.transaction(() => {
+    store.insert('envelopes', envelopeRow(env, { state, updated_at: ts(updatedMinutes) }));
+    for (let i = 0; i < revisions; i += 1) {
+      store.insert('document_revisions', {
+        id: sid('rev'),
+        envelope_id: env,
+        content_digest: blob.digest,
+        blob_ref: blob.ref,
+        bytes: 1,
+        pages: 1,
+        page_geometry_json: '[]',
+        parse_report_json: '{}',
+        created_at: ts(2),
+      });
+    }
+  });
+  return env;
+}
+
+function disposalRecord(id, envelopeId, kind) {
+  return {
+    id,
+    envelope_id: envelopeId,
+    kind,
+    retained_artifact_digests_json: '[]',
+    disposed_blob_refs_json: '[]',
+    policy_ref: 'synthetic-policy',
+    server_time: ts(30),
+  };
+}
+
+test('[RET-02] BlobDisposer is the exported disposal path: it re-checks every candidate in its own transaction and records the kind', () => {
+  const { db, blobs, audit } = environment(scratch, steppingClock());
+  try {
+    const tenant = sid('tenant');
+    createTenant(db, tenant);
+    const store = db.forTenant(tenant);
+    const disposer = new BlobDisposer({ db, blobs, audit, clock: fixedClock(RUN_AT) });
+    const owner = terminalEnvelope(db, blobs, tenant, { state: 'voided', updatedMinutes: 1 });
+    const completed = terminalEnvelope(db, blobs, tenant, { state: 'completed', updatedMinutes: 1 });
+    const live = terminalEnvelope(db, blobs, tenant, { state: 'sent', updatedMinutes: 1 });
+
+    // Candidates an orphan collector computed earlier: two unreferenced attempt
+    // blobs, the published PDF of another envelope, and a live document.
+    const orphanA = blobs.put(tenant, syntheticBytes('attempt-a', 300));
+    const orphanB = blobs.put(tenant, syntheticBytes('attempt-b', 300));
+    const candidates = [orphanA.ref, orphanB.ref, completed.pdf.ref, live.doc.ref];
+    // After the candidates were computed, a live envelope starts using orphanB.
+    envelopeWithDocument(db, tenant, orphanB, { state: 'draft' });
+
+    const before = store.count('disposal_records');
+    const request = { envelopeId: owner.env, kind: 'orphan-collection', policyRef: 'orphan-collection', refs: candidates, retainedArtifactDigests: [] };
+    assert.throws(() => db.transaction(() => disposer.dispose(tenant, request)), (error) => error instanceof StorageUsageError && /own transaction/.test(error.message));
+    for (const bad of [
+      { ...request, kind: 'archive' },
+      { ...request, kind: 'retention' },
+      { ...request, scope: 'all' },
+      { ...request, refs: [blobs.put(sid('tenant'), syntheticBytes('foreign', 10)).ref] },
+      { ...request, policyRef: '' },
+    ]) {
+      assert.throws(() => disposer.dispose(tenant, bad), StorageUsageError, JSON.stringify(bad.kind));
+    }
+    assert.equal(store.count('disposal_records'), before, 'refused requests write nothing');
+
+    const outcome = disposer.dispose(tenant, request);
+    assert.equal(outcome.kind, 'orphan-collection');
+    assert.deepEqual(outcome.disposedBlobRefs, [orphanA.ref]);
+    assert.deepEqual(outcome.keptBlobRefs, [orphanB.ref, completed.pdf.ref, live.doc.ref].sort(), 'referenced refs are kept, re-checked at disposal time');
+    assert.equal(blobs.check(tenant, orphanA.digest), 'missing');
+    for (const kept of [orphanB, completed.pdf, live.doc]) assert.equal(blobs.check(tenant, kept.digest), 'ok');
+
+    const record = store.get('disposal_records', { id: outcome.disposalId });
+    assert.equal(record.kind, 'orphan-collection');
+    const recordDigest = canonicalDigest({
+      schema: DISPOSAL_RECORD_SCHEMA,
+      tenant_id: tenant,
+      id: record.id,
+      envelope_id: owner.env,
+      kind: 'orphan-collection',
+      retained_artifact_digests: [],
+      disposed_blob_refs: [orphanA.ref],
+      policy_ref: 'orphan-collection',
+      server_time: RUN_AT,
+    });
+    assert.equal(outcome.recordDigest, recordDigest);
+    const event = store.get('audit_events', { subject_digest: recordDigest });
+    assert.deepEqual([event.type, event.actor_kind, event.actor_ref, event.envelope_id], ['retention.orphans_collected', 'system', 'orphan-collector', owner.env]);
+    assert.deepEqual(JSON.parse(event.metadata_json), {
+      disposal_id: record.id,
+      disposed_blob_count: 1,
+      kept_blob_count: 3,
+      kind: 'orphan-collection',
+      policy_ref: 'orphan-collection',
+      retained_artifact_count: 0,
+    });
+    assert.equal(disposer.hasRetentionDisposal(tenant, owner.env), false, 'an orphan collection is not a retention disposal');
+
+    // A batch is decided in order: A keeps the shared document while B is
+    // live; B, decided after A gave it up, disposes it.
+    const shared = blobs.put(tenant, syntheticBytes('shared-batch', 400));
+    const envA = envelopeWithDocument(db, tenant, shared);
+    const envB = envelopeWithDocument(db, tenant, shared);
+    const retention = (envelopeId) => ({ envelopeId, kind: 'retention', scope: 'documents', policyRef: 'synthetic-policy', refs: [shared.ref], retainedArtifactDigests: [] });
+    const [first, second] = disposer.disposeBatch(tenant, [retention(envA), retention(envB)]);
+    assert.deepEqual([first.keptBlobRefs, first.disposedBlobRefs], [[shared.ref], []]);
+    assert.deepEqual([second.keptBlobRefs, second.disposedBlobRefs], [[], [shared.ref]]);
+    assert.equal(blobs.check(tenant, shared.digest), 'missing');
+    assert.equal(disposer.hasRetentionDisposal(tenant, envA), true);
+    const records = store.count('disposal_records');
+    assert.throws(() => disposer.dispose(tenant, retention(envA)), /already has a retention disposal/, 'checked inside the transaction');
+    assert.equal(store.count('disposal_records'), records, 'a refused batch writes nothing');
+    assert.equal(verifyChain(db, tenant).ok, true);
+  } finally {
+    db.close();
+  }
+});
+
+test('[RET-03] an orphan-collection DisposalRecord does not block retention; only a retention record ends it', () => {
+  const { db, blobs, audit } = environment(scratch, steppingClock());
+  try {
+    const tenant = sid('tenant');
+    createTenant(db, tenant);
+    setPolicy(db, tenant, { policy_ref: 'tenant-retention', dispose_after_days: 1 });
+    const store = db.forTenant(tenant);
+    const orphaned = terminalEnvelope(db, blobs, tenant, { state: 'voided', updatedMinutes: 1 });
+    const control = terminalEnvelope(db, blobs, tenant, { state: 'voided', updatedMinutes: 1 });
+    const retained = terminalEnvelope(db, blobs, tenant, { state: 'voided', updatedMinutes: 1 });
+    db.transaction(() => {
+      store.insert('disposal_records', disposalRecord(sid('disp'), orphaned.env, 'orphan-collection'));
+      store.insert('disposal_records', disposalRecord(sid('disp'), retained.env, 'retention'));
+    });
+    // A record without a kind (as an untyped writer would insert it) is refused.
+    const { kind: _omitted, ...untyped } = disposalRecord(sid('disp'), control.env, 'retention');
+    assert.throws(
+      () => db.transaction(() => store.insert('disposal_records', untyped)),
+      (error) => error instanceof StorageConstraintError && /kind is required/.test(error.message),
+    );
+
+    const clock = fixedClock(new Date(BASE_TIME + 3 * DAY).toISOString());
+    const run = new RetentionService({ db, blobs, audit, clock }).run(tenant);
+    assert.deepEqual(run.disposals.map((disposal) => disposal.envelopeId).sort(), [orphaned.env, control.env].sort());
+    assert.equal(blobs.check(tenant, orphaned.doc.digest), 'missing', 'the envelope with only an orphan-collection record was disposed');
+    assert.equal(blobs.check(tenant, control.doc.digest), 'missing');
+    assert.equal(blobs.check(tenant, retained.doc.digest), 'ok', 'an envelope with a retention record is skipped');
+    assert.equal(store.count('disposal_records', { envelope_id: orphaned.env, kind: 'retention' }), 1);
+    assert.deepEqual(new RetentionService({ db, blobs, audit, clock }).run(tenant).disposals, [], 'retention records end it');
+  } finally {
+    db.close();
+  }
+});
+
+test('[RET-04] a final artifact kept by scope "documents" keeps protecting its blob; scope "all" gives it up', () => {
+  const { db, blobs, audit } = environment(scratch, steppingClock());
+  try {
+    for (const scope of ['documents', 'all']) {
+      const tenant = sid('tenant');
+      createTenant(db, tenant);
+      setPolicy(db, tenant, { policy_ref: `synthetic-${scope}`, dispose_after_days: 30, scope });
+      const disposed = terminalEnvelope(db, blobs, tenant, { state: 'completed', updatedMinutes: 10 });
+      // A later envelope reuses the final PDF's bytes as its document; it is
+      // not yet eligible at the first run.
+      const reuser = envelopeWithDocument(db, tenant, disposed.pdf, { state: 'declined', updatedMinutes: 40 * 24 * 60 });
+
+      const first = new RetentionService({ db, blobs, audit, clock: fixedClock(RUN_AT) }).run(tenant);
+      assert.deepEqual(first.disposals.map((disposal) => disposal.envelopeId), [disposed.env]);
+      assert.equal(blobs.check(tenant, disposed.pdf.digest), 'ok', `${scope}: the PDF survives the first run (kept or still shared)`);
+
+      const later = fixedClock(new Date(BASE_TIME + 80 * DAY).toISOString());
+      const second = new RetentionService({ db, blobs, audit, clock: later }).run(tenant);
+      assert.deepEqual(second.disposals.map((disposal) => disposal.envelopeId), [reuser]);
+      if (scope === 'documents') {
+        assert.equal(blobs.check(tenant, disposed.pdf.digest), 'ok', 'scope documents never removes a retained final artifact');
+        assert.deepEqual(second.disposals[0].keptBlobRefs, [disposed.pdf.ref], 'the retained final artifact still references the blob');
+        assert.equal(db.forTenant(tenant).get('final_artifacts', { envelope_id: disposed.env }).pdf_blob_ref, disposed.pdf.ref);
+      } else {
+        assert.equal(blobs.check(tenant, disposed.pdf.digest), 'missing', 'scope all gave the artifact up, so the last user disposes it');
+        assert.deepEqual(second.disposals[0].disposedBlobRefs, [disposed.pdf.ref]);
+      }
+      assert.equal(verifyChain(db, tenant).ok, true);
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test('[RET-05] one run disposes every eligible envelope, beyond 10,000, in batched transactions', () => {
+  const { db, blobs, audit } = environment(scratch, steppingClock());
+  try {
+    const tenant = sid('tenant');
+    createTenant(db, tenant);
+    setPolicy(db, tenant, { policy_ref: 'synthetic-bulk', dispose_after_days: 1 });
+    const store = db.forTenant(tenant);
+    const count = MAX_LIST_LIMIT + 1;
+    db.transaction(() => {
+      for (let i = 0; i < count; i += 1) store.insert('envelopes', envelopeRow(`env_${String(i).padStart(16, '0')}`, { state: 'voided', updated_at: ts(5) }));
+    });
+    // Two more whose ids sort after all of those, with real document blobs.
+    const tail = ['zz_tail_000000000001', 'zz_tail_000000000002'].map((id, index) => {
+      const doc = blobs.put(tenant, syntheticBytes(`tail-${index}`, 256));
+      db.transaction(() => {
+        store.insert('envelopes', envelopeRow(id, { state: 'expired', updated_at: ts(5) }));
+        store.insert('document_revisions', {
+          id: sid('rev'),
+          envelope_id: id,
+          content_digest: doc.digest,
+          blob_ref: doc.ref,
+          bytes: 256,
+          pages: 1,
+          page_geometry_json: '[]',
+          parse_report_json: '{}',
+          created_at: ts(2),
+        });
+      });
+      return { id, doc };
+    });
+    const clock = fixedClock(new Date(BASE_TIME + 2 * DAY).toISOString());
+    const run = new RetentionService({ db, blobs, audit, clock }).run(tenant);
+    assert.equal(run.disposals.length, count + 2, 'every eligible envelope in one run');
+    assert.equal(new Set(run.disposals.map((disposal) => disposal.envelopeId)).size, count + 2);
+    for (const { id, doc } of tail) {
+      assert.ok(run.disposals.some((disposal) => disposal.envelopeId === id && disposal.disposedBlobRefs[0] === doc.ref));
+      assert.equal(blobs.check(tenant, doc.digest), 'missing');
+    }
+    assert.equal(store.count('disposal_records', { kind: 'retention' }), count + 2);
+    assert.ok(RETENTION_BATCH_SIZE < count, 'the run spans several batches');
+    const report = verifyChain(db, tenant);
+    assert.deepEqual([report.ok, report.events], [true, count + 2]);
+    assert.deepEqual(new RetentionService({ db, blobs, audit, clock }).run(tenant).disposals, []);
+  } finally {
+    db.close();
+  }
+});
+
+test('[RET-06] the shared-reference check reads every reference, so a live user past 10,000 rows keeps the blob', () => {
+  const { db, blobs, audit } = environment(scratch, steppingClock());
+  try {
+    const tenant = sid('tenant');
+    createTenant(db, tenant);
+    setPolicy(db, tenant, { policy_ref: 'synthetic-shared', dispose_after_days: 1 });
+    const shared = blobs.put(tenant, syntheticBytes('shared-many', 512));
+    // The eligible envelope holds the first 10,000 references; the live
+    // draft's reference comes after them.
+    const eligible = envelopeWithDocument(db, tenant, shared, { state: 'declined', updatedMinutes: 5, revisions: MAX_LIST_LIMIT });
+    const live = envelopeWithDocument(db, tenant, shared, { state: 'draft', updatedMinutes: 5 });
+    assert.equal(db.forTenant(tenant).count('document_revisions', { blob_ref: shared.ref }), MAX_LIST_LIMIT + 1);
+
+    const clock = fixedClock(new Date(BASE_TIME + 2 * DAY).toISOString());
+    const run = new RetentionService({ db, blobs, audit, clock }).run(tenant);
+    assert.deepEqual(run.disposals.map((disposal) => disposal.envelopeId), [eligible]);
+    assert.deepEqual(run.disposals[0].disposedBlobRefs, []);
+    assert.deepEqual(run.keptSharedBlobRefs, [shared.ref]);
+    assert.equal(blobs.check(tenant, shared.digest), 'ok', `the live envelope ${live} keeps its document`);
   } finally {
     db.close();
   }

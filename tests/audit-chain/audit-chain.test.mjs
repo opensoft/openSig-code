@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Per-tenant audit hash chain (T029): AC-01 chain digest, AC-02 row-edit
-// detection, AC-03 truncated-tail detection, AC-04 checkpoint cadence.
+// detection, AC-03 truncated-tail detection, AC-04 checkpoint cadence, AC-06
+// verification past 10,000 checkpoints and across ties at one seq.
 // Tampering is simulated through a raw connection that drops the T003
 // append-only triggers, as an attacker with file access could.
 
@@ -9,7 +10,7 @@ import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
 import { canonicalBytes, canonicalDigest, canonicalize } from '../../src/domain/canonical/index.ts';
-import { StorageConstraintError, StorageUsageError } from '../../src/storage/db/index.ts';
+import { MAX_LIST_LIMIT, StorageConstraintError, StorageUsageError } from '../../src/storage/db/index.ts';
 import {
   AUDIT_EVENT_SCHEMA,
   AuditWriter,
@@ -20,7 +21,7 @@ import {
   verifyChain,
 } from '../../src/storage/audit/index.ts';
 import { makeScratch } from '../storage/support/fixtures.mjs';
-import { addEnvelope, createTenant, environment, hex, rawConnection, sid } from './support/chain.mjs';
+import { addEnvelope, createTenant, envelopeRow, environment, hex, rawConnection, sid } from './support/chain.mjs';
 
 const scratch = makeScratch();
 after(() => scratch.cleanup());
@@ -306,6 +307,61 @@ test('[AC-04] a cadence checkpoint is written every 100 events and a completion 
     assert.equal(report.events, 251);
     assert.equal(report.checkpoints, 3);
   } finally {
+    db.close();
+  }
+});
+
+test('[AC-06] verification reads every checkpoint by keyset, past 10,000 rows and across ties at one seq', () => {
+  const { db, path, audit } = environment(scratch);
+  const raw = rawConnection(path);
+  try {
+    const tenant = sid('tenant');
+    createTenant(db, tenant);
+    const store = db.forTenant(tenant);
+    const total = MAX_LIST_LIMIT + 50; // events; the head is seq 10,050
+    const tieSeq = 9_900; // a cadence, a completion and TIES more completions share this seq
+    const ties = 30;
+    const system = { kind: 'system', ref: 'finalizer' };
+    db.transaction(() => {
+      for (let seq = 1; seq <= total; seq += 1) {
+        const envelope = `env_${String(seq).padStart(16, '0')}`;
+        store.insert('envelopes', envelopeRow(envelope));
+        audit.append(tenant, { type: 'envelope.completed', actor: system, envelopeId: envelope });
+        audit.checkpointCompletion(tenant, envelope);
+        if (seq === tieSeq) {
+          for (let tie = 0; tie < ties; tie += 1) {
+            const tied = `tie_${String(tie).padStart(16, '0')}`;
+            store.insert('envelopes', envelopeRow(tied));
+            audit.checkpointCompletion(tenant, tied);
+          }
+        }
+      }
+    });
+    const checkpointRows = store.count('audit_checkpoints');
+    assert.equal(checkpointRows, total + ties + Math.floor(total / CHECKPOINT_INTERVAL));
+    // In (seq, insertion) order the rows before tieSeq number 9,997, so the
+    // 2 + TIES rows at tieSeq straddle the 10,000-row page boundary.
+    assert.equal(store.count('audit_checkpoints', { seq: { op: '<', value: tieSeq } }), 9_997);
+    assert.equal(store.count('audit_checkpoints', { seq: tieSeq }), 2 + ties);
+    const intact = verifyChain(db, tenant);
+    assert.deepEqual([intact.ok, intact.events, intact.checkpoints], [true, total, checkpointRows]);
+
+    // Tamper as an attacker with file access: rewrite the event at tieSeq and
+    // cut the newest event. Every checkpoint at tieSeq must be reported once,
+    // and the completion checkpoint past the cut (row 10,180) must be seen.
+    raw.exec('DROP TRIGGER audit_events_append_only_update; DROP TRIGGER audit_events_append_only_delete;');
+    raw.prepare('UPDATE audit_events SET event_digest = ? WHERE tenant_id = ? AND seq = ?').run(hex('rewritten'), tenant, tieSeq);
+    raw.prepare('DELETE FROM audit_events WHERE tenant_id = ? AND seq = ?').run(tenant, total);
+    const report = verifyChain(db, tenant);
+    assert.equal(report.ok, false);
+    assert.equal(report.checkpoints, checkpointRows, 'every checkpoint row was read');
+    const at = (kind) => report.problems.filter((problem) => problem.kind === kind).map((problem) => problem.seq);
+    assert.deepEqual(at('truncated'), [total], 'the cut tail is caught by the checkpoint beyond 10,000 rows');
+    assert.deepEqual(at('checkpoint-mismatch'), Array(2 + ties).fill(tieSeq), 'each tied checkpoint is reported exactly once');
+    assert.deepEqual(at('digest-mismatch'), [tieSeq]);
+    assert.deepEqual(at('link-break'), [tieSeq + 1]);
+  } finally {
+    raw.close();
     db.close();
   }
 });

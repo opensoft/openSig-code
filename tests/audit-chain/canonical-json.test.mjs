@@ -7,6 +7,7 @@
 // section 3.2.2.2. Nothing is downloaded.
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -227,11 +228,34 @@ function sourceFiles(dir) {
   return out;
 }
 
-test('[JCS-06] src/ has exactly one canonicalizer and exactly one importer of the restricted audit writer', () => {
-  const files = sourceFiles(join(REPO_ROOT, 'src')).map((path) => ({ rel: relative(REPO_ROOT, path), text: readFileSync(path, 'utf8') }));
-  const definition = /\b(?:function|const|let|var|class)\s+(?:\w*[Cc]anonical(?:i[sz]e|Json|JSON|Bytes|Digest|Form)?\w*|\w*[Jj]cs\w*)\b/;
-  const outside = files.filter((file) => !file.rel.startsWith('src/domain/canonical/') && definition.test(file.text));
+/**
+ * Names of definitions that look like a canonical JSON implementation: a name
+ * built on "canonicaliz-"/"canonicalis-" (canonicalize, Canonicalizer), one of
+ * the canonical module's own function names re-implemented (canonicalJson,
+ * canonicalBytes, canonicalDigest, canonicalString, canonicalText), or a JCS
+ * word part (jcsEncode, toJcs, JCS_ENCODE). A value that merely holds a
+ * canonical digest or bytes (canonicalManifestDigest) is not flagged.
+ */
+function looksLikeCanonicalizer(name) {
+  if (/[Cc]anonicali[sz]/.test(name)) return true;
+  if (/^canonical(?:Json|JSON|Bytes|Digest|String|Text)$/.test(name)) return true;
+  return /^(?:jcs|Jcs|JCS)(?![a-z])/.test(name) || /[a-z0-9_](?:Jcs|JCS)(?![a-z])/.test(name);
+}
+
+function canonicalizerDefinitions(text) {
+  return [...text.matchAll(/\b(?:function\*?|const|let|var|class)\s+([A-Za-z_$][\w$]*)/g)].map((match) => match[1]).filter(looksLikeCanonicalizer);
+}
+
+function srcFiles() {
+  return sourceFiles(join(REPO_ROOT, 'src')).map((path) => ({ rel: relative(REPO_ROOT, path), text: readFileSync(path, 'utf8') }));
+}
+
+test('[JCS-06] src/ has exactly one canonicalizer, and every canonical digest goes through it', () => {
+  const files = srcFiles();
+  const outside = files.filter((file) => !file.rel.startsWith('src/domain/canonical/') && canonicalizerDefinitions(file.text).length > 0);
   assert.deepEqual(outside.map((file) => file.rel), [], 'no canonicalizer is defined outside src/domain/canonical/');
+  const inside = files.filter((file) => file.rel.startsWith('src/domain/canonical/')).flatMap((file) => canonicalizerDefinitions(file.text));
+  assert.deepEqual([...new Set(inside)].sort(), ['canonicalBytes', 'canonicalDigest', 'canonicalize'], 'the detector finds the real canonicalizer');
 
   const canonicalImports = files
     .filter((file) => file.rel.startsWith('src/domain/canonical/'))
@@ -241,10 +265,101 @@ test('[JCS-06] src/ has exactly one canonicalizer and exactly one importer of th
     assert.ok(specifier.startsWith('node:') || /^\.\/[a-z-]+\.ts$/.test(specifier), `canonical module import ${specifier} stays self-contained`);
   }
 
-  const restricted = files.filter((file) => /from\s+'[^']*restricted-writer\.ts'/.test(file.text)).map((file) => file.rel);
-  assert.deepEqual(restricted, ['src/storage/audit/writer.ts'], 'only the audit writer uses the restricted write path');
   const users = files.filter((file) => /\bcanonical(?:Digest|Bytes|ize)\b/.test(file.text) && !file.rel.startsWith('src/domain/canonical/'));
   for (const file of users) {
     assert.match(file.text, /from\s+'[./]*domain\/canonical\/index\.ts'/, `${file.rel} imports the canonical module`);
   }
+});
+
+test('[JCS-07] the canonicalizer check flags canonicalizer-shaped definitions and not values named after canonical digests', () => {
+  const definitionsOf = (name) => [
+    `const ${name} = (value) => value;`,
+    `export function ${name}(value) { return value; }`,
+    `let ${name};`,
+    `class ${name} {}`,
+  ];
+  const flagged = [
+    'canonicalize',
+    'canonicalise',
+    'canonicalizeValue',
+    'recanonicalize',
+    'Canonicalizer',
+    'JsonCanonicalizer',
+    'canonicalJson',
+    'canonicalJSON',
+    'canonicalBytes',
+    'canonicalDigest',
+    'canonicalString',
+    'jcs',
+    'jcsEncode',
+    'toJcs',
+    'encodeJCS',
+    'JCS_ENCODE',
+  ];
+  const notFlagged = [
+    'canonicalManifestDigest',
+    'canonicalManifestBytes',
+    'canonicalRecipientsDigest',
+    'canonicalFieldValuesDigest',
+    'nonCanonicalCount',
+    'isCanonical',
+    'canonicalUrl',
+    'digestOfCanonicalText',
+    'objcSomething',
+  ];
+  for (const name of flagged) {
+    for (const source of definitionsOf(name)) assert.deepEqual(canonicalizerDefinitions(source), [name], source);
+  }
+  for (const name of notFlagged) {
+    for (const source of definitionsOf(name)) assert.deepEqual(canonicalizerDefinitions(source), [], source);
+  }
+  // The pattern later tasks need (T007, T010, T016): a canonical digest held
+  // in a variable, computed through the canonical module.
+  const consumer = [
+    "import { canonicalDigest } from '../canonical/index.ts';",
+    'const canonicalManifestDigest = canonicalDigest(manifest);',
+    'export const canonicalRecipientsDigest = canonicalDigest(recipients);',
+  ].join('\n');
+  assert.deepEqual(canonicalizerDefinitions(consumer), []);
+  // A second implementation is still caught.
+  assert.deepEqual(canonicalizerDefinitions('export function canonicalize(value) { return JSON.stringify(value); }'), ['canonicalize']);
+});
+
+test('[JCS-08] only src/storage/audit/writer.ts obtains the restricted insert, and no other module can append once it has', () => {
+  // Static: in the code (comments removed) of src/ and scripts/, only the
+  // audit writer references the claim (tenant-store.ts defines it), and
+  // nothing names the removed module or the hook.
+  const withoutComments = (text) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/[^\n]*/g, '$1');
+  const scanned = [...sourceFiles(join(REPO_ROOT, 'src')), ...sourceFiles(join(REPO_ROOT, 'scripts'))].map((path) => ({
+    rel: relative(REPO_ROOT, path),
+    text: withoutComments(readFileSync(path, 'utf8')),
+  }));
+  const claimants = scanned.filter((file) => /\bclaimRestrictedInsert\b/.test(file.text)).map((file) => file.rel).sort();
+  assert.deepEqual(claimants, ['src/storage/audit/writer.ts', 'src/storage/db/tenant-store.ts'], 'only the audit writer claims the restricted insert');
+  const writer = scanned.find((file) => file.rel === 'src/storage/audit/writer.ts');
+  assert.equal([...writer.text.matchAll(/\bclaimRestrictedInsert\(\)/g)].length, 1, 'the writer claims exactly once');
+  assert.match(writer.text, /^const appendRestricted = claimRestrictedInsert\(\);$/m, 'at module load, into a module-private binding');
+  assert.doesNotMatch(writer.text, /export\s+(?:const|let|var|function)\s+appendRestricted|export\s*\{[^}]*\bappendRestricted\b/, 'the claimed insert is not exported');
+  assert.deepEqual(scanned.filter((file) => /restricted-writer|restrictedInsertHook|\brestrictedInsert\b/.test(file.text) && file.rel !== 'src/storage/db/tenant-store.ts').map((file) => file.rel), []);
+
+  // Run time, in fresh processes: (a) with the audit writer loaded, a claim
+  // from any other module throws, so it cannot append (the P07 bypass);
+  // (b) a module that claims first makes the audit writer fail to load,
+  // instead of sharing the append path.
+  const probe = (order) =>
+    spawnSync(process.execPath, [join(REPO_ROOT, 'tests', 'audit-chain', 'support', 'claim-probe.mjs'), order], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 60_000 });
+  const writerFirst = probe('writer-first');
+  assert.equal(writerFirst.status, 0, writerFirst.stderr);
+  const a = JSON.parse(writerFirst.stdout.trim().split('\n').at(-1));
+  assert.match(a.outsideClaim, /^storage_usage: .*already been claimed/);
+  assert.equal(a.exportedInsert, false, 'tenant-store exports no restricted insert function');
+  assert.equal(a.outsideAppends, 0, 'nothing reached the audit chain outside the writer');
+  assert.equal(a.writerAppends, 1, 'the audit writer still appends');
+  assert.equal(a.chainOk, true);
+
+  const outsiderFirst = probe('outsider-first');
+  assert.equal(outsiderFirst.status, 0, outsiderFirst.stderr);
+  const b = JSON.parse(outsiderFirst.stdout.trim().split('\n').at(-1));
+  assert.equal(b.outsideClaim, 'function');
+  assert.match(b.writerLoad, /^storage_usage: .*already been claimed/, 'the audit writer refuses to load once the insert was taken');
 });

@@ -7,9 +7,12 @@
 // chain head). The chain is tamper-evident, not tamper-proof: an attacker who
 // rewrites every row and checkpoint consistently is caught only by a head
 // recorded outside the database.
+//
+// Events and checkpoints are read with the store's keyset iterator, so every
+// row is seen exactly once however many there are, including several
+// checkpoints at the same seq (a cadence and completion checkpoints).
 
 import type { Database } from '../db/connection.ts';
-import { MAX_LIST_LIMIT, type Row } from '../db/tenant-store.ts';
 import { eventDigest, eventFromRow, recordFromRow, type AuditEventRecord } from './event.ts';
 import type { AuditHead } from './writer.ts';
 
@@ -41,17 +44,6 @@ export interface VerifyOptions {
   readonly expectedHead?: AuditHead;
 }
 
-function* eventRows(db: Database, tenantId: string): Generator<Row> {
-  const store = db.forTenant(tenantId);
-  let after = 0;
-  for (;;) {
-    const page = store.list('audit_events', { seq: { op: '>', value: after } }, { orderBy: [['seq', 'asc']], limit: MAX_LIST_LIMIT });
-    for (const row of page) yield row;
-    if (page.length < MAX_LIST_LIMIT) return;
-    after = Number(page[page.length - 1]?.['seq']);
-  }
-}
-
 export function verifyChain(db: Database, tenantId: string, options: VerifyOptions = {}): ChainReport {
   const problems: ChainProblem[] = [];
   const digests = new Map<number, string>();
@@ -60,7 +52,8 @@ export function verifyChain(db: Database, tenantId: string, options: VerifyOptio
   let head: AuditHead | null = null;
   let events = 0;
 
-  for (const row of eventRows(db, tenantId)) {
+  const store = db.forTenant(tenantId);
+  for (const row of store.iterate('audit_events', {}, { orderBy: [['seq', 'asc']] })) {
     events += 1;
     const seq = Number(row['seq']);
     const stored = String(row['event_digest']);
@@ -88,8 +81,9 @@ export function verifyChain(db: Database, tenantId: string, options: VerifyOptio
     previous = stored;
   }
 
-  const checkpoints = db.forTenant(tenantId).list('audit_checkpoints', {}, { orderBy: [['seq', 'asc']] });
-  for (const checkpoint of checkpoints) {
+  let checkpoints = 0;
+  for (const checkpoint of store.iterate('audit_checkpoints', {}, { orderBy: [['seq', 'asc']] })) {
+    checkpoints += 1;
     const seq = Number(checkpoint['seq']);
     const digest = digests.get(seq);
     if (digest === undefined) {
@@ -113,13 +107,14 @@ export function verifyChain(db: Database, tenantId: string, options: VerifyOptio
     }
   }
 
-  return { ok: problems.length === 0, events, checkpoints: checkpoints.length, head, problems };
+  return { ok: problems.length === 0, events, checkpoints, head, problems };
 }
 
 /** The tenant's events of one envelope as contract AuditEventRecords, in seq order (for receipts). */
 export function envelopeAuditRecords(db: Database, tenantId: string, envelopeId: string): AuditEventRecord[] {
-  return db
-    .forTenant(tenantId)
-    .list('audit_events', { envelope_id: envelopeId }, { orderBy: [['seq', 'asc']] })
-    .map(recordFromRow);
+  const records: AuditEventRecord[] = [];
+  for (const row of db.forTenant(tenantId).iterate('audit_events', { envelope_id: envelopeId }, { orderBy: [['seq', 'asc']] })) {
+    records.push(recordFromRow(row));
+  }
+  return records;
 }

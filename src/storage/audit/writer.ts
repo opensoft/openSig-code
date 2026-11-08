@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The one restricted writer of the per-tenant audit hash chain. It is the only
-// importer of src/storage/db/restricted-writer.ts (tests/audit-chain/ checks
-// that boundary). Appends run inside the caller's Database.transaction(), so
-// the event commits atomically with the state change it records, and the
-// BEGIN IMMEDIATE lock serializes sequence allocation. The schema triggers
-// (T003) independently refuse a seq gap, a broken prev_digest link, and any
-// update or delete.
+// The one restricted writer of the per-tenant audit hash chain. When this
+// module loads it claims the one-shot restricted insert of
+// src/storage/db/tenant-store.ts and keeps it module-private, so no other
+// module can obtain it afterwards; if another module claimed it first, loading
+// this module fails loudly. tests/audit-chain/ checks the boundary statically
+// and at run time (JCS-08). Appends run inside the caller's
+// Database.transaction(), so the event commits atomically with the state
+// change it records, and the BEGIN IMMEDIATE lock serializes sequence
+// allocation. The schema triggers (T003) independently refuse a seq gap, a
+// broken prev_digest link, and any update or delete.
 //
 // Checkpoints: a cadence checkpoint at every multiple of CHECKPOINT_INTERVAL,
 // written in the same transaction as that event, and a completion checkpoint
@@ -15,9 +18,11 @@
 import { canonicalize, type JsonValue } from '../../domain/canonical/index.ts';
 import type { Database } from '../db/connection.ts';
 import { StorageUsageError } from '../db/errors.ts';
-import { appendRestricted } from '../db/restricted-writer.ts';
-import type { TenantStore } from '../db/tenant-store.ts';
+import { claimRestrictedInsert, type TenantStore } from '../db/tenant-store.ts';
 import { ACTOR_KINDS, DIGEST, EVENT_TYPE, eventDigest, ID, rowValues, type AuditActor, type AuditEvent } from './event.ts';
+
+// Claimed once, at module load, and never exported.
+const appendRestricted = claimRestrictedInsert();
 
 export const CHECKPOINT_INTERVAL = 100;
 
