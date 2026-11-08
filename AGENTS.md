@@ -21,4 +21,25 @@ All original project work is Apache-2.0. Third-party shipped code, assets and de
 
 Keep clinical attestation and amendments in openChart, financial authority in openPractice, and human personal approval outside Hermes service credentials. Optional anchoring publishes commitments only and does not block ordinary signing.
 
-Use the shared user-level OpenSpec/Speckit protocol. Canonical governance and feature plans live in the spec leg; implementation and tests live in the code leg. Shape rules live in the assembly root's AGENTS-shape.md. No signing runtime/test commands exist yet; establish them with the first governed implementation.
+Use the shared user-level OpenSpec/Speckit protocol. Canonical governance and feature plans live in the spec leg; implementation and tests live in the code leg. Shape rules live in the assembly root's AGENTS-shape.md.
+
+## Runtime and verification commands
+
+Established by T001 of feature 001-corporate-signing-mvp (spec leg `plan.md` § Technical Context and § Verification runner contract).
+
+```sh
+sh scripts/fetch-node.sh                  # pinned Node 24.22.2 into gitignored tools/
+PATH="$PWD/tools/node/bin:$PATH"; export PATH
+npm ci --no-audit --no-fund               # exactly the lockfile
+npm run verify -- <mode>                  # the only acceptance signal
+```
+
+- `scripts/fetch-node.sh` verifies the clearsigned `SHASUMS256.txt.asc` with gpg (in a short-path temporary GNUPGHOME) against the embedded release key and fingerprint, and requires the tarball SHA-256 to equal both the signed line and the embedded constant. It also requires the extracted `bin/node` and the bundled npm tree to match embedded digests, then extracts to `tools/` and writes `tools/node.receipt.json`. Every run re-checks those digests. It is idempotent, fails closed, and never uses the host Node.
+- `npm run verify -- <mode>` takes exactly one mode name from `scripts/verify-modes.mjs` and has no flags. It prints one final stdout line, `verify: <mode> <STATUS> exit=<n> ...`, and writes `.verify-out/<mode>/result.json`. Exit statuses: 0 PASS, 1 FAIL, 2 USAGE, 3 CAPABILITY_ABSENT (environment-blocked, never a pass), 4 VACUOUS, 5 EVIDENCE_MISSING, 6 ENV_MISMATCH, 7 RUNNER_ERROR. Treat any non-zero exit as failure.
+- `npm test` runs `verify -- all-unit`. `npm run typecheck` runs the pinned TypeScript compiler; never use `npx tsc`. Raw `node --test` is not an acceptance signal.
+- Tests live in one directory per mode under `tests/`, matching the registry globs. Every `tests/**/*.test.mjs` must be claimed by exactly one mode. A test that satisfies a required case starts its name with `[CASE-ID]`. A test that produces evidence writes it under `$OPENSIG_VERIFY_OUT/`, with labels as top-level string properties and `tree_digest` set to `$OPENSIG_VERIFY_TREE_DIGEST`.
+- Dependencies are exact pins (`.npmrc`: `engine-strict`, `save-exact`, `ignore-scripts`). They change only in a task whose `files:` list names `package.json` and `package-lock.json`.
+
+**Freeze rule.** `scripts/verify.mjs`, `scripts/verify-modes.mjs` and `tests/tooling/verification-runner.test.mjs` are frozen at the A-007 runner commit (spec plan.md amendment A-007, which supersedes the A-006 hardening baseline; earlier baselines were a71b3bc, then f31842b). No later task lists or edits them. Before accepting any later task, the orchestrator runs `git diff --quiet <T001-sha> HEAD -- scripts/verify.mjs scripts/verify-modes.mjs tests/tooling/verification-runner.test.mjs`, where `<T001-sha>` is the A-007 runner commit. Only a recorded architect amendment can change them, through a new `[O]` task that lists the three files, re-runs `npm run verify -- tooling` and re-freezes at that task's commit.
+
+The runner returns ENV_MISMATCH when the gate's own configuration differs from its frozen values: `package.json` `scripts.verify`, `scripts.test`, `scripts.typecheck` and `engines.node`, `.node-version`, `.npmrc` (its non-blank, non-comment lines must be exactly `engine-strict=true`, `save-exact=true` and `ignore-scripts=true`; any other line, such as `script-shell=`, a quoted key or a section header, is a mismatch), or any part of `tsconfig.json` (including `noCheck`). A task that lists `package.json` may add exact-pinned `devDependencies` but must not change those values.
