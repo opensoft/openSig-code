@@ -9,18 +9,18 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { evaluateLicense, loadPolicy } from '../../scripts/license-inventory.mjs';
-import { collectPlatformInventory, PLATFORM_STATUS } from '../../scripts/platform-inventory.mjs';
+import { collectPlatformInventory, effectiveBrowsersPath, PLATFORM_DECISION, PLATFORM_STATUS } from '../../scripts/platform-inventory.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const TOOL = join(REPO_ROOT, 'scripts', 'license-inventory.mjs');
 const PLATFORM_TOOL = join(REPO_ROOT, 'scripts', 'platform-inventory.mjs');
-const PLATFORM_ITEMS = ['node-runtime', 'linked-libraries', 'openssl-cli', 'chromium', 'hermes-image'];
+const PLATFORM_ITEMS = ['node-runtime', 'linked-libraries', 'openssl-cli', 'unshare', 'chromium', 'hermes-image'];
 
 const scratch = [];
 after(() => {
@@ -147,7 +147,7 @@ test('[LI-05] shipped MIT, Apache-2.0 and MIT OR Apache-2.0 packages pass', () =
   });
   const result = inventory(root);
   assert.equal(result.code, 0, result.stdout);
-  assert.match(result.last, /^license-inventory: PASS application-gate shipped=3 non-shipped=0 notice=written platform=POLICY-PENDING$/);
+  assert.match(result.last, /^license-inventory: PASS application-gate shipped=3 non-shipped=0 notice=written platform=INVENTORIED$/);
   for (const name of ['pkg-mit', 'pkg-apache', 'pkg-dual']) {
     const pkg = record(result, name);
     assert.equal(pkg.classification, 'shipped');
@@ -221,32 +221,84 @@ test('[LI-08] a disallowed dev-only package is reported as non-shipped and does 
   assert.equal(record(closure, 'pkg-b').classification, 'shipped');
 });
 
-test('[LI-09] platform status is always POLICY-PENDING', () => {
+test('[LI-09] platforms are INVENTORIED separately and never affect the application gate', () => {
   const bare = mkdtempSync(join(tmpdir(), 'opensig-platform-'));
   scratch.push(bare);
+  assert.equal(PLATFORM_STATUS, 'INVENTORIED');
+  assert.ok(PLATFORM_DECISION.includes('"MIT/Apache application and libraries; inventory platform licenses separately"'), 'the owner decision is stated verbatim');
   for (const root of [REPO_ROOT, bare]) {
     const platform = collectPlatformInventory(root);
-    assert.equal(platform.status, 'POLICY-PENDING');
-    assert.equal(PLATFORM_STATUS, 'POLICY-PENDING');
+    assert.equal(platform.status, 'INVENTORIED');
+    assert.equal(platform.decision, PLATFORM_DECISION);
     assert.deepEqual(
       platform.items.map((item) => item.id),
       PLATFORM_ITEMS,
     );
-    for (const item of platform.items) assert.equal(item.status, 'POLICY-PENDING', `${item.id} status`);
-    assert.ok(!/"status":"PASS"/.test(JSON.stringify(platform)), 'no platform status is PASS');
+    for (const item of platform.items) assert.equal(item.status, 'INVENTORIED', `${item.id} status`);
+    assert.ok(!/"status":"(?:PASS|POLICY-PENDING)"/.test(JSON.stringify(platform)), 'no platform status is PASS or POLICY-PENDING');
   }
-  assert.equal(collectPlatformInventory(REPO_ROOT).items[0].observed.receipt.version, '24.22.2', 'the pinned runtime is recorded');
+  const runtime = collectPlatformInventory(REPO_ROOT).items[0];
+  assert.equal(runtime.observed.receipt.version, '24.22.2', 'the pinned runtime is recorded');
+  assert.match(runtime.recorded_licenses, /BlueOak-1\.0\.0/, 'platform licenses outside the allowlist are recorded, not gated');
+  const unshare = collectPlatformInventory(REPO_ROOT).items.find((item) => item.id === 'unshare');
+  assert.match(unshare.name, /util-linux unshare/);
+  assert.match(unshare.recorded_licenses, /GPL-2\.0-or-later/, 'the parser sandbox launcher is inventoried with its own licenses');
+  assert.ok(unshare.observed.version === null ? typeof unshare.observed.detail === 'string' : /util-linux/.test(unshare.observed.version), 'its version, or why it is absent, is recorded');
 
   const out = join(bare, 'out');
   const cli = spawnSync(process.execPath, [PLATFORM_TOOL, '--root', REPO_ROOT, '--out', out], { encoding: 'utf8', timeout: 60_000 });
   assert.equal(cli.status, 0);
-  assert.match(cli.stdout, /^platform-inventory: POLICY-PENDING items=5 written=.* \(recorded, not passed\)\n$/);
-  assert.equal(JSON.parse(readFileSync(join(out, 'platform-inventory.json'), 'utf8')).status, 'POLICY-PENDING');
+  assert.match(cli.stdout, /^platform-inventory: INVENTORIED items=6 written=.* \(recorded separately; never gates the application\)\n$/);
+  assert.equal(JSON.parse(readFileSync(join(out, 'platform-inventory.json'), 'utf8')).status, 'INVENTORIED');
 
-  const gate = inventory(shippedOnly('MIT'));
-  assert.match(gate.last, / platform=POLICY-PENDING$/);
-  assert.equal(JSON.parse(readFileSync(join(gate.out, 'platform-inventory.json'), 'utf8')).status, 'POLICY-PENDING');
-  assert.equal(gate.json().platform_status, 'POLICY-PENDING');
+  // The application gate is the same whatever the platform probes find: with
+  // ldd, openssl and the browser cache all unavailable, a passing project still
+  // passes and a failing one still fails, with identical findings and SBOM gate.
+  const noPlatform = { PATH: '', HOME: bare, PLAYWRIGHT_BROWSERS_PATH: join(bare, 'no-browsers') };
+  for (const [license, expected] of [
+    ['MIT', 0],
+    ['0BSD', 1],
+  ]) {
+    const root = shippedOnly(license);
+    inventory(root); // writes NOTICE, so both runs below are check runs on the same tree
+    const normal = inventory(root, []);
+    const stripped = spawnSync(process.execPath, [TOOL, '--root', root, '--out', join(root, '.stripped-out')], { encoding: 'utf8', timeout: 120_000, env: noPlatform });
+    assert.equal(normal.code, expected, normal.stdout);
+    assert.equal(stripped.status, expected, stripped.stdout + stripped.stderr);
+    assert.equal(stripped.stdout, normal.stdout, 'identical gate output with and without platform tools');
+    const strippedJson = JSON.parse(readFileSync(join(root, '.stripped-out', 'inventory.json'), 'utf8'));
+    const strippedPlatform = JSON.parse(readFileSync(join(root, '.stripped-out', 'platform-inventory.json'), 'utf8'));
+    assert.notDeepEqual(strippedPlatform.items, JSON.parse(readFileSync(join(normal.out, 'platform-inventory.json'), 'utf8')).items, 'the platform record itself differs');
+    for (const field of ['application_gate', 'findings', 'classification_sha256', 'sbom_serial_number', 'platform_status']) {
+      assert.deepEqual(strippedJson[field], normal.json()[field], field);
+    }
+    assert.equal(normal.json().platform_status, 'INVENTORIED');
+    assert.ok(!normal.json().findings.some((finding) => /platform/.test(finding.rule)), 'no platform finding exists');
+    assert.match(normal.last, / platform=INVENTORIED$/);
+  }
+
+  // The browsers path is resolved exactly as the frozen runner's chromium probe resolves it.
+  const coreDir = join(REPO_ROOT, 'node_modules', 'playwright-core');
+  const cases = [
+    [undefined, join(homedir(), '.cache', 'ms-playwright')],
+    ['', join(homedir(), '.cache', 'ms-playwright')],
+    ['0', join(coreDir, '.local-browsers')],
+    ['/opt/synthetic-browsers', '/opt/synthetic-browsers'],
+    ['relative/browsers', resolve('relative/browsers')],
+  ];
+  const base = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== 'PLAYWRIGHT_BROWSERS_PATH'));
+  for (const [value, expected] of cases) {
+    const env = value === undefined ? base : { ...base, PLAYWRIGHT_BROWSERS_PATH: value };
+    assert.equal(effectiveBrowsersPath(REPO_ROOT, env).path, expected, `PLAYWRIGHT_BROWSERS_PATH=${JSON.stringify(value)}`);
+    const chromium = collectPlatformInventory(REPO_ROOT, { env }).items.find((item) => item.id === 'chromium');
+    assert.equal(chromium.observed.active_location, expected);
+    assert.equal(chromium.observed.locations[0].path, expected);
+  }
+  const runner = readFileSync(join(REPO_ROOT, 'scripts', 'verify.mjs'), 'utf8');
+  assert.ok(
+    runner.includes("configured === '0' ? join(packageDir, '.local-browsers') : configured ? resolve(configured) : join(homedir(), '.cache', 'ms-playwright');"),
+    'the frozen runner still resolves the browsers path this way',
+  );
 });
 
 test('[LI-10] the CycloneDX SBOM classifies every package and NOTICE is regenerated and checked', () => {
@@ -277,7 +329,7 @@ test('[LI-10] the CycloneDX SBOM classifies every package and NOTICE is regenera
     assert.match(component.hashes[0].content, /^[0-9a-f]{128}$/);
     assert.ok(component.properties.some((p) => p.name === 'opensig:classification'));
   }
-  assert.ok(sbom.metadata.properties.some((p) => p.name === 'opensig:platform-status' && p.value === 'POLICY-PENDING'));
+  assert.ok(sbom.metadata.properties.some((p) => p.name === 'opensig:platform-status' && p.value === 'INVENTORIED'));
 
   const notice = readFileSync(join(root, 'NOTICE'), 'utf8');
   assert.ok(notice.includes('pkg-a 1.0.0 (MIT)') && notice.includes('Synthetic MIT text for pkg-a.'));
@@ -498,7 +550,7 @@ test('the code-leg inventory passes with an empty shipped closure and a current 
   scratch.push(out);
   const run = spawnSync(process.execPath, [TOOL, '--root', REPO_ROOT, '--out', out], { encoding: 'utf8', timeout: 120_000 });
   assert.equal(run.status, 0, run.stdout + run.stderr);
-  assert.match(run.stdout, /license-inventory: PASS application-gate shipped=0 non-shipped=\d+ notice=current platform=POLICY-PENDING\n$/);
+  assert.match(run.stdout, /license-inventory: PASS application-gate shipped=0 non-shipped=\d+ notice=current platform=INVENTORIED\n$/);
   const packages = JSON.parse(readFileSync(join(out, 'inventory.json'), 'utf8')).packages;
   assert.ok(packages.length >= 3);
   for (const pkg of packages) assert.equal(pkg.classification, 'non-shipped', `${pkg.name} is a development tool`);

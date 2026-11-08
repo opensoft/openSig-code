@@ -7,22 +7,28 @@
 //
 // Records the platform this code runs on but does not ship as an npm package:
 // the pinned Node.js runtime, the libraries its binary links, the OpenSSL CLI,
-// the Chromium build used by browser tests, and the isolated Hermes image.
+// util-linux unshare (the PDF parser's namespace sandbox launcher), the
+// Chromium build used by browser tests, and the isolated Hermes image.
 //
-// Every item, and the inventory as a whole, carries status POLICY-PENDING: the
-// owner has not yet decided the platform license scope (spec plan.md, "Pending
-// owner decision: platform license scope"). This tool never reports PASS and
-// waives nothing. Its exit status says only whether the inventory was written.
+// Owner decision (2026-11-08, verbatim): "MIT/Apache application and
+// libraries; inventory platform licenses separately" (spec plan.md, "Owner
+// decision: platform license scope (resolved 2026-11-08)"). Platforms are
+// therefore recorded separately, with their own licenses, under status
+// INVENTORIED: they are not held to the MIT/Apache-2.0 allowlist, and no
+// platform entry ever affects the application gate (scripts/license-inventory.mjs),
+// which stays strictly MIT/Apache-2.0. This tool never reports PASS and waives
+// nothing. Its exit status says only whether the inventory was written.
 
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const PLATFORM_STATUS = 'POLICY-PENDING';
+export const PLATFORM_STATUS = 'INVENTORIED';
+export const OWNER_DECISION = 'MIT/Apache application and libraries; inventory platform licenses separately';
 export const PLATFORM_DECISION =
-  'Owner decision on platform license scope is pending (spec plan.md "Pending owner decision: platform license scope"). No platform item is passed or waived.';
+  `Owner decision (2026-11-08): "${OWNER_DECISION}" (spec plan.md "Owner decision: platform license scope (resolved 2026-11-08)"). Platform items are recorded separately with their own licenses; they are not held to the MIT/Apache-2.0 allowlist and never affect the application gate. No platform item is passed or waived.`;
 export const HERMES_IMAGE =
   'docker.io/nousresearch/hermes-agent@sha256:adb7890916de63245523492be8f68f9d2095fecbec4e2a6dab7960381f0fc002';
 
@@ -101,23 +107,66 @@ function opensslItem(env) {
   };
 }
 
-function chromiumItem(root, env) {
-  let pinnedRevision = null;
+function unshareItem(env) {
+  const version = run('unshare', ['--version'], env);
+  return {
+    id: 'unshare',
+    name: 'util-linux unshare',
+    role: 'platform tool: launches the PDF parse worker in a new user and network namespace (T033 parser sandbox, plan.md amendment A-007)',
+    observed: { version: version.ok ? version.stdout.trim().split('\n')[0] : null, detail: version.ok ? null : version.detail },
+    recorded_licenses:
+      'util-linux: no single license; GPL-2.0-or-later by default, with LGPL-2.1-or-later, BSD and public-domain parts (util-linux README.licensing; recorded, not re-measured here)',
+  };
+}
+
+function isRegularFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The browsers directory exactly as the frozen runner's chromium probe
+ * (scripts/verify.mjs probeChromium) resolves it: the first of playwright-core
+ * and playwright with a browsers.json is the package; PLAYWRIGHT_BROWSERS_PATH=0
+ * means <package>/.local-browsers, any other non-empty value is resolved, and
+ * unset or empty means the default cache. Returns { packageDir, path, source }.
+ */
+export function effectiveBrowsersPath(root, env) {
+  let packageDir = null;
   for (const name of ['playwright-core', 'playwright']) {
-    const browsers = readJson(join(root, 'node_modules', name, 'browsers.json'));
-    const chromium = browsers?.browsers?.find?.((browser) => browser.name === 'chromium');
-    if (chromium?.revision) {
-      pinnedRevision = String(chromium.revision);
+    const dir = join(root, 'node_modules', name);
+    if (isRegularFile(join(dir, 'browsers.json'))) {
+      packageDir = dir;
       break;
     }
   }
-  // Playwright reads PLAYWRIGHT_BROWSERS_PATH when set, else the default cache;
-  // both locations are recorded so the build that would run is visible.
   const configured = env.PLAYWRIGHT_BROWSERS_PATH;
+  if (configured === '0') {
+    return packageDir
+      ? { packageDir, path: join(packageDir, '.local-browsers'), source: 'PLAYWRIGHT_BROWSERS_PATH=0 (package-local)' }
+      : { packageDir, path: null, source: 'PLAYWRIGHT_BROWSERS_PATH=0, but Playwright is not installed' };
+  }
+  if (configured) return { packageDir, path: resolve(configured), source: 'PLAYWRIGHT_BROWSERS_PATH' };
+  return { packageDir, path: join(homedir(), '.cache', 'ms-playwright'), source: 'default cache' };
+}
+
+function chromiumItem(root, env) {
+  const effective = effectiveBrowsersPath(root, env);
+  let pinnedRevision = null;
+  if (effective.packageDir) {
+    const browsers = readJson(join(effective.packageDir, 'browsers.json'));
+    const chromium = browsers?.browsers?.find?.((browser) => browser.name === 'chromium');
+    if (chromium?.revision) pinnedRevision = String(chromium.revision);
+  }
+  // The effective location comes first; the default cache is listed too when
+  // it differs, so a mismatch between the two is visible.
   const defaultCache = join(homedir(), '.cache', 'ms-playwright');
   const paths = [];
-  if (configured && configured !== '0') paths.push({ path: resolve(configured), source: 'PLAYWRIGHT_BROWSERS_PATH' });
-  paths.push({ path: defaultCache, source: 'default cache' });
+  if (effective.path) paths.push({ path: effective.path, source: `${effective.source} (effective)` });
+  if (effective.path !== defaultCache) paths.push({ path: defaultCache, source: 'default cache' });
   const locations = paths.map(({ path, source }) => {
     let builds = [];
     try {
@@ -135,9 +184,10 @@ function chromiumItem(root, env) {
     role: 'non-shipped test-time browser',
     observed: {
       pinned_revision: pinnedRevision,
-      active_location: locations[0].path,
+      active_location: effective.path,
+      active_source: effective.source,
       locations,
-      detail: pinnedRevision ? null : 'Playwright is not installed yet (T027 pins it); cached builds are listed as found',
+      detail: pinnedRevision ? null : 'Playwright is not installed; cached builds are listed as found',
     },
   };
 }
@@ -155,9 +205,9 @@ function hermesItem() {
   };
 }
 
-/** Collect the platform inventory. Every item's status is POLICY-PENDING. */
+/** Collect the platform inventory. Every item's status is INVENTORIED (recorded separately, never gating). */
 export function collectPlatformInventory(root = REPO_ROOT, { env = process.env } = {}) {
-  const items = [nodeRuntimeItem(root, env), linkedLibrariesItem(root, env), opensslItem(env), chromiumItem(root, env), hermesItem()];
+  const items = [nodeRuntimeItem(root, env), linkedLibrariesItem(root, env), opensslItem(env), unshareItem(env), chromiumItem(root, env), hermesItem()];
   return {
     kind: 'opensig-platform-inventory',
     status: PLATFORM_STATUS,
@@ -193,7 +243,7 @@ function main(argv) {
   }
   const inventory = collectPlatformInventory(options.root);
   const path = writePlatformInventory(options.out, inventory);
-  process.stdout.write(`platform-inventory: ${PLATFORM_STATUS} items=${inventory.items.length} written=${path} (recorded, not passed)\n`);
+  process.stdout.write(`platform-inventory: ${PLATFORM_STATUS} items=${inventory.items.length} written=${path} (recorded separately; never gates the application)\n`);
   process.exitCode = 0;
 }
 

@@ -1,5 +1,5 @@
 {
-  "description": "openSig application-dependency license gate (spec plan.md, Pending owner decision: application gate; FR-011). Applies to every shipped npm package and every third-party asset copied into dist/. Non-shipped development tools are inventoried and reported, not gated. Platform items are POLICY-PENDING and are not covered by this file.",
+  "description": "openSig application-dependency license gate (spec plan.md, Owner decision: platform license scope (resolved 2026-11-08); FR-011). Owner decision, verbatim: \"MIT/Apache application and libraries; inventory platform licenses separately\". Applies, with no waiver, to every shipped npm package (the production closure and its transitive dependencies) and every third-party asset copied into dist/. Non-shipped development tools are inventoried and reported, not gated. Pre-existing platforms (the Node runtime binary and its embedded components, the OS/base image, the browser, any JVM, test-time platform tools) are inventoried separately by scripts/platform-inventory.mjs with status INVENTORIED; they are not covered by this file and never affect this gate.",
   "allowed": ["MIT", "Apache-2.0"],
   "allowedExceptions": []
 }

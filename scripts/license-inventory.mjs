@@ -37,8 +37,10 @@
 //
 // Outputs (in --out, default .verify-out/license-inventory/): sbom.cdx.json
 // (CycloneDX 1.6), inventory.json, and platform-inventory.json (status
-// POLICY-PENDING). Both files carry the same application-gate value, NOTICE
-// check included, and the SBOM serial number covers every classification.
+// INVENTORIED: platforms are recorded separately under the owner decision and
+// never affect the application gate computed here). Both files carry the same
+// application-gate value, NOTICE check included, and the SBOM serial number
+// covers every classification.
 // NOTICE at the repository root is regenerated with --write-notice; without
 // it, a stale NOTICE fails the run.
 //
