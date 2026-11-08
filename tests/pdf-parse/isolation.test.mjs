@@ -3,7 +3,8 @@
 // T033 parser-limits PL-11 and PL-12: the parse child is killed at its memory, CPU and
 // wall-time limits and the kill is a 422 resource-limit rejection; the child runs under
 // the Node permission model with no fs-write, child-process or worker grant and an empty
-// environment; and src/pdf/ imports no network module.
+// environment; and src/pdf/ imports no network module. PL-12 is an import boundary kept
+// as defence in depth; the network isolation itself is the namespace sandbox (PL-13).
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -149,7 +150,7 @@ function sourceFiles(dir) {
 
 const bare = (specifier) => specifier.replace(/^node:/, '').split('/')[0];
 
-test('[PL-12] src/pdf/ imports no net, http, https, dns, tls or dgram module', () => {
+test('[PL-12] import boundary (defence in depth), not network isolation: src/pdf/ imports no net, http, https, dns, tls or dgram module', () => {
   // The checker itself finds what it must find.
   assert.deepEqual(importSpecifiers(`import net from 'node:net';\nconst h = await import("https");\nexport * from './x.ts';`), ['node:net', './x.ts', 'https']);
   assert.deepEqual(importSpecifiers('const m = await import(name);'), ['<dynamic import>']);

@@ -113,7 +113,7 @@ test('[PL-01] valid documents parse in the isolated service with the declared st
   assert.equal(hybrid.stats.objects, 6);
 });
 
-test('[PL-02] rotated-page geometry follows inherited /Rotate, /MediaBox and /CropBox', async () => {
+test('[PL-02] rotated-page geometry follows inherited /Rotate and /MediaBox, and a /CropBox equal to the media box is accepted', async () => {
   const report = accepted(await parsePdf(fixtureBytes('rotated-pages.pdf')), 'rotated-pages.pdf');
   assert.deepEqual(geometry(report.pages), fixtureRecord('rotated-pages.pdf').pages);
   assert.deepEqual(report.pages.map((page) => page.rotate), [90, 270, 180, 0, 270]);
@@ -126,15 +126,15 @@ test('[PL-02] rotated-page geometry follows inherited /Rotate, /MediaBox and /Cr
   ]);
   assert.deepEqual(report.pages[4].media_box, [36, 36, 648, 828], 'a non-zero media box origin is preserved');
 
-  // An inherited /CropBox is the displayed box (clipped to the media box), then rotated.
-  const cropped = classicPdf(basicObjects({ pages: '/CropBox [36 36 576 756] /Rotate 90', page: '/MediaBox [0 0 612 792]' }));
-  const croppedReport = accepted(await parsePdf(cropped), 'inherited crop box');
-  assert.deepEqual(croppedReport.pages[0].crop_box, [36, 36, 576, 756]);
-  assert.deepEqual([croppedReport.pages[0].width, croppedReport.pages[0].height, croppedReport.pages[0].rotate], [720, 540, 90]);
-  const clipped = classicPdf(basicObjects({ page: '/CropBox [-100 -100 300 900] /Rotate -180' }));
-  const clippedReport = accepted(await parsePdf(clipped), 'clipped crop box');
-  assert.deepEqual(clippedReport.pages[0].crop_box, [0, 0, 300, 792]);
-  assert.deepEqual([clippedReport.pages[0].width, clippedReport.pages[0].height, clippedReport.pages[0].rotate], [300, 792, 180]);
+  // An inherited /CropBox equal to the media box (corners in any order) is the displayed
+  // box, then rotated. A crop box that differs is rejected (PL-14, cropbox_differs).
+  const same = classicPdf(basicObjects({ pages: '/CropBox [612 792 0 0] /Rotate 90', page: '/MediaBox [0 0 612 792]' }));
+  const sameReport = accepted(await parsePdf(same), 'inherited crop box equal to the media box');
+  assert.deepEqual(sameReport.pages[0].crop_box, [0, 0, 612, 792]);
+  assert.deepEqual([sameReport.pages[0].width, sameReport.pages[0].height, sameReport.pages[0].rotate], [792, 612, 90]);
+  const inherited = classicPdf(basicObjects({ pages: '/Rotate -180', page: '/MediaBox [0 0 300 500]' }));
+  const inheritedReport = accepted(await parsePdf(inherited), 'inherited rotate with a page media box');
+  assert.deepEqual([inheritedReport.pages[0].width, inheritedReport.pages[0].height, inheritedReport.pages[0].rotate], [300, 500, 180]);
 
   rejected(await parsePdf(classicPdf(basicObjects({ page: '/Rotate 45' }))), 'malformed', '/Rotate 45');
   rejected(await parsePdf(classicPdf(basicObjects({ page: '/MediaBox [0 0 0 792]' }))), 'malformed', 'zero-area media box');

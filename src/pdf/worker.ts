@@ -10,10 +10,11 @@
 // It refuses to parse unless the Node permission model is active with no fs-write,
 // child-process or worker grant.
 //
-// RECORDED DEVIATION (MVP): the permission model does not block network access, and there is
-// no OS-level network block for this process. Isolation from the network rests on the PL-12
-// import boundary (this module's closure imports only node:buffer and node:zlib) and on
-// the empty environment; see src/pdf/service.ts.
+// Network: the service launches this process inside a new user and network namespace
+// (util-linux unshare --user --net), where every connect fails at the OS level; see
+// src/pdf/service.ts. The permission model itself has no network scope. The PL-12 import
+// boundary (this module's closure imports only node:buffer and node:zlib) is defence in
+// depth, not the network isolation. The parent validates everything this process reports.
 
 import { Buffer } from 'node:buffer';
 

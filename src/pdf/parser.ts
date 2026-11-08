@@ -17,9 +17,14 @@
 // Rejections, in precedence order after structural validity: encryption (trailer
 // /Encrypt), an existing digital signature (signature dictionaries, signed /FT /Sig fields,
 // /DocMDP or /UR3 permissions), active content (JavaScript, Launch actions, embedded files,
-// RichMedia), then more than maxPages pages. Names are compared after #xx decoding, so an
-// escaped name cannot hide a detection. JBIG2 and JPX image filters are reported as
-// features; they are not decoded here.
+// RichMedia, XFA forms, 3D artwork and its /OnInstantiate scripts, Screen annotations and
+// Rendition actions), then, page by page, an effective /CropBox that differs from the
+// /MediaBox (unsupported-feature `cropbox_differs`, A-008 S2: field rectangles are
+// normalized to the displayed page, so a cropped page would mis-map them) and more than
+// maxPages pages. The effective crop box is the inherited /CropBox intersected with the
+// /MediaBox (ISO 32000-1 14.11.2); a crop box that covers the whole media box is accepted.
+// Names are compared after #xx decoding, so an escaped name cannot hide a detection. JBIG2
+// and JPX image filters are reported as features; they are not decoded here.
 
 import { Buffer } from 'node:buffer';
 
@@ -49,7 +54,7 @@ export interface PageReport {
   rotate: 0 | 90 | 180 | 270;
   /** Effective /MediaBox, normalized to [llx, lly, urx, ury]. */
   media_box: number[];
-  /** Displayed box: the effective /CropBox clipped to the media box (the media box when absent). */
+  /** Displayed box: the effective /CropBox clipped to the media box. Always equal to media_box (S2). */
   crop_box: number[];
   /** Indirect reference of the page object. */
   ref: [number, number];
@@ -532,6 +537,10 @@ class DocumentParser {
     if (action === 'Launch') this.active.add('launch');
     if (type === 'EmbeddedFile' || map.has('EmbeddedFiles') || map.has('EF')) this.active.add('embedded-file');
     if (subtype === 'RichMedia' || map.has('RichMediaContent') || map.has('RichMediaSettings')) this.active.add('rich-media');
+    if (map.has('XFA')) this.active.add('xfa');
+    if (subtype === '3D' || type === '3D' || map.has('3DD') || map.has('OnInstantiate')) this.active.add('3d');
+    if (subtype === 'Screen') this.active.add('screen');
+    if (action === 'Rendition' || type === 'Rendition') this.active.add('rendition');
     for (const inner of map.values()) this.scanValue(inner);
   }
 
@@ -604,6 +613,7 @@ class DocumentParser {
         const c = effective.cropBox;
         crop = [Math.max(c[0] ?? 0, media[0] ?? 0), Math.max(c[1] ?? 0, media[1] ?? 0), Math.min(c[2] ?? 0, media[2] ?? 0), Math.min(c[3] ?? 0, media[3] ?? 0)];
         if ((crop[2] ?? 0) - (crop[0] ?? 0) <= 0 || (crop[3] ?? 0) - (crop[1] ?? 0) <= 0) throw malformed(`page object ${ref.num} /CropBox lies outside its /MediaBox`);
+        if (!crop.every((value, index) => value === media[index])) throw new ParseFailure('unsupported-feature', 'cropbox_differs');
       }
       const width = (crop[2] ?? 0) - (crop[0] ?? 0);
       const height = (crop[3] ?? 0) - (crop[1] ?? 0);
