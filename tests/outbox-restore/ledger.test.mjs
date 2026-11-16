@@ -321,6 +321,20 @@ function userProcesses() {
   return { inspectable, uninspectable };
 }
 
+/**
+ * Any process of this user on the host that is exiting, or is a zombie, is
+ * uninspectable for a moment too (its /proc/<pid>/fd turns root-owned), and
+ * on a shared host such processes come and go all the time. A pid is steadily
+ * uninspectable, or steadily inspectable, when it is so in two scans taken
+ * around a command; assertions about the whole of /proc use those.
+ */
+function steadyProcesses(before, after = userProcesses()) {
+  return {
+    inspectable: before.inspectable.filter((pid) => after.inspectable.includes(pid)),
+    uninspectable: before.uninspectable.filter((pid) => after.uninspectable.includes(pid)),
+  };
+}
+
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const isPending = (error) => error?.code === 'committed_pending_publication';
 const claimsUnchanged = (message) => /byte-identical|unchanged|nothing was (written|recorded|changed)/.test(message);
@@ -1846,16 +1860,22 @@ test('[OR-35] the lock owner holds its descriptor for the whole session and rele
     // that /proc does not let anyone but root inspect (a non-dumpable one,
     // such as ssh-agent) means refuse, naming it, never assume it is not a
     // holder; then the success path is shown over the inspectable processes.
-    const { inspectable, uninspectable } = userProcesses();
+    // Every steadily uninspectable process is named, and no steadily
+    // inspectable one; a process exiting during the command may be named.
+    const scanBefore = userProcesses();
     const moved = cli('--break-lock', 'damaged', '--ledger', sys.ledgerPath);
+    const { inspectable, uninspectable } = steadyProcesses(scanBefore);
     let movedTo;
-    if (uninspectable.length === 0) {
-      assert.equal(moved.status, 0, moved.stdout + moved.stderr);
+    if (moved.status === 0) {
+      assert.deepEqual(uninspectable, [], `moved although a process of this user stayed uninspectable (${moved.stdout})`);
       movedTo = /^backup: damaged-lock-moved path=(\S+)\n$/.exec(moved.stdout)?.[1];
     } else {
       assert.equal(moved.status, 1, moved.stdout + moved.stderr);
-      assert.match(moved.stdout, /^backup: refused ledger_invalid: process\(es\) [0-9, ]+ of this user cannot be inspected, so it cannot be shown that none holds the damaged lock; the lock was not moved\n$/);
-      for (const pid of uninspectable) assert.match(moved.stdout, new RegExp(`\\b${pid}\\b`), `the refusal names pid ${pid}`);
+      const named = /^backup: refused ledger_invalid: process\(es\) ([0-9, ]+) of this user cannot be inspected, so it cannot be shown that none holds the damaged lock; the lock was not moved\n$/.exec(moved.stdout);
+      assert.ok(named, moved.stdout);
+      const pids = named[1].split(', ').map(Number);
+      for (const pid of uninspectable) assert.ok(pids.includes(pid), `the refusal names pid ${pid}: ${moved.stdout}`);
+      for (const pid of pids) assert.ok(!inspectable.includes(pid), `pid ${pid}, inspectable before and after, is not named: ${moved.stdout}`);
       assert.deepEqual(readFileSync(lockPath), torn, 'refused: the lock is untouched');
       movedTo = breakDamagedLock(sys.ledgerPath, { pids: () => inspectable }).movedTo;
     }
@@ -1868,10 +1888,11 @@ test('[OR-35] the lock owner holds its descriptor for the whole session and rele
     // The 60 s rule, on the file's mtime and an injectable clock.
     writeFileSync(lockPath, torn, { flag: 'wx', mode: 0o600 });
     const mtime = statSync(lockPath).mtimeMs;
+    const scanYoung = userProcesses();
     const young = cli('--break-lock', 'damaged', '--ledger', sys.ledgerPath);
     assert.equal(young.status, 1);
     assert.match(young.stdout, /it is moved aside only when older than 60 s; the lock was not moved/);
-    const scanned = userProcesses().inspectable;
+    const scanned = steadyProcesses(scanYoung).inspectable;
     assert.ok(scanned.includes(process.pid));
     const scan = { pids: () => scanned };
     assert.throws(() => breakDamagedLock(sys.ledgerPath, { ...scan, now: () => mtime + 59_000 }), /only when older than 60 s/);
