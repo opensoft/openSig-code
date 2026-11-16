@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "openSig Corporate Signing MVP",
-    "version": "0.2.2-draft",
+    "version": "0.2.3-draft",
     "license": {
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
@@ -3178,7 +3178,7 @@
       "DrawnSignatureValue": {
         "type": "object",
         "additionalProperties": false,
-        "description": "Vector strokes in field-local normalized coordinates [0,1] (origin top-left). At most 50 strokes, 1000 points per stroke and 10000 points in total; rendered as PDF path operators, never as an image.",
+        "description": "Vector strokes in field-local fixed-point coordinates: integers 0..10000 in units of 1/10000 of the field's width (x) and height (y), origin top-left. At most 50 strokes, 1000 points per stroke and 10000 points per value; the Approval point budget also applies. Rendered as PDF path operators, never as an image (contract 0.2.3).",
         "properties": {
           "key": {
             "type": "string",
@@ -3202,14 +3202,14 @@
                 "type": "array",
                 "prefixItems": [
                   {
-                    "type": "number",
+                    "type": "integer",
                     "minimum": 0,
-                    "maximum": 1
+                    "maximum": 10000
                   },
                   {
-                    "type": "number",
+                    "type": "integer",
                     "minimum": 0,
-                    "maximum": 1
+                    "maximum": 10000
                   }
                 ],
                 "minItems": 2,
@@ -3287,7 +3287,7 @@
       "Approval": {
         "type": "object",
         "additionalProperties": false,
-        "description": "Exactly one value per field of this recipient. Binding: document, manifest, prior approval, consent text and intended recipient (from the session). An exact retry returns the original receipt; a changed retry returns 409.",
+        "description": "Exactly one value per field of this recipient. Point budget: all DrawnSignatureValue strokes in one Approval hold at most 15000 points in total, so any Approval within the schema fits the 256 KiB JSON limit as compact JSON; a request over the budget is 400 invalid_request (contract 0.2.3). Binding: document, manifest, prior approval, consent text and intended recipient (from the session). An exact retry returns the original receipt; a changed retry returns 409.",
         "properties": {
           "expected_version": {
             "type": "integer",
@@ -3936,7 +3936,7 @@
       "AuditReceipt": {
         "type": "object",
         "additionalProperties": false,
-        "description": "audit-receipt.json: every event of this envelope from the tenant's hash chain, each with its full digest preimage (AuditEventRecord), plus the chain head at completion and the latest checkpoint. A holder can recompute every event_digest. prev_digest links to the tenant chain, whose events for other envelopes are omitted for confidentiality, so continuity is checkable only between consecutive seq values in the receipt; full-chain continuity is attested by chain_head_digest and the checkpoint and verified on restore. Tamper-evident, not tamper-proof.",
+        "description": "audit-receipt.json: every event of this envelope from the tenant's hash chain up to the chain head at package assembly, each with its full digest preimage (AuditEventRecord), plus that chain head and the completion checkpoint written at assembly. The envelope.completed event, written when the package is published, follows that head and is not in the receipt (contract 0.2.3). A holder can recompute every event_digest. prev_digest links to the tenant chain, whose events for other envelopes are omitted for confidentiality, so continuity is checkable only between consecutive seq values in the receipt; full-chain continuity is attested by chain_head_digest and the checkpoint and verified on restore. Tamper-evident, not tamper-proof.",
         "properties": {
           "schema": {
             "const": "opensig.audit-receipt/1"
@@ -4332,7 +4332,7 @@
         }
       },
       "PayloadTooLarge": {
-        "description": "payload_too_large: request body over the route limit (10 MiB for PDF upload, enforced while streaming; 256 KiB for JSON)",
+        "description": "payload_too_large: request body over the route limit (10 MiB for PDF upload, enforced while streaming; 256 KiB for JSON, which any Approval within its point budget fits as compact JSON)",
         "content": {
           "application/json": {
             "schema": {

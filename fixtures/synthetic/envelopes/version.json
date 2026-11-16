@@ -29,8 +29,8 @@
           },
           {
             "path": "version",
-            "greaterThan": {
-              "$ctx": "version"
+            "equals": {
+              "$ctx": "next_version"
             }
           },
           {
@@ -297,8 +297,8 @@
           },
           {
             "path": "version",
-            "greaterThan": {
-              "$ctx": "version"
+            "equals": {
+              "$ctx": "next_version"
             }
           }
         ]
@@ -541,8 +541,8 @@
           },
           {
             "path": "version",
-            "greaterThan": {
-              "$ctx": "version"
+            "equals": {
+              "$ctx": "next_version"
             }
           }
         ]

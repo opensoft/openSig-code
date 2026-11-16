@@ -80,10 +80,11 @@ reject-everything (`tests/contract/envelopes/stubs.test.mjs`).
   - `prepared-1`: prepared, with one signature field.
 
   Each given lists its own steps: `create` (an `EnvelopeCreate` body),
-  `document` (a PDF descriptor) and `prepare` (`FieldInput[]`). Create, upload
-  and prepare are each a versioned mutation. A subject therefore arranges
-  `prepared-1` at version 2 or above, which the stale-version cases rely on
-  (`previous_version`).
+  `document` (a PDF descriptor) and `prepare` (`FieldInput[]`). Under the
+  version semantics below, a conforming subject arranges `draft-1` at
+  version 1, `draft-1-document` at version 2 and `prepared-1` at version 3.
+  The stale-version cases (`previous_version`) rely on `prepared-1` being at
+  version 2 or above.
 - **`request.operationId`** names the contract operation. The method and path
   template come from the vendored contract.
 - **`request.principal`** is `sender` (a human operator with role `sender`) or
@@ -130,10 +131,10 @@ contract. Each test also checks:
 | Defect | Status | Code | Contract basis |
 |---|---|---|---|
 | `body-schema`, `body-syntax` | 400 | `invalid_request` | BadRequest: "malformed JSON, schema violation or unknown property" |
-| `body-rule` (EnvelopeCreate "Ordinals must be exactly 1 or 1..2 without gaps.") | 400 | `invalid_request` | The rule is part of the request schema's text, and no other `Error.code` names it |
+| `body-rule` (EnvelopeCreate "Ordinals must be exactly 1 or 1..2 without gaps.") | 400 | `invalid_request` | Ruled in spec 12de9e8, T006 readings (a): the EnvelopeCreate description is part of the schema, and BadRequest covers any schema violation |
 | `header-missing` (`Idempotency-Key`), `header-invalid` | 400 | `invalid_request` | Required header parameter and its pattern |
 | `header-missing` (`If-Match`) | 428 | `precondition_required` | PreconditionRequired: "If-Match missing on upload" |
-| `path-parameter` | 400 | `invalid_request` | EnvelopeId pattern; readEnvelope declares 400, and the path parameter is its only validated input |
+| `path-parameter` | 400 | `invalid_request` | Ruled in spec 12de9e8, T006 readings (b): the EnvelopeId pattern is part of the contract, and every operation with that path parameter declares 400. The uniform 404 applies to well-formed ids |
 | `absent-resource` | 404 | `not_found` | NotFound: "absent or inaccessible" |
 | `version-mismatch` | 409 | `version_conflict` | Conflict |
 | `state` (upload on a prepared envelope) | 409 | `state_conflict` | uploadDocument: "draft only" |
@@ -145,6 +146,26 @@ contract. Each test also checks:
 The boundary cases follow "over the route limit": a body exactly at a limit is
 accepted. That means 10 MiB = 10485760 bytes, which equals
 `DocumentSummary.bytes.maximum`, and 256 KiB = 262144 bytes.
+
+## Version semantics
+
+Ruled in spec 12de9e8, T006 readings (c), and stated in the spec's data model
+(Transitions and races, item 1):
+
+- create sets the envelope `version` to 1;
+- each successful operation that changes the envelope's state or content,
+  upload and prepare included, adds exactly 1;
+- a refused request, a read and an idempotent replay leave it unchanged.
+
+Accordingly, the cases assert exact versions:
+
+- every accepting create case: `version` equals 1;
+- the read case: the arranged version;
+- the accepting upload, prepare and void cases: `next_version` (the arranged
+  version plus 1).
+
+The version-mismatch cases send `next_version` (a version the envelope has not
+reached) or `previous_version` (stale).
 
 ## Verdict
 
@@ -225,7 +246,15 @@ The manifest covers only its four categories. It does not exercise:
 - send confirmation;
 - recipient routes or webhooks.
 
-T034, T008, T010 and T019 own those.
+These are owned elsewhere (spec 12de9e8, T006 readings):
+
+- 401/403 per route: T034 (EA-03); the recipient-scheme 401/403 cases belong
+  to T008 and T010;
+- idempotent replay: T034 (EA-02, SC002-23);
+- cross-tenant 404: T034 (SC002-07, SC002-08, SC002-26), T016 (SC002-09) and
+  T010 (SC002-02);
+- send confirmation: T034 (SC002-24);
+- webhooks: T019.
 
 The PDF inspector is a structural checker for the synthetic documents built
 here. It is not a general PDF parser.

@@ -229,6 +229,10 @@
             "equals": "draft"
           },
           {
+            "path": "version",
+            "equals": 1
+          },
+          {
             "path": "recipients",
             "length": 1
           }

@@ -7,8 +7,8 @@
   "contract": {
     "file": "contracts/http-api.json",
     "source": "contracts/http-api.source.json",
-    "sha256": "03a5477befc1c3b7aa3714bd1a5f38f723faea06d8b7482f1b1ef942119965a5",
-    "info_version": "0.2.2-draft"
+    "sha256": "9e53f792672d6976972beab1a102fa87d6e26fb35b778044c7e77ebca4a654fd",
+    "info_version": "0.2.3-draft"
   },
   "limits": {
     "json_body_bytes": 262144,

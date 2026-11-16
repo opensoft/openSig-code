@@ -34,6 +34,10 @@
             "equals": "draft"
           },
           {
+            "path": "version",
+            "equals": 1
+          },
+          {
             "path": "recipients",
             "length": 1
           },
@@ -135,6 +139,10 @@
             "equals": "draft"
           },
           {
+            "path": "version",
+            "equals": 1
+          },
+          {
             "path": "recipients",
             "length": 2
           },
@@ -190,6 +198,10 @@
           {
             "path": "state",
             "equals": "draft"
+          },
+          {
+            "path": "version",
+            "equals": 1
           },
           {
             "path": "created_by.kind",
@@ -1027,8 +1039,8 @@
           },
           {
             "path": "version",
-            "greaterThan": {
-              "$ctx": "version"
+            "equals": {
+              "$ctx": "next_version"
             }
           },
           {
