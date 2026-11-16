@@ -6,17 +6,23 @@
 // record's commit and the blob removal; RET-02 the exported disposal path and
 // its in-transaction re-check; RET-03 only retention records end retention;
 // RET-04 retained final artifacts keep protecting their blobs; RET-05 more
-// than 10,000 eligible envelopes; RET-06 every shared reference is seen.
+// than 10,000 eligible envelopes; RET-06 every shared reference is seen;
+// RET-07 the exported reference-protection predicate is the disposer's rule.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { canonicalDigest } from '../../src/domain/canonical/index.ts';
 import { eventDigest, eventFromRow, verifyChain } from '../../src/storage/audit/index.ts';
 import { MAX_LIST_LIMIT, StorageConstraintError, StorageUsageError } from '../../src/storage/db/index.ts';
 import {
+  BLOB_REFERENCE_COLUMNS,
   BlobDisposer,
   DISPOSAL_RECORD_SCHEMA,
+  ReferenceProtection,
   RETENTION_BATCH_SIZE,
   RetentionPolicyError,
   RetentionService,
@@ -476,6 +482,69 @@ test('[RET-06] the shared-reference check reads every reference, so a live user 
     assert.deepEqual(run.disposals[0].disposedBlobRefs, []);
     assert.deepEqual(run.keptSharedBlobRefs, [shared.ref]);
     assert.equal(blobs.check(tenant, shared.digest), 'ok', `the live envelope ${live} keeps its document`);
+  } finally {
+    db.close();
+  }
+});
+
+test('[RET-07] the exported ReferenceProtection predicate is the one rule the disposer applies (A-009 T30R-4)', () => {
+  const { db, blobs, audit } = environment(scratch, steppingClock());
+  try {
+    const tenant = sid('tenant');
+    createTenant(db, tenant);
+    const store = db.forTenant(tenant);
+    const disposer = new BlobDisposer({ db, blobs, audit, clock: fixedClock(RUN_AT) });
+    assert.deepEqual(
+      BLOB_REFERENCE_COLUMNS.map(({ table, column, kind }) => `${table}.${column}:${kind}`),
+      ['document_revisions.blob_ref:document', 'final_artifacts.pdf_blob_ref:artifact', 'final_artifacts.evidence_blob_ref:artifact', 'final_artifacts.package_blob_ref:artifact'],
+    );
+
+    // Four envelopes, one per case of the rule.
+    const keptArtifacts = terminalEnvelope(db, blobs, tenant, { state: 'completed', updatedMinutes: 1 });
+    const gaveUpAll = terminalEnvelope(db, blobs, tenant, { state: 'completed', updatedMinutes: 1 });
+    const orphaned = terminalEnvelope(db, blobs, tenant, { state: 'completed', updatedMinutes: 1 });
+    const live = terminalEnvelope(db, blobs, tenant, { state: 'sent', updatedMinutes: 1 });
+    const retention = (envelope, scope) => ({ envelopeId: envelope.env, kind: 'retention', scope, policyRef: 'synthetic-policy', refs: [], retainedArtifactDigests: [] });
+    disposer.dispose(tenant, retention(keptArtifacts, 'documents'));
+    disposer.dispose(tenant, retention(gaveUpAll, 'all'));
+    disposer.dispose(tenant, { envelopeId: orphaned.env, kind: 'orphan-collection', policyRef: 'orphan-collection', refs: [], retainedArtifactDigests: [] });
+
+    const plain = new ReferenceProtection(store);
+    const decisions = (protection) =>
+      [keptArtifacts, gaveUpAll, orphaned, live].map((envelope) => [protection.protects(envelope.env, 'document'), protection.protects(envelope.env, 'artifact')]);
+    assert.deepEqual(decisions(plain), [
+      [false, true], // retention, scope documents: documents given up, artifacts kept
+      [false, false], // retention, scope all: both given up
+      [true, true], // an orphan-collection record gives nothing up
+      [true, true], // live
+    ]);
+    const asRetentionAll = new ReferenceProtection(store, { envelopeId: live.env, kind: 'retention', scope: 'all' });
+    assert.deepEqual(decisions(asRetentionAll)[3], [false, false], 'the envelope being disposed counts as giving up what the disposal gives up');
+    assert.deepEqual(decisions(asRetentionAll).slice(0, 3), decisions(plain).slice(0, 3));
+    const asOrphan = new ReferenceProtection(store, { envelopeId: live.env, kind: 'orphan-collection', scope: undefined });
+    assert.deepEqual(decisions(asOrphan)[1], [false, true], 'an orphan collection never overrides a final artifact');
+
+    // Parity: for both kinds of disposal, the disposer keeps exactly the refs
+    // the exported predicate calls referenced.
+    const unreferenced = blobs.put(tenant, syntheticBytes('ret-07-unreferenced', 200));
+    const refsOf = (envelope) => [envelope.doc.ref, envelope.pdf?.ref, envelope.evidence?.ref].filter(Boolean);
+    const pool = [...new Set([...refsOf(keptArtifacts), ...refsOf(gaveUpAll), ...refsOf(orphaned), ...refsOf(live), unreferenced.ref])].sort();
+    for (const request of [
+      { envelopeId: orphaned.env, kind: 'orphan-collection', policyRef: 'orphan-collection', refs: pool, retainedArtifactDigests: [] },
+      { envelopeId: live.env, kind: 'retention', scope: 'documents', policyRef: 'synthetic-policy', refs: pool, retainedArtifactDigests: [] },
+    ]) {
+      const context = { envelopeId: request.envelopeId, kind: request.kind, scope: request.scope };
+      const predicted = pool.filter((ref) => new ReferenceProtection(store, context).referenced(ref));
+      const outcome = disposer.dispose(tenant, request);
+      assert.deepEqual(outcome.keptBlobRefs, predicted, `${request.kind}: kept refs equal the predicate`);
+      assert.deepEqual(outcome.disposedBlobRefs, pool.filter((ref) => !predicted.includes(ref)));
+    }
+    assert.equal(blobs.check(tenant, keptArtifacts.pdf.digest), 'ok', 'a retained final artifact survived both disposals');
+
+    // The disposer has no private copy of the rule: it delegates to the class.
+    const source = readFileSync(join(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'), 'src', 'storage', 'retention', 'service.ts'), 'utf8');
+    assert.equal([...source.matchAll(/new ReferenceProtection\(/g)].length, 1, 'one construction site, in BlobDisposer');
+    assert.equal([...source.matchAll(/iterate\('final_artifacts'/g)].length, 0, 'no second scan of artifact references');
   } finally {
     db.close();
   }

@@ -15,7 +15,9 @@
 // resume() finishes step 2 for earlier records after a crash between the
 // commit and the removal, keeping any ref that is referenced again.
 //
-// Reference rule. A row that references a blob protects it, except:
+// Reference rule (ReferenceProtection, exported as the single
+// reference-protection predicate: backup computes its required blobs with it
+// too, A-009 T30R-4). A row that references a blob protects it, except:
 // - a document revision of an envelope that retention disposed (retention
 //   always gives up the document revisions);
 // - a final artifact of an envelope that retention disposed with scope 'all'
@@ -110,17 +112,96 @@ export interface RetentionRun {
 
 const ARTIFACT_REF_COLUMNS = ['pdf_blob_ref', 'evidence_blob_ref', 'package_blob_ref'] as const;
 
+/** Whether a referencing row is a document revision or a final artifact. */
+export type ReferenceKind = 'document' | 'artifact';
+
+/** Every column that references a blob, with the kind of reference it is. */
+export const BLOB_REFERENCE_COLUMNS: readonly { readonly table: string; readonly column: string; readonly kind: ReferenceKind }[] = Object.freeze([
+  Object.freeze({ table: 'document_revisions', column: 'blob_ref', kind: 'document' as const }),
+  ...ARTIFACT_REF_COLUMNS.map((column) => Object.freeze({ table: 'final_artifacts', column, kind: 'artifact' as const })),
+]);
+
 /** What one envelope has given up through retention. */
 interface GivenUp {
   readonly documents: boolean;
   readonly artifacts: boolean;
 }
 
-/** The disposal being decided: its envelope counts as given up as requested. */
-interface DisposalContext {
+/** A disposal being decided: its envelope counts as having given up what it gives up. */
+export interface DisposalContext {
   readonly envelopeId: string;
   readonly kind: DisposalKind;
   readonly scope: RetentionScope | undefined;
+}
+
+/** The scope of the envelope's retention disposal, from its audit event ('documents' when not recorded). */
+function retentionScope(store: TenantStore, envelopeId: string): RetentionScope {
+  for (const event of store.iterate('audit_events', { envelope_id: envelopeId, type: EVENT.retention.type })) {
+    const metadata = parseJson(String(event['metadata_json']));
+    if (metadata !== null && typeof metadata === 'object' && !Array.isArray(metadata) && metadata['scope'] === 'all') return 'all';
+  }
+  return 'documents';
+}
+
+function hasRetentionDisposal(store: TenantStore, envelopeId: string): boolean {
+  return store.count('disposal_records', { envelope_id: envelopeId, kind: 'retention' }) > 0;
+}
+
+/**
+ * The single reference-protection predicate (A-009 T30R-4), shared by the
+ * disposer and by backup's required-blob set. protects() answers whether a
+ * referencing row, of the given kind and owned by the given envelope, still
+ * protects the blob it references:
+ * - a document revision protects unless its envelope has a retention
+ *   DisposalRecord;
+ * - a final artifact protects unless its envelope was disposed by retention
+ *   with scope 'all';
+ * - with a disposal context, that disposal's envelope counts as having given
+ *   up what the disposal gives up (a retention disposal: its documents, and
+ *   its final artifacts for scope 'all'), and for an orphan collection every
+ *   final artifact protects.
+ * Orphan-collection records never make an envelope give anything up. An
+ * instance caches per envelope; use one instance per consistent read.
+ */
+export class ReferenceProtection {
+  readonly #store: TenantStore;
+  readonly #context: DisposalContext | undefined;
+  readonly #cache = new Map<string, GivenUp>();
+
+  constructor(store: TenantStore, context?: DisposalContext) {
+    this.#store = store;
+    this.#context = context;
+  }
+
+  #givenUp(envelopeId: string): GivenUp {
+    const context = this.#context;
+    if (context !== undefined && context.kind === 'retention' && envelopeId === context.envelopeId) {
+      return { documents: true, artifacts: context.scope === 'all' };
+    }
+    let state = this.#cache.get(envelopeId);
+    if (state === undefined) {
+      const disposed = hasRetentionDisposal(this.#store, envelopeId);
+      state = { documents: disposed, artifacts: disposed && retentionScope(this.#store, envelopeId) === 'all' };
+      this.#cache.set(envelopeId, state);
+    }
+    return state;
+  }
+
+  protects(envelopeId: string, kind: ReferenceKind): boolean {
+    if (kind === 'artifact' && this.#context?.kind === 'orphan-collection') return true;
+    const givenUp = this.#givenUp(envelopeId);
+    return kind === 'document' ? !givenUp.documents : !givenUp.artifacts;
+  }
+
+  /** True while any row that still protects `ref` references it (every row is read). */
+  referenced(ref: string): boolean {
+    for (const { table, column, kind } of BLOB_REFERENCE_COLUMNS) {
+      for (const row of this.#store.iterate(table, { [column]: ref })) {
+        if (this.protects(String(row['envelope_id']), kind)) return true;
+      }
+    }
+    return false;
+  }
 }
 
 function defaultId(): string {
@@ -173,45 +254,9 @@ export class BlobDisposer {
     return now;
   }
 
-  /** The scope of the envelope's retention disposal, from its audit event ('documents' when not recorded). */
-  #retentionScope(store: TenantStore, envelopeId: string): RetentionScope {
-    for (const event of store.iterate('audit_events', { envelope_id: envelopeId, type: EVENT.retention.type })) {
-      const metadata = parseJson(String(event['metadata_json']));
-      if (metadata !== null && typeof metadata === 'object' && !Array.isArray(metadata) && metadata['scope'] === 'all') return 'all';
-    }
-    return 'documents';
-  }
-
-  #givenUp(store: TenantStore, envelopeId: string, context: DisposalContext, cache: Map<string, GivenUp>): GivenUp {
-    if (context.kind === 'retention' && envelopeId === context.envelopeId) {
-      return { documents: true, artifacts: context.scope === 'all' };
-    }
-    let state = cache.get(envelopeId);
-    if (state === undefined) {
-      const disposed = this.#hasRetentionDisposal(store, envelopeId);
-      state = { documents: disposed, artifacts: disposed && this.#retentionScope(store, envelopeId) === 'all' };
-      cache.set(envelopeId, state);
-    }
-    return state;
-  }
-
-  /** True while any row that has not given the ref up still references it. */
+  /** True while any row still protecting the ref (ReferenceProtection) references it. */
   #referenced(store: TenantStore, ref: string, context: DisposalContext): boolean {
-    const cache = new Map<string, GivenUp>();
-    for (const row of store.iterate('document_revisions', { blob_ref: ref })) {
-      if (!this.#givenUp(store, String(row['envelope_id']), context, cache).documents) return true;
-    }
-    for (const column of ARTIFACT_REF_COLUMNS) {
-      for (const row of store.iterate('final_artifacts', { [column]: ref })) {
-        if (context.kind === 'orphan-collection') return true;
-        if (!this.#givenUp(store, String(row['envelope_id']), context, cache).artifacts) return true;
-      }
-    }
-    return false;
-  }
-
-  #hasRetentionDisposal(store: TenantStore, envelopeId: string): boolean {
-    return store.count('disposal_records', { envelope_id: envelopeId, kind: 'retention' }) > 0;
+    return new ReferenceProtection(store, context).referenced(ref);
   }
 
   #removeBlob(tenantId: string, ref: string): boolean {
@@ -240,7 +285,7 @@ export class BlobDisposer {
 
   /** True when the envelope has a retention DisposalRecord; orphan-collection records do not count. */
   hasRetentionDisposal(tenantId: string, envelopeId: string): boolean {
-    return this.#hasRetentionDisposal(this.#db.forTenant(tenantId), envelopeId);
+    return hasRetentionDisposal(this.#db.forTenant(tenantId), envelopeId);
   }
 
   /** Dispose one envelope's candidate refs (its own transaction; see disposeBatch). */
@@ -265,7 +310,7 @@ export class BlobDisposer {
     const outcomes = this.#db.transaction(() =>
       checked.map((context, index): DisposalOutcome => {
         const request = requests[index] as DisposalRequest;
-        if (context.kind === 'retention' && this.#hasRetentionDisposal(store, context.envelopeId)) {
+        if (context.kind === 'retention' && hasRetentionDisposal(store, context.envelopeId)) {
           throw new StorageUsageError('the envelope already has a retention disposal');
         }
         const disposedBlobRefs: string[] = [];
@@ -345,7 +390,7 @@ export class BlobDisposer {
         const key = parseBlobRef(ref);
         if (key.tenantId !== tenantId) throw new StorageUsageError('a disposal blob ref belongs to another tenant');
         if (this.#blobs.check(tenantId, key.digest) === 'missing') continue;
-        context ??= { envelopeId, kind, scope: kind === 'retention' ? this.#retentionScope(store, envelopeId) : undefined };
+        context ??= { envelopeId, kind, scope: kind === 'retention' ? retentionScope(store, envelopeId) : undefined };
         if (this.#referenced(store, ref, context)) continue;
         if (this.#removeBlob(tenantId, ref)) resumed.push(ref);
       }
