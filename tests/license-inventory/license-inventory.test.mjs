@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// License inventory and SBOM gate (T002), cases LI-01..LI-10.
+// License inventory and SBOM gate (T002), cases LI-01..LI-11.
 //
 // Every project below is synthetic: package.json, package-lock.json and the
-// node_modules tree are generated at runtime in a temporary directory.
+// node_modules tree are generated at runtime in a temporary directory. LI-11
+// reads the host's own platform tools and package records, and checks each
+// value against the host independently.
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
@@ -20,7 +22,7 @@ import { collectPlatformInventory, effectiveBrowsersPath, PLATFORM_DECISION, PLA
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const TOOL = join(REPO_ROOT, 'scripts', 'license-inventory.mjs');
 const PLATFORM_TOOL = join(REPO_ROOT, 'scripts', 'platform-inventory.mjs');
-const PLATFORM_ITEMS = ['node-runtime', 'linked-libraries', 'openssl-cli', 'unshare', 'chromium', 'hermes-image'];
+const PLATFORM_ITEMS = ['node-runtime', 'linked-libraries', 'openssl-cli', 'bwrap', 'unshare', 'mount', 'chroot', 'setpriv', 'sh', 'mkdir', 'chromium', 'hermes-image'];
 
 const scratch = [];
 after(() => {
@@ -248,7 +250,7 @@ test('[LI-09] platforms are INVENTORIED separately and never affect the applicat
   const out = join(bare, 'out');
   const cli = spawnSync(process.execPath, [PLATFORM_TOOL, '--root', REPO_ROOT, '--out', out], { encoding: 'utf8', timeout: 60_000 });
   assert.equal(cli.status, 0);
-  assert.match(cli.stdout, /^platform-inventory: INVENTORIED items=6 written=.* \(recorded separately; never gates the application\)\n$/);
+  assert.match(cli.stdout, /^platform-inventory: INVENTORIED items=12 written=.* \(recorded separately; never gates the application\)\n$/);
   assert.equal(JSON.parse(readFileSync(join(out, 'platform-inventory.json'), 'utf8')).status, 'INVENTORIED');
 
   // The application gate is the same whatever the platform probes find: with
@@ -563,4 +565,228 @@ test('usage errors exit 2', () => {
   assert.equal(run.stdout, 'license-inventory: ERROR usage\n');
   const platform = spawnSync(process.execPath, [PLATFORM_TOOL, '--status', 'PASS'], { encoding: 'utf8' });
   assert.equal(platform.status, 2);
+});
+
+// --- LI-11: every platform tool the parse sandbox can launch (A-010) ---------------------
+
+/** POSIX special built-ins, plus `[` and `test` (dash built-ins). Every other command word counts as a program. */
+const SHELL_BUILTINS = new Set([':', '.', 'break', 'continue', 'eval', 'exec', 'exit', 'export', 'readonly', 'return', 'set', 'shift', 'times', 'trap', 'unset', '[', 'test']);
+const SHELL_RESERVED = new Set(['!', '{', '}', 'case', 'do', 'done', 'elif', 'else', 'esac', 'fi', 'for', 'if', 'in', 'then', 'until', 'while']);
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/** The commands an `sh -c` script runs: programs called by name, and "$variable" commands. */
+function scriptCommands(script) {
+  const programs = new Set();
+  const variables = new Set();
+  for (const segment of script.replace(/\\\n/g, ' ').split(/\n|;|&&|\|\|?/)) {
+    const words = segment.trim().split(/\s+/).filter(Boolean);
+    while (words.length > 0 && (SHELL_RESERVED.has(words[0]) || ASSIGNMENT.test(words[0]) || words[0] === 'exec')) words.shift();
+    const word = words[0];
+    if (word === undefined) continue;
+    const variable = /^"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"?$/.exec(word);
+    if (variable) variables.add(variable[1]);
+    else if (!SHELL_BUILTINS.has(word)) programs.add(word);
+  }
+  return { programs: [...programs], variables: [...variables] };
+}
+
+/** What the launcher runs for a fixed-path tool: the first candidate that exists (src/pdf/sandbox.ts launcherTools). */
+function expectedFixed(candidates) {
+  const states = candidates.map((path) => (existsSync(path) ? { path, present: true, resolved: realpathSync(path) } : { path, present: false, resolved: null }));
+  return { candidates: states, selected: states.find((state) => state.present)?.path ?? null };
+}
+
+/** What `shell`, started with the launcher's empty environment, runs for `command`. */
+function expectedShellPath(shell, command) {
+  if (!existsSync(shell)) return { selected: null };
+  const found = spawnSync(shell, ['-c', 'command -v "$1" || :', 'li-11', command], { encoding: 'utf8', env: {} }).stdout.trim();
+  return { selected: found.startsWith('/') ? found : null };
+}
+
+/** The single dpkg owner of `path`, or null, looked up independently of the tool under test. */
+function dpkgOwnerOf(path, env = process.env) {
+  const run = spawnSync('dpkg', ['-S', path], { encoding: 'utf8', env });
+  if (run.status !== 0) return null;
+  const owners = run.stdout
+    .split('\n')
+    .filter((line) => line.endsWith(`: ${path}`) && !/^(?:local )?diversion /.test(line))
+    .map((line) => line.slice(0, -(path.length + 2)));
+  return owners.length === 1 && !owners[0].includes(', ') ? owners[0] : null;
+}
+
+/** The License synopsis of the Files: * paragraph of a machine-readable Debian copyright file, or null. */
+function filesStarLicense(text) {
+  if (!text.startsWith('Format:')) return null;
+  for (const paragraph of text.split(/\n[ \t]*\n/)) {
+    const files = /^Files:(.*(?:\n[ \t].*)*)/m.exec(paragraph);
+    if (!files || !files[1].trim().split(/\s+/).includes('*')) continue;
+    return /^License:[ \t]*(\S.*?)[ \t]*$/m.exec(paragraph)?.[1] ?? null;
+  }
+  return null;
+}
+
+/** One sandbox tool's record, checked against the host independently of the tool under test. */
+function assertToolRecord(item, expected, env = process.env) {
+  const { observed, package_record: record } = item;
+  assert.equal(item.status, 'INVENTORIED', `${item.id} status`);
+  if (expected.candidates) assert.deepEqual(observed.candidates, expected.candidates, `${item.id}: every candidate path, with its resolved target`);
+  assert.equal(observed.selected, expected.selected, `${item.id}: the path the launcher runs`);
+  for (const field of ['policy', 'status', 'passed', 'waived']) assert.ok(!(field in record), `${item.id}: the package record evaluates nothing (${field})`);
+  if (expected.selected === null) {
+    assert.equal(observed.present, false, `${item.id} is recorded as absent`);
+    for (const value of [observed.resolved_path, observed.version, record.query, record.package, record.license, record.license_source]) assert.equal(value, null, `${item.id}: nothing is filled in for an absent tool`);
+    assert.match(observed.detail, /^absent/);
+    assert.match(record.detail, /^absent/);
+    return;
+  }
+  assert.equal(observed.present, true);
+  assert.equal(observed.detail, null);
+  assert.equal(observed.resolved_path, realpathSync(expected.selected), `${item.id} is resolved through its symlinks`);
+  const version = spawnSync(expected.selected, ['--version'], { encoding: 'utf8', env, timeout: 30_000 });
+  if (version.status === 0 && version.stdout.trim() !== '') assert.equal(observed.version, version.stdout.trim().split('\n')[0], `${item.id} --version`);
+  else {
+    assert.equal(observed.version, null);
+    assert.match(observed.version_detail, /^--version gave no version: /);
+  }
+  assert.equal(record.query, `dpkg -S ${observed.resolved_path}`, `${item.id}: the package manager is asked about the resolved file`);
+  const owner = dpkgOwnerOf(observed.resolved_path, env);
+  assert.equal(record.package, owner, `${item.id} package, from the package records`);
+  if (owner === null) {
+    assert.equal(record.license, null, `${item.id}: no package record, so no license is filled in`);
+    assert.equal(record.license_source, null);
+    assert.match(record.detail, /^no (?:single )?package record/);
+    return;
+  }
+  const copyright = `/usr/share/doc/${owner.split(':')[0]}/copyright`;
+  if (!existsSync(copyright)) {
+    assert.equal(record.license, null, `${item.id}: no copyright record, so no license is filled in`);
+    assert.equal(record.license_source, null);
+    assert.match(record.detail, /^no license record/);
+    return;
+  }
+  const text = readFileSync(copyright, 'utf8');
+  assert.equal(record.license_source, copyright);
+  assert.equal(record.license, filesStarLicense(text), `${item.id}: the license is the record's own Files: * license`);
+  if (record.license === null) assert.match(record.detail, /^no license record/);
+  else assert.ok(text.includes(`\nLicense: ${record.license}\n`), `${item.id}: ${record.license} appears verbatim in ${copyright}`);
+  for (const other of record.other_licenses) assert.ok(text.includes(`\nLicense: ${other}\n`), `${item.id}: ${other} appears verbatim in ${copyright}`);
+}
+
+test('[LI-11] the platform inventory records every tool the parse sandbox can launch, from package records', async () => {
+  const sandbox = await import('../../src/pdf/sandbox.ts');
+  const { workerCommand } = await import('../../src/pdf/service.ts');
+  const { DEFAULT_PARSER_LIMITS, DEFAULT_SERVICE_LIMITS } = await import('../../src/pdf/limits.ts');
+
+  // The launcher's own tool list. The placeholder tool paths are never run: only the
+  // command lines the launcher builds are read.
+  const placeholder = process.execPath;
+  const utilLinux = sandbox.launcherCommand(
+    { available: true, launcher: 'util-linux', tools: { unshare: placeholder, mount: placeholder, chroot: placeholder, setpriv: placeholder } },
+    [],
+    placeholder,
+    [],
+  );
+  const shellAt = utilLinux.args.indexOf('--') + 1;
+  const shell = utilLinux.args[shellAt];
+  assert.equal(utilLinux.args[shellAt + 1], '-c', 'the util-linux launcher runs a shell script');
+  const setup = scriptCommands(utilLinux.args[shellAt + 2]);
+  assert.ok(setup.variables.length > 0 && setup.variables.every((name) => Object.hasOwn(sandbox.TOOL_PATHS, name)), `the setup script runs fixed launcher tools: ${setup.variables}`);
+  const bwrap = sandbox.launcherCommand({ available: true, launcher: 'bwrap', tools: { bwrap: placeholder } }, [], placeholder, []);
+  assert.equal(bwrap.file, placeholder, 'the bwrap launcher runs bwrap itself, then the worker');
+  assert.equal(workerCommand(DEFAULT_PARSER_LIMITS, DEFAULT_SERVICE_LIMITS).file, shell, 'the service wraps either launcher in the same shell');
+
+  const expected = [
+    ...Object.entries(sandbox.TOOL_PATHS).map(([id, candidates]) => ({ id, lookup: 'fixed', candidates: [...candidates] })),
+    { id: 'sh', lookup: 'fixed', candidates: [shell] },
+    ...setup.programs.map((command) => ({ id: command, lookup: 'shell-path', command })),
+  ];
+  const platform = collectPlatformInventory(REPO_ROOT);
+  const missing = expected.map((tool) => tool.id).filter((id) => !platform.items.some((item) => item.id === id));
+  assert.deepEqual(missing, [], `the platform inventory is missing parse-sandbox tools: ${missing.join(', ')}`);
+  for (const tool of expected) {
+    const item = platform.items.find((entry) => entry.id === tool.id);
+    assert.equal(item.parse_sandbox?.lookup, tool.lookup, `${tool.id} lookup`);
+    if (tool.lookup === 'fixed') {
+      assert.deepEqual(item.parse_sandbox.candidates, tool.candidates, `${tool.id}: the launcher's candidate paths, in its order`);
+      assertToolRecord(item, expectedFixed(tool.candidates));
+    } else {
+      assert.equal(item.parse_sandbox.command, tool.command);
+      assert.equal(item.parse_sandbox.shell, shell, `${tool.id} is looked up by the launcher's shell`);
+      assertToolRecord(item, expectedShellPath(shell, tool.command));
+    }
+  }
+  assert.equal(platform.items.filter((item) => item.parse_sandbox).length, expected.length, 'no other item claims to be a parse-sandbox tool');
+  assert.equal(platform.status, 'INVENTORIED');
+  const unshare = platform.items.find((item) => item.id === 'unshare');
+  assert.match(unshare.recorded_licenses, /GPL-2\.0-or-later/, 'the upstream license statement is kept beside the package record');
+});
+
+test('[LI-11] an absent sandbox tool is recorded as absent, and a tool with no package record gets no license', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'opensig-li11-'));
+  scratch.push(dir);
+  mkdirSync(join(dir, 'bin'));
+  mkdirSync(join(dir, 'real'));
+  writeFileSync(join(dir, 'real', 'unowned-tool'), 'synthetic file: no package owns it, and it is not a program\n');
+  symlinkSync(join(dir, 'real', 'unowned-tool'), join(dir, 'bin', 'unowned-tool'));
+  symlinkSync(process.execPath, join(dir, 'bin', 'linked-runtime'));
+  const synthetic = [
+    { id: 'synthetic-absent', name: 'synthetic absent tool', role: 'LI-11 synthetic', lookup: 'fixed', candidates: [join(dir, 'gone', 'tool'), join(dir, 'bin', 'tool')] },
+    { id: 'synthetic-unowned', name: 'synthetic unowned file', role: 'LI-11 synthetic', lookup: 'fixed', candidates: [join(dir, 'gone', 'unowned-tool'), join(dir, 'bin', 'unowned-tool')] },
+    { id: 'synthetic-linked', name: 'synthetic link to the runtime', role: 'LI-11 synthetic', lookup: 'fixed', candidates: [join(dir, 'bin', 'linked-runtime')] },
+    { id: 'synthetic-command', name: 'synthetic absent command', role: 'LI-11 synthetic', lookup: 'shell-path', command: `opensig-li11-${randomBytes(8).toString('hex')}` },
+  ];
+  const platform = collectPlatformInventory(REPO_ROOT, { sandboxTools: synthetic });
+  const listed = platform.items.filter((item) => item.parse_sandbox);
+  assert.deepEqual(
+    listed.map((item) => item.id),
+    synthetic.map((tool) => tool.id),
+    'every sandbox tool is listed, absent ones included',
+  );
+  const byId = Object.fromEntries(listed.map((item) => [item.id, item]));
+  for (const tool of synthetic) assertToolRecord(byId[tool.id], tool.lookup === 'fixed' ? expectedFixed(tool.candidates) : expectedShellPath('/bin/sh', tool.command));
+
+  const absent = byId['synthetic-absent'];
+  assert.equal(absent.observed.present, false);
+  assert.deepEqual(absent.observed.candidates, synthetic[0].candidates.map((path) => ({ path, present: false, resolved: null })), 'each candidate is recorded as absent');
+  assert.equal(byId['synthetic-command'].observed.present, false, 'a command the shell cannot find is recorded as absent');
+  const unowned = byId['synthetic-unowned'];
+  assert.equal(unowned.observed.selected, join(dir, 'bin', 'unowned-tool'));
+  assert.equal(unowned.observed.resolved_path, realpathSync(join(dir, 'real', 'unowned-tool')), 'the symbolic link is resolved to the real file');
+  assert.equal(unowned.observed.version, null);
+  assert.match(unowned.observed.version_detail, /^--version gave no version: /);
+  assert.equal(unowned.package_record.package, null);
+  assert.equal(unowned.package_record.license, null, 'no package record: no license is invented');
+  assert.match(unowned.package_record.detail, /^no package record/);
+  const linked = byId['synthetic-linked'];
+  assert.equal(linked.observed.resolved_path, realpathSync(process.execPath));
+  assert.equal(linked.observed.version, process.version, 'the --version output is recorded');
+  assert.equal(platform.status, 'INVENTORIED');
+
+  // Without the package manager no package is named and no license is filled in.
+  const noDpkg = collectPlatformInventory(REPO_ROOT, { env: { PATH: '' } });
+  const tools = noDpkg.items.filter((item) => item.parse_sandbox);
+  assert.ok(tools.length > 0);
+  for (const item of tools) {
+    assert.equal(item.package_record.package, null, `${item.id} package`);
+    assert.equal(item.package_record.license, null, `${item.id} license`);
+    assert.match(item.package_record.detail, item.observed.present ? /^no package record: dpkg could not run/ : /^absent/, item.id);
+  }
+
+  // A license is read only from a machine-readable record's Files: * paragraph, never from free text.
+  const { debianCopyrightLicense } = await import('../../scripts/platform-inventory.mjs');
+  const header = 'Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\nUpstream-Name: synthetic\n';
+  const extra = 'Files: lib/extra.c\nCopyright: 2026 Synthetic Authors\nLicense: BSD-3-Clause\n';
+  const main = 'Files: *\nCopyright: 2026 Synthetic Authors\nLicense: GPL-2+\n';
+  const text = 'License: GPL-2+\n Synthetic license text.\n .\n More synthetic text.\n';
+  assert.deepEqual(debianCopyrightLicense([header, extra, main, text].join('\n')), { license: 'GPL-2+', other_licenses: ['BSD-3-Clause'], detail: null });
+  const noDefault = debianCopyrightLicense([header, extra, text].join('\n'));
+  assert.equal(noDefault.license, null);
+  assert.deepEqual(noDefault.other_licenses, ['BSD-3-Clause']);
+  assert.match(noDefault.detail, /Files: \*/);
+  const noLicense = debianCopyrightLicense([header, 'Files: *\nCopyright: 2026 Synthetic Authors\n'].join('\n'));
+  assert.equal(noLicense.license, null);
+  assert.match(noLicense.detail, /License/);
+  const freeText = debianCopyrightLicense('This package was debianized by a synthetic maintainer.\nIt is distributed under the GNU GPL.\n');
+  assert.equal(freeText.license, null, 'no license is read from free text');
+  assert.match(freeText.detail, /machine-readable/);
 });

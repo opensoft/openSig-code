@@ -34,7 +34,7 @@ Authority: spec leg `specs/001-corporate-signing-mvp/plan.md` § Technical Conte
   - 0: the gate passes and `NOTICE` is current.
   - 1: a policy failure or a stale `NOTICE`.
   - 2: a usage error, a read error (an unreadable package file or `dist/` entry, or a `dist` that is not a directory), or an incomplete or inconsistent install (a package locked but not installed, a version drift, an unresolvable dependency, or a missing lockfile).
-- **Verification.** `npm run verify -- license-inventory` runs cases LI-01..LI-10 on synthetic `node_modules` trees, plus the gate on this repository.
+- **Verification.** `npm run verify -- license-inventory` runs cases LI-01..LI-10 on synthetic `node_modules` trees, plus the gate on this repository. It also runs LI-11 (A-010), which checks that the platform inventory records every tool the parse sandbox can launch, with package and license taken only from the package records. The frozen registry requires LI-01..LI-10; LI-11 is not counted there, but a failing LI-11 still fails the mode.
 
 ## Current result (T027: complete package set)
 
@@ -121,4 +121,4 @@ Chosen: **playwright 1.61.1**, with playwright-core 1.61.1. It names `chromium` 
 
 **Superseded task-line note.** The T027 task line says "the cache currently holds `chromium-1243` and `chromium-1234`". That note is superseded by this pin: playwright 1.61.1, chromium-1228 at the effective path. This stands pending a tasks.md amendment that the orchestrator is filing. The note describes `~/.cache/ms-playwright`, which is not the effective path in this environment (`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`), so it is a stale environment note. Matching it would mean pinning 1.62.x (1234) or 1.63.0 (1243). The frozen probe would then look for those revisions under `/ms-playwright` and find them absent.
 
-Platform items (the Node runtime and its bundled components, linked system libraries, the OpenSSL CLI, util-linux `unshare`, the Chromium build and the Hermes image) are outside this gate. Under the owner decision they are inventoried separately with status INVENTORIED, are not held to the MIT/Apache-2.0 allowlist, and never affect the application gate. The release gate stays OPEN on its other open gates.
+Platform items are outside this gate: the Node runtime and its bundled components, linked system libraries, the OpenSSL CLI, the parse-sandbox tools (`bwrap`, `unshare`, `mount`, `chroot`, `setpriv`, `/bin/sh` and `mkdir`), the Chromium build and the Hermes image. Under the owner decision they are inventoried separately with status INVENTORIED, are not held to the MIT/Apache-2.0 allowlist, and never affect the application gate. The release gate stays OPEN on its other open gates.
