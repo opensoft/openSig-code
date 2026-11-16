@@ -12,9 +12,13 @@
 // under its digest by link(2), which is atomic and never replaces an existing
 // entry (Node has no rename(2) with RENAME_NOREPLACE, so this is the
 // no-overwrite form of the rename step). The sha256 directory is fsynced
-// (also when the blob already existed) and the temp name is removed. Newly
-// created directories are fsynced in their parent first. A crash before
-// publication leaves only a .partial file, never a visible blob.
+// (also when the blob already existed) and the temp name is removed. Every
+// directory on the path (tenants, the tenant directory, sha256 and tmp) has
+// its parent fsynced first, whether this write created it or found it (it may
+// be left by a write whose parent fsync failed, or by another process): an
+// instance skips that only for a directory whose parent fsync already
+// succeeded in it, and a failed fsync never counts (A-010, Codex [19]). A
+// crash before publication leaves only a .partial file, never a visible blob.
 //
 // No overwrite: when a blob already exists, a write verifies the existing
 // bytes and returns created=false; a corrupt existing blob is reported, never
@@ -92,6 +96,8 @@ export class FileBlobStore implements BlobStore {
   readonly root: string;
   readonly maxBytes: number;
   readonly #fs: FsOps;
+  /** Directories whose parent fsync succeeded in this instance (their entries are durable). */
+  readonly #durable = new Set<string>();
 
   /** Internal: use openBlobStore(). */
   constructor(root: string, maxBytes: number, fsOps: FsOps) {
@@ -130,16 +136,26 @@ export class FileBlobStore implements BlobStore {
     }
   }
 
-  /** Create a directory (mode 0700) if absent, fsyncing its parent when created. */
+  /**
+   * Make `path` a directory (mode 0700) whose entry is durable in `parent`:
+   * create it if absent, then fsync the parent whether it was created or
+   * found. Skipped only when that fsync already succeeded in this instance;
+   * a failed fsync records nothing, so the next write syncs the parent again
+   * before it can report success.
+   */
   #ensureDirectory(path: string, parent: string): void {
-    if (this.#directoryState(path) === 'directory') return;
-    try {
-      this.#fs.mkdir(path, DIRECTORY_MODE);
-    } catch (error) {
-      if (errorCode(error) !== 'EEXIST') throw error;
+    if (this.#directoryState(path) === 'missing') {
+      try {
+        this.#fs.mkdir(path, DIRECTORY_MODE);
+      } catch (error) {
+        if (errorCode(error) !== 'EEXIST') throw error;
+      }
+      this.#directoryState(path);
+    } else if (this.#durable.has(path)) {
+      return;
     }
-    this.#directoryState(path);
     this.#syncDirectory(parent);
+    this.#durable.add(path);
   }
 
   #ensureTenant(tenantId: string): void {

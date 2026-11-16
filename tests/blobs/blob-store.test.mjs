@@ -6,7 +6,9 @@
 //   BL-03 no overwrite
 //   BL-04 no cross-tenant deduplication
 // plus streaming writes, crash safety, input validation and the write order
-// (temp file, fsync, no-replace publish, directory fsync).
+// (temp file, fsync, no-replace publish, directory fsync);
+//   BL-12 every directory on the write path, created or found, has its
+//         parent fsynced before success; a failed fsync never counts.
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -640,4 +642,82 @@ test('[BL-11] success is reported only once the published entry and every newly 
   const again = store.put(first, syntheticBytes('bl-11-again', 300));
   assertDurable(first, again.digest, 'existing tenant');
   assert.deepEqual(tmpEntries(root, first), []);
+});
+
+test('[BL-12] the parent of every directory on the write path is fsynced, created or found, before success; a failed fsync never counts, so a retry syncs it first (A-010 Codex [19])', () => {
+  const root = scratch();
+  const fds = new Map();
+  const log = [];
+  let failing = 0; // fsyncs of root/tenants still to fail
+  const rel = (path) => (path === root ? '.' : path.slice(root.length + 1));
+  const kind = (path) => (path.endsWith('.partial') ? 'temp' : /\/sha256\/[0-9a-f]{64}$/.test(path) ? 'blob' : rel(path));
+  const seam = {
+    ...nodeFsOps,
+    open(path, flags, mode) {
+      const fd = nodeFsOps.open(path, flags, mode);
+      fds.set(fd, path);
+      return fd;
+    },
+    close(fd) {
+      fds.delete(fd);
+      nodeFsOps.close(fd);
+    },
+    fsync(fd) {
+      const path = fds.get(fd);
+      if (path === join(root, 'tenants') && failing > 0) {
+        failing -= 1;
+        log.push(`fsync-failed:${kind(path)}`);
+        throw Object.assign(new Error('synthetic EIO'), { code: 'EIO' });
+      }
+      nodeFsOps.fsync(fd);
+      log.push(`fsync:${kind(path)}`);
+    },
+    mkdir(path, mode) {
+      nodeFsOps.mkdir(path, mode);
+      log.push(`mkdir:${rel(path)}`);
+    },
+    link(existing, target) {
+      nodeFsOps.link(existing, target);
+      log.push(`link:${kind(target)}`);
+    },
+  };
+  const store = openBlobStore({ root, fsOps: seam });
+  const tenant = tenantId('tenant');
+  const tenantDir = `tenants/${tenant}`;
+  const bytes = syntheticBytes('bl-12', 900);
+  const digest = sha256(bytes);
+
+  // mkdir tenants/<tenant> succeeds, then the fsync of its parent, tenants, fails: the write fails.
+  log.length = 0;
+  failing = 1;
+  assert.throws(() => store.put(tenant, bytes), /synthetic EIO/);
+  assert.deepEqual(log, [`mkdir:${tenantDir}`, 'fsync-failed:tenants']);
+  assert.ok(statSync(join(root, tenantDir)).isDirectory(), 'the tenant directory exists; its entry is not yet durable');
+  assert.equal(store.check(tenant, digest), 'missing');
+
+  // A retry finds the directory and syncs tenants again: while that fsync fails, so does the write.
+  log.length = 0;
+  failing = 1;
+  assert.throws(() => store.put(tenant, bytes), /synthetic EIO/, 'a retry is not accepted while the parent fsync fails');
+  assert.deepEqual(log, ['fsync-failed:tenants']);
+  assert.equal(store.check(tenant, digest), 'missing');
+
+  // It succeeds only once that fsync has succeeded, before the blob is published.
+  log.length = 0;
+  const put = store.put(tenant, bytes);
+  assert.equal(put.created, true);
+  assert.equal(log[0], 'fsync:tenants', 'the found tenant directory has its parent synced first');
+  assert.ok(log.indexOf('fsync:tenants') < log.indexOf('link:blob'));
+  assert.deepEqual(store.read(tenant, digest), Buffer.from(bytes));
+
+  // A new instance finds every directory (left, say, by another process) and
+  // syncs each one's parent before its first success.
+  log.length = 0;
+  const reopened = openBlobStore({ root, fsOps: seam });
+  assert.equal(reopened.put(tenant, syntheticBytes('bl-12-reopened', 300)).created, true);
+  const beforeLink = log.slice(0, log.indexOf('link:blob'));
+  assert.deepEqual(beforeLink.filter((entry) => entry.startsWith('mkdir:')), [], 'every directory was found');
+  for (const parent of ['.', 'tenants', tenantDir]) {
+    assert.ok(beforeLink.includes(`fsync:${parent}`), `the parent ${parent} of a found directory is fsynced before success`);
+  }
 });
