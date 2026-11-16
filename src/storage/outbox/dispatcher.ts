@@ -17,9 +17,9 @@
 // passed, is abandoned in the claim transaction and never delivered again. A
 // late settle of an attempt whose event was abandoned meanwhile never
 // relabels it and never schedules another attempt: attempts_exhausted and
-// retry_horizon_passed stay recorded. A late success after attempts_exhausted
-// is still recorded as the event's acknowledgement (acknowledged_at), so the
-// evidence of delivery is kept (data-model.md, Transitions and races item 4).
+// retry_horizon_passed stay recorded. A late success after either is still
+// recorded as the event's acknowledgement (acknowledged_at), so the evidence
+// of delivery is kept (data-model.md, Transitions and races item 4).
 
 import type { Database } from '../db/connection.ts';
 import { StorageUsageError } from '../db/errors.ts';
@@ -174,10 +174,12 @@ export class OutboxDispatcher {
       if (Number(current['attempts']) !== attempt) return 'retrying';
       // Abandoned while this attempt was in flight (on reclaim, past
       // maxAttempts or the horizon): a late result never resurrects or
-      // relabels it. A late success after attempts_exhausted is recorded as
-      // the acknowledgement; the event stays attempts_exhausted.
+      // relabels it. A late success after attempts_exhausted or
+      // retry_horizon_passed is recorded as the acknowledgement; the event
+      // keeps that abandon state.
       if (current['next_attempt_at'] === null) {
-        if (!result.ok || current['last_error_code'] !== ATTEMPTS_EXHAUSTED) return 'abandoned';
+        const reclaimAbandoned = current['last_error_code'] === ATTEMPTS_EXHAUSTED || current['last_error_code'] === RETRY_HORIZON_PASSED;
+        if (!result.ok || !reclaimAbandoned) return 'abandoned';
         store.update('outbox_events', { event_id: eventId }, { acknowledged_at: new Date(this.#now()).toISOString() });
         return 'delivered';
       }

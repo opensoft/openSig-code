@@ -22,8 +22,9 @@
 //    before the rename;
 // 5. releases the lock on every path, errors included: only when the lock
 //    path is still the file it holds (device and inode) does it unlink it;
-//    otherwise it never unlinks and reports the lock as lost. It then closes
-//    the descriptor. Only a crash leaves a lock behind.
+//    otherwise it never unlinks and reports the lock as lost (lock-lost,
+//    exit 70 in scripts/backup.mjs, which observes onLedgerLockLost). It
+//    then closes the descriptor. Only a crash leaves a lock behind.
 // A stale lock is never broken automatically: breakLedgerLock() needs the
 // lock's nonce, a lock recorded on this host, and a recorded pid that is not
 // alive (the operator's --break-lock <nonce>). A damaged lock (no parsable
@@ -503,6 +504,26 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/** A lock found lost at release: its path was removed or replaced during the session. */
+export interface LockLost {
+  readonly lockPath: string;
+  readonly nonce: string;
+}
+
+const lockLostListeners = new Set<(event: LockLost) => void>();
+
+/**
+ * Observe locks found lost at release (scripts/backup.mjs reports them as
+ * lock-lost, exit 70). Without a listener a lost lock is reported as a
+ * process warning. Returns the function that removes the listener.
+ */
+export function onLedgerLockLost(listener: (event: LockLost) => void): () => void {
+  lockLostListeners.add(listener);
+  return () => {
+    lockLostListeners.delete(listener);
+  };
+}
+
 /** The word --break-lock takes, instead of a nonce, for a damaged lock. */
 export const DAMAGED_LOCK = 'damaged';
 /** A damaged lock younger than this may belong to a writer still creating it. */
@@ -908,8 +929,9 @@ export class LedgerSession {
   /**
    * Release the lock and close its descriptor. 'released': the lock path was
    * still this session's file and was removed. 'lost': the path was gone or
-   * another file, so it was not unlinked; this is reported as a process
-   * warning (OPENSIG_LEDGER_LOCK_LOST). 'failed': removing it failed after
+   * another file, so it was not unlinked; this is reported to the
+   * onLedgerLockLost listeners, or without one as a process warning
+   * (OPENSIG_LEDGER_LOCK_LOST). 'failed': removing it failed after
    * the identity check (the descriptor is still closed; a lock file left
    * behind is reported to the next writer with its nonce).
    */
@@ -922,9 +944,14 @@ export class LedgerSession {
       this.#releaseStatus = 'failed';
     }
     if (this.#releaseStatus === 'lost') {
-      process.emitWarning(`the exported-head ledger lock ${lockPathOf(this.path)} was lost during the session (nonce ${this.#lock.record.nonce}): the lock path was removed or replaced; it was not unlinked`, {
-        code: 'OPENSIG_LEDGER_LOCK_LOST',
-      });
+      const event: LockLost = { lockPath: lockPathOf(this.path), nonce: this.#lock.record.nonce };
+      if (lockLostListeners.size > 0) {
+        for (const listener of lockLostListeners) listener(event);
+      } else {
+        process.emitWarning(`the exported-head ledger lock ${event.lockPath} was lost during the session (nonce ${event.nonce}): the lock path was removed or replaced; it was not unlinked`, {
+          code: 'OPENSIG_LEDGER_LOCK_LOST',
+        });
+      }
     }
     return this.#releaseStatus;
   }

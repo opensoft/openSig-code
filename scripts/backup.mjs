@@ -32,7 +32,12 @@
 //   committed-unsynced             74  a ledger write other than a backup passed the rename but its
 //                                      directory fsync failed; recover with --resync-ledger
 //   committed-pending-publication  75  the ledger is committed, the backup is not yet published
-//   (usage errors exit 2; 74 and 75 mean only their own status)
+//   lock-lost                      70  at release the lock path no longer matched the held lock;
+//                                      overrides the outcome's exit code, and the line still names
+//                                      that outcome (outcome=...) and its recovery; run verify first
+//   usage errors                    2  bad or conflicting arguments, found before any lock is taken
+//   (70, 74, 75 and 2 each mean only their own status; a refusal found during a run, such as a
+//   database appearing at the restore target, is refused, exit 1)
 
 import {
   breakDamagedLock,
@@ -42,6 +47,7 @@ import {
   DAMAGED_LOCK,
   discardStaged,
   LedgerCommitUnsyncedError,
+  onLedgerLockLost,
   PendingPublicationError,
   RestoreRefusedError,
   restoreBackup,
@@ -61,6 +67,7 @@ const USAGE = [
   '     | backup.mjs --break-lock NONCE|damaged --ledger FILE',
 ].join('\n');
 
+const EXIT_LOCK_LOST = 70;
 const EXIT_UNSYNCED = 74;
 const EXIT_PENDING = 75;
 
@@ -136,7 +143,7 @@ async function run({ command, target, values, flags }) {
         ...(Object.hasOwn(values, 'max-blob-bytes') ? { maxBlobBytes: Number(values['max-blob-bytes']) } : {}),
       });
       const blobs = manifest.tenants.reduce((sum, tenant) => sum + tenant.blob_count, 0);
-      return line(`published directory=${values.out} tenants=${manifest.tenants.length} blobs=${blobs} schema=${manifest.schema_version}`);
+      return outcome(`published directory=${values.out} tenants=${manifest.tenants.length} blobs=${blobs} schema=${manifest.schema_version}`);
     }
     case 'verify':
     case 'restore': {
@@ -146,74 +153,92 @@ async function run({ command, target, values, flags }) {
           : restoreBackup({ backupDir: values.from, ledgerPath: values.ledger, databasePath: values.db, blobRoot: values.blobs, firstRestore });
       const blobs = report.tenants.reduce((sum, tenant) => sum + tenant.blobs, 0);
       const events = report.tenants.reduce((sum, tenant) => sum + tenant.events, 0);
-      return line(`${command === 'verify' ? 'verified' : 'restored'} tenants=${report.tenants.length} events=${events} blobs=${blobs} schema=${report.schema_version}`);
+      return outcome(`${command === 'verify' ? 'verified' : 'restored'} tenants=${report.tenants.length} events=${events} blobs=${blobs} schema=${report.schema_version}`);
     }
     case '--complete-staged': {
       const result = completeStaged(target, { ledgerPath: values.ledger });
-      return line(`published directory=${result.directory}`);
+      return outcome(`published directory=${result.directory}`);
     }
     case '--discard-staged': {
       const result = discardStaged(target, {
         ledgerPath: values.ledger,
         ...(Object.hasOwn(values, 'abandon-committed') ? { abandonCommitted: values['abandon-committed'] } : {}),
       });
-      if (result.status === 'discarded') return line(`discarded directory=${result.directory}`);
+      if (result.status === 'discarded') return outcome(`discarded directory=${result.directory}`);
       const consequence =
         result.headsChanged === true
           ? 'the ledger stays as committed, ahead of every published backup; every restore refuses until a backup carrying the committed heads is published'
           : result.headsChanged === false
             ? 'the ledger stays as committed; this backup did not change the ledger heads, so a published backup that carries them stays restorable'
             : 'the ledger stays as committed';
-      return line(`abandoned-committed directory=${result.directory} ledger-digest=${result.ledgerDigest}: the staged backup was deleted; ${consequence}`);
+      return outcome(`abandoned-committed directory=${result.directory} ledger-digest=${result.ledgerDigest}: the staged backup was deleted; ${consequence}`);
     }
     case '--retire-tenant': {
       const retired = retireTenant({ databasePath: values.db, ledgerPath: values.ledger, tenantId: target, clock });
-      return line(`retired tenant=${target} seq=${retired.seq}`);
+      return outcome(`retired tenant=${target} seq=${retired.seq}`);
     }
     case '--resync-ledger': {
       const synced = resyncLedger(target, { ledgerPath: values.ledger });
-      return line(`ledger-synced ledger=${synced.ledgerPath} ledger-digest=${synced.ledgerDigest}`);
+      return outcome(`ledger-synced ledger=${synced.ledgerPath} ledger-digest=${synced.ledgerDigest}`);
     }
     case '--break-lock': {
       if (target === DAMAGED_LOCK) {
         const moved = breakDamagedLock(values.ledger);
-        return line(`damaged-lock-moved path=${moved.movedTo}`);
+        return outcome(`damaged-lock-moved path=${moved.movedTo}`);
       }
       const holder = breakLedgerLock(values.ledger, target);
-      return line(`lock-broken pid=${holder.pid} host=${holder.hostname}`);
+      return outcome(`lock-broken pid=${holder.pid} host=${holder.hostname}`);
     }
     default:
       throw new Error(`unhandled command ${command}`);
   }
 }
 
+/** An outcome: its status line (after "backup: ") and its exit code. */
+function outcome(text, exit = 0) {
+  return { text, exit };
+}
+
+function describeError(error) {
+  if (error instanceof PendingPublicationError) {
+    return outcome(`committed-pending-publication directory=${error.directory} ledger-digest=${error.ledgerDigest} recover="${error.recovery}": ${error.message}`, EXIT_PENDING);
+  }
+  if (error instanceof RestoreRefusedError) return outcome(`refused ${error.reasons.length} reason(s): ${error.reasons.join('; ')}`, 1);
+  if (error instanceof LedgerCommitUnsyncedError) {
+    return outcome(
+      `committed-unsynced ledger=${error.ledgerPath} previous-digest=${error.previousDigest ?? 'none'} ledger-digest=${error.ledgerDigest} recover="${error.recovery}": ${error.message}`,
+      EXIT_UNSYNCED,
+    );
+  }
+  return outcome(`refused ${error?.code ?? 'error'}: ${error?.message ?? String(error)}`, 1);
+}
+
 async function main() {
   const parsed = parse(process.argv.slice(2));
   if (parsed.error !== undefined) return usage(parsed.error);
+  const lost = [];
+  const stopObserving = onLedgerLockLost((event) => lost.push(event));
+  let result;
   try {
-    await run(parsed);
+    result = await run(parsed);
   } catch (error) {
-    if (error instanceof PendingPublicationError) {
-      line(`committed-pending-publication directory=${error.directory} ledger-digest=${error.ledgerDigest} recover="${error.recovery}": ${error.message}`);
-      process.exitCode = EXIT_PENDING;
-      return;
-    }
-    if (error instanceof RestoreRefusedError) {
-      line(`refused ${error.reasons.length} reason(s): ${error.reasons.join('; ')}`);
-      process.exitCode = 1;
-      return;
-    }
-    if (error instanceof LedgerCommitUnsyncedError) {
-      line(
-        `committed-unsynced ledger=${error.ledgerPath} previous-digest=${error.previousDigest ?? 'none'} ledger-digest=${error.ledgerDigest} recover="${error.recovery}": ${error.message}`,
-      );
-      process.exitCode = EXIT_UNSYNCED;
-      return;
-    }
-    if (error?.code === 'storage_usage') return usage(error.message);
-    line(`refused ${error?.code ?? 'error'}: ${error?.message ?? String(error)}`);
-    process.exitCode = 1;
+    if (error?.code === 'storage_usage') result = { usage: error.message };
+    else result = describeError(error);
+  } finally {
+    stopObserving();
   }
+  if (lost.length > 0) {
+    // lock-lost takes precedence over the outcome's own exit code; the line still names that outcome and its recovery.
+    const underlying = result.usage === undefined ? result.text : `usage ${result.usage}`;
+    line(
+      `lock-lost lock=${lost[0].lockPath}: the exported-head ledger lock was removed or replaced during this run, so another writer may have run at the same time; run verify before trusting the outcome; outcome=${underlying}`,
+    );
+    process.exitCode = EXIT_LOCK_LOST;
+    return;
+  }
+  if (result.usage !== undefined) return usage(result.usage);
+  line(result.text);
+  process.exitCode = result.exit;
 }
 
 await main();

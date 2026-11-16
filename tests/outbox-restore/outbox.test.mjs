@@ -7,7 +7,8 @@
 // OR-14 reclaiming an expired claim is held to the same bounds; OR-25 a late
 // settle after an abandon on reclaim never relabels or reschedules the event;
 // OR-36 a late success after attempts_exhausted is recorded as the
-// acknowledgement, and the event stays attempts_exhausted.
+// acknowledgement, and the event stays attempts_exhausted; OR-37 the same
+// after retry_horizon_passed.
 
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
@@ -417,6 +418,55 @@ test('[OR-36] a success that arrives after attempts_exhausted is recorded as the
     assert.deepEqual(row(), acknowledged);
 
     // No further attempt, however late.
+    state.now += 7_200_000;
+    assert.deepEqual(reclaim.due(tenant), []);
+    assert.deepEqual(await reclaim.dispatch(tenant), { delivered: [], retrying: [], abandoned: [] });
+    assert.deepEqual(row(), acknowledged);
+  } finally {
+    db.close();
+  }
+});
+
+test('[OR-37] a success that arrives after retry_horizon_passed is recorded as the acknowledgement; the event keeps retry_horizon_passed and gets no retry', async () => {
+  const { db } = environment(scratch);
+  try {
+    const tenant = sid('tenant');
+    createTenant(db, tenant);
+    const { state, clock } = controllableClock();
+    const store = db.forTenant(tenant);
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    const { eventId } = voidEnvelope(db, tenant, addEnvelope(db, tenant), clock);
+    const row = () => ({ ...store.get('outbox_events', { event_id: eventId }) });
+    const options = { maxAttempts: 50, horizonMs: 120_000 };
+
+    // Two attempts hang; the third claim comes after the horizon and abandons the event.
+    const inFlight = [];
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      const dispatcher = new OutboxDispatcher({ db, clock, ...options, deliver: (attempt) => new Promise((resolve) => inFlight.push({ attempt: attempt.attempt, resolve })) });
+      const pending = dispatcher.dispatch(tenant);
+      await settle();
+      inFlight.at(-1).pending = pending;
+      state.now += 60_001;
+    }
+    assert.deepEqual(inFlight.map((hung) => hung.attempt), [1, 2]);
+    const reclaim = new OutboxDispatcher({ db, clock, ...options, deliver: async () => assert.fail('deliver() after retry_horizon_passed') });
+    assert.deepEqual(await reclaim.dispatch(tenant), { delivered: [], retrying: [], abandoned: [eventId] });
+    const passed = row();
+    assert.deepEqual([passed.attempts, passed.next_attempt_at, passed.acknowledged_at, passed.last_error_code], [2, null, null, RETRY_HORIZON_PASSED]);
+
+    // The last attempt's delivery succeeds late.
+    state.now += 5_000;
+    const lateAt = new Date(state.now).toISOString();
+    inFlight[1].resolve({ ok: true });
+    assert.deepEqual(await inFlight[1].pending, { delivered: [eventId], retrying: [], abandoned: [] });
+    const acknowledged = row();
+    assert.equal(acknowledged.acknowledged_at, lateAt, 'the late success is recorded in the existing acknowledgement field');
+    assert.deepEqual({ ...acknowledged, acknowledged_at: null }, passed, 'the event keeps retry_horizon_passed: attempts, next_attempt_at and last_error_code are unchanged');
+
+    // A late failure of the older attempt changes nothing, and no retry follows.
+    inFlight[0].resolve({ ok: false, errorCode: 'http_503', retryable: true });
+    await inFlight[0].pending;
+    assert.deepEqual(row(), acknowledged);
     state.now += 7_200_000;
     assert.deepEqual(reclaim.due(tenant), []);
     assert.deepEqual(await reclaim.dispatch(tenant), { delivered: [], retrying: [], abandoned: [] });

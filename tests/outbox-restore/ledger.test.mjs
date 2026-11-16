@@ -35,7 +35,14 @@
 // OR-34 --discard-staged identifies the staging by its real path and reports
 //       the path it deleted;
 // OR-35 the lock descriptor is held for the whole session and released on
-//       every path; --break-lock damaged.
+//       every path; --break-lock damaged;
+// OR-38 a lock lost at release reports lock-lost, exit 70, over the
+//       outcome's own exit, still naming that outcome and its recovery;
+// OR-39 a refusal found during a run (a database appearing at the restore
+//       target) is refused, exit 1; exit 2 means usage errors only;
+// OR-41 a real non-dumpable live writer holding a torn, aged lock:
+//       --break-lock damaged refuses, names it as uninspectable and leaves the
+//       lock untouched; Linux only, otherwise skipped (VACUOUS, never a pass).
 // All data is synthetic. The backup module is imported as a namespace so that
 // every test reports its own failure against an older API.
 
@@ -43,8 +50,10 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs, {
+  chmodSync,
   closeSync,
   constants as fsConstants,
+  copyFileSync,
   cpSync,
   existsSync,
   fsyncSync,
@@ -272,7 +281,12 @@ function deadPid() {
 
 /** scripts/backup.mjs with the ledger-directory fsync failing after the ledger rename (fault injected at node:fs in that process). */
 function cliFault(ledgerPath, ...args) {
-  return spawnSync(process.execPath, [CLI_FAULT, 'ledger-dir-fsync', ledgerPath, ...args], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000 });
+  return cliFaults('ledger-dir-fsync', ledgerPath, ...args);
+}
+
+/** scripts/backup.mjs with the named faults of support/cli-fault.mjs injected in that process. */
+function cliFaults(faults, ledgerPath, ...args) {
+  return spawnSync(process.execPath, [CLI_FAULT, faults, ledgerPath, ...args], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000 });
 }
 
 /** io seam: the ledger-directory fsync fails once a rename onto the ledger has returned. */
@@ -2024,6 +2038,240 @@ test('[OR-35] the lock owner holds its descriptor for the whole session and rele
     assert.ok(warnings.some((warning) => warning.code === 'OPENSIG_LEDGER_LOCK_LOST'), 'the lost lock is reported');
     rmSync(lockPath);
   } finally {
+    sys.db.close();
+  }
+});
+
+// ------------------------------------------------------------------- OR-38
+
+test('[OR-38] a lock lost at release reports lock-lost, exit 70, over the outcome\'s own exit code, and the status line still names that outcome and its recovery (T30R3-3)', async () => {
+  const sys = system({ tenants: 2, events: 3 });
+  try {
+    await backup(sys, 'bk1', { firstBackup: true });
+    const lockPath = `${sys.ledgerPath}.lock`;
+    const foreign = "a lock that is not this run's";
+    const lostLine = (run, underlying) => {
+      assert.equal(run.status, 70, `lock-lost exits 70 (${run.stdout}${run.stderr})`);
+      assert.ok(
+        run.stdout.startsWith(
+          `backup: lock-lost lock=${lockPath}: the exported-head ledger lock was removed or replaced during this run, so another writer may have run at the same time; run verify before trusting the outcome; outcome=${underlying}`,
+        ),
+        run.stdout,
+      );
+      assert.equal(readFileSync(lockPath, 'utf8'), foreign, 'the lock path that is not this run\'s is never unlinked');
+      rmSync(lockPath);
+    };
+
+    // A published backup (exit 0 on its own).
+    appendEvents(sys, sys.tenants[0], 1);
+    const final = join(sys.backups, 'bk2');
+    lostLine(cliFaults('lock-swap', sys.ledgerPath, 'create', '--db', sys.path, '--blobs', sys.blobRoot, '--out', final, '--ledger', sys.ledgerPath), `published directory=${final} tenants=2 blobs=0 schema=`);
+    assert.equal(verifyBackup({ backupDir: final, ledgerPath: sys.ledgerPath }).tenants[0].head.seq, 4, 'the outcome itself happened; verify confirms it');
+
+    // A refusal (exit 1 on its own).
+    lostLine(cliFaults('lock-swap', sys.ledgerPath, '--resync-ledger', hex('not-the-ledger'), '--ledger', sys.ledgerPath), 'refused recovery_refused: the ledger digest is ');
+
+    // committed-unsynced (exit 74 on its own): the recovery command is still named.
+    const tenantB = sys.tenants[1];
+    deleteTenant(sys, tenantB);
+    const unsynced = cliFaults('ledger-dir-fsync,lock-swap', sys.ledgerPath, '--retire-tenant', tenantB, '--db', sys.path, '--ledger', sys.ledgerPath);
+    const unsyncedDigest = sha(sys.ledgerPath);
+    lostLine(unsynced, `committed-unsynced ledger=${sys.ledgerPath} previous-digest=`);
+    assert.ok(unsynced.stdout.includes(`recover="--resync-ledger ${unsyncedDigest} --ledger ${sys.ledgerPath}"`), unsynced.stdout);
+    assert.equal(cli('--resync-ledger', unsyncedDigest, '--ledger', sys.ledgerPath).status, 0);
+
+    // committed-pending-publication (exit 75 on its own): the recovery command is still named.
+    appendEvents(sys, sys.tenants[0], 1);
+    const pendingFinal = join(sys.backups, 'bk3');
+    const pending = cliFaults('ledger-dir-fsync,lock-swap', sys.ledgerPath, 'create', '--db', sys.path, '--blobs', sys.blobRoot, '--out', pendingFinal, '--ledger', sys.ledgerPath);
+    lostLine(pending, 'committed-pending-publication directory=');
+    const [staged] = stagingDirs(sys);
+    assert.ok(pending.stdout.includes(`recover="--complete-staged ${join(sys.backups, staged)}"`), pending.stdout);
+    assert.equal(cli('--complete-staged', join(sys.backups, staged), '--ledger', sys.ledgerPath).status, 0);
+
+    // Exit 70 means only lock-lost: the same runs without the fault keep their own status.
+    assert.equal(cli('--resync-ledger', hex('not-the-ledger'), '--ledger', sys.ledgerPath).status, 1);
+    assert.deepEqual(ledgerFiles(sys), [LEDGER_FILE]);
+  } finally {
+    sys.db.close();
+  }
+});
+
+// ------------------------------------------------------------------- OR-39
+
+test('[OR-39] a refusal found during a run is refused (exit 1): a database appearing at the restore target, the target blob root or the backup directory changing; exit 2 means usage errors only (T30R3-5)', async () => {
+  const sys = system({ tenants: 1, events: 3, blobs: true });
+  try {
+    await backup(sys, 'bk1', { firstBackup: true });
+    const bk1 = join(sys.backups, 'bk1');
+
+    // A database appears at the restore target during the run.
+    const raced = target();
+    const run = cliFaults('target-db-appears', sys.ledgerPath, 'restore', '--from', bk1, '--ledger', sys.ledgerPath, '--db', raced.databasePath, '--blobs', raced.blobRoot);
+    assert.equal(run.status, 1, `refused, never a usage error (${run.stdout}${run.stderr})`);
+    assert.equal(run.stdout, 'backup: refused 1 reason(s): the target database path appeared during the restore; restore never overwrites a database\n');
+    assert.equal(run.stderr, '');
+    assert.equal(readFileSync(raced.databasePath, 'utf8'), 'a database another process created during the restore', 'it is never overwritten');
+    assert.equal(existsSync(raced.blobRoot), false);
+
+    // The target blob root, empty when checked, changes before it is prepared.
+    const changed = target();
+    hookFs('openSync', (real, path, ...rest) => {
+      if (String(path).endsWith('.restoring') && !existsSync(changed.blobRoot)) {
+        mkdirSync(changed.blobRoot);
+        writeFileSync(join(changed.blobRoot, 'other.txt'), 'written by another process');
+      }
+      return real.call(fs, path, ...rest);
+    });
+    let blobRace;
+    try {
+      blobRace = await settle(Promise.resolve().then(() => restoreBackup({ backupDir: bk1, ledgerPath: sys.ledgerPath, ...changed })));
+    } finally {
+      unhookFs();
+    }
+    assert.ok(blobRace.error instanceof RestoreRefusedError && /the target blob root changed during the restore/.test(blobRace.error.message), String(blobRace.error));
+    assert.equal(readFileSync(join(changed.blobRoot, 'other.txt'), 'utf8'), 'written by another process', 'nothing this run did not write is removed');
+    assert.equal(existsSync(changed.databasePath), false);
+
+    // The backup directory, empty when checked, changes during the backup.
+    appendEvents(sys, sys.tenants[0], 1);
+    const final = join(sys.backups, 'bk2');
+    hookFs('openSync', (real, path, ...rest) => {
+      if (String(path).endsWith('manifest.staged.json') && !existsSync(final)) {
+        mkdirSync(final);
+        writeFileSync(join(final, 'other.txt'), 'written by another process');
+      }
+      return real.call(fs, path, ...rest);
+    });
+    let dirRace;
+    try {
+      dirRace = await settle(backup(sys, 'bk2'));
+    } finally {
+      unhookFs();
+    }
+    assert.ok(dirRace.error instanceof BackupError && /the backup directory changed during the backup/.test(dirRace.error.message), String(dirRace.error));
+    assert.deepEqual(readdirSync(final), ['other.txt']);
+    assert.deepEqual(stagingDirs(sys), []);
+
+    // Exit 2 means only a usage error: a target that exists before the run.
+    const existing = cli('restore', '--from', bk1, '--ledger', sys.ledgerPath, '--db', raced.databasePath, '--blobs', join(scratch.dir(), 'blobs'));
+    assert.equal(existing.status, 2);
+    assert.match(existing.stderr, /^backup: USAGE the target database path already exists/);
+  } finally {
+    sys.db.close();
+  }
+});
+
+// ------------------------------------------------------------------- OR-41
+
+test('[OR-41] a real non-dumpable live writer (an execute-only copy of the pinned node) holds a torn, aged lock: --break-lock damaged refuses, names it as uninspectable and leaves the lock untouched; the writer then completes and releases (T30R3-4)', async (t) => {
+  // The premise is the kernel's: a process run from a binary it cannot read
+  // is marked non-dumpable, and then a peer of the same user cannot read its
+  // /proc/<pid>/fd. Where that cannot be set up the test skips with the
+  // reason, so the mode is VACUOUS, never a pass. No host setting is touched.
+  if (process.platform !== 'linux') {
+    t.skip(`the non-dumpable writer needs Linux /proc; this platform is ${process.platform}`);
+    return;
+  }
+  if (typeof process.getuid !== 'function' || process.getuid() === 0) {
+    t.skip('running as root, which can read every process\'s /proc/<pid>/fd, so a writer its peers cannot inspect cannot be set up');
+    return;
+  }
+  const sys = system({ tenants: 1, events: 3 });
+  const binDir = scratch.dir('opensig-execute-only-');
+  const writerNode = join(binDir, 'node');
+  const barrier = scratch.dir('opensig-barrier-');
+  let writer;
+  let ended;
+  try {
+    await backup(sys, 'bk1', { firstBackup: true });
+    const lockPath = `${sys.ledgerPath}.lock`;
+    copyFileSync(process.execPath, writerNode);
+    chmodSync(writerNode, 0o111);
+
+    // The writer opens its session and holds it, the lock descriptor open, until <barrier>/go.
+    writer = spawn(writerNode, [CHILD, 'free', 'hold', JSON.stringify({ ledgerPath: sys.ledgerPath, barrier })], { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    writer.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    writer.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const exit = new Promise((resolveExit) => {
+      writer.on('error', (error) => resolveExit({ error }));
+      writer.on('close', (code, signal) => resolveExit({ code, signal }));
+    });
+    exit.then((result) => {
+      ended = result;
+    });
+    for (let i = 0; i < 6000 && ended === undefined && !existsSync(join(barrier, 'ready')); i += 1) await sleep(5);
+    if (ended?.error !== undefined) {
+      t.skip(`the execute-only copy of node cannot be run here (${ended.error.code ?? ended.error.message}), so the non-dumpable writer cannot be set up`);
+      return;
+    }
+    assert.ok(existsSync(join(barrier, 'ready')), `the writer holds its session (${stdout}${stderr})`);
+    const pid = Number(readFileSync(join(barrier, 'ready'), 'utf8'));
+    assert.equal(pid, writer.pid);
+    assert.equal(readLedgerLock(sys.ledgerPath)?.pid, pid, 'the lock is the writer\'s');
+    assert.deepEqual(JSON.parse(readFileSync(join(barrier, 'held.json'), 'utf8')), { pid, ownLockDescriptor: true }, 'the writer itself sees its open descriptor on the lock');
+    assert.equal(statSync(`/proc/${pid}`).uid, process.getuid(), 'the writer is a process of this user');
+
+    // The premise: a peer process of this user cannot read the writer's /proc/<pid>/fd.
+    const peer = spawnSync(process.execPath, ['-e', `try { require('node:fs').readdirSync('/proc/${pid}/fd'); console.log('readable'); } catch (error) { console.log(error.code); }`], { encoding: 'utf8', timeout: 60_000 });
+    if (peer.stdout.trim() === 'readable') {
+      t.skip(`a peer process can read /proc/${pid}/fd of the execute-only writer, so this kernel did not make it non-dumpable; the premise cannot be set up`);
+      return;
+    }
+    assert.equal(peer.stdout.trim(), 'EACCES', `a peer cannot read the live writer's /proc/${pid}/fd (${peer.stdout}${peer.stderr})`);
+
+    // The lock is torn in place (the same inode the writer holds) and aged past 60 s.
+    const held = statSync(lockPath);
+    writeFileSync(lockPath, Buffer.from('{"schema":"opensig.ledger-lock/1","pid":'));
+    const aged = new Date(Date.now() - 120_000);
+    utimesSync(lockPath, aged, aged);
+    const torn = statSync(lockPath);
+    assert.deepEqual([torn.dev, torn.ino], [held.dev, held.ino], 'torn in place');
+    assert.ok(Date.now() - torn.mtimeMs > 60_000, 'older than 60 s');
+    const digest = sha(lockPath);
+    const untouched = (what) => {
+      const now = statSync(lockPath);
+      assert.deepEqual([now.dev, now.ino, sha(lockPath)], [held.dev, held.ino, digest], `${what}: the lock is untouched (same device, inode and digest)`);
+      assert.deepEqual(readdirSync(dirname(lockPath)).filter((name) => name.includes('.damaged-')), [], `${what}: nothing was moved aside`);
+    };
+
+    // The command line inspects every process of this user. It refuses and
+    // names the writer among the uninspectable (other non-dumpable processes
+    // of this user, such as ssh-agent, may be named too).
+    const refused = cli('--break-lock', 'damaged', '--ledger', sys.ledgerPath);
+    assert.equal(refused.status, 1, `refused (${refused.stdout}${refused.stderr})`);
+    const named = /^backup: refused ledger_invalid: process\(es\) ([0-9, ]+) of this user cannot be inspected, so it cannot be shown that none holds the damaged lock; the lock was not moved\n$/.exec(refused.stdout);
+    assert.ok(named, refused.stdout);
+    assert.ok(named[1].split(', ').map(Number).includes(pid), `the writer, pid ${pid}, is named as uninspectable: ${refused.stdout}`);
+    untouched('the command line');
+
+    // The library, with the writer as the only candidate process.
+    assert.throws(
+      () => breakDamagedLock(sys.ledgerPath, { pids: () => [pid] }),
+      (error) => error instanceof LedgerError && error.message === `process(es) ${pid} of this user cannot be inspected, so it cannot be shown that none holds the damaged lock; the lock was not moved`,
+    );
+    untouched('the library');
+
+    // The writer completes: it releases its lock (the path is still its file), never reporting it lost.
+    writeFileSync(join(barrier, 'go'), '');
+    assert.deepEqual(await exit, { code: 0, signal: null }, stdout + stderr);
+    assert.equal(stdout, '{"ok":true}\n');
+    assert.doesNotMatch(stderr, /OPENSIG_LEDGER_LOCK_LOST|lost/);
+    assert.equal(existsSync(lockPath), false, 'the writer released the lock');
+    LedgerSession.open(sys.ledgerPath).release();
+  } finally {
+    if (writer !== undefined && ended === undefined) {
+      writeFileSync(join(barrier, 'go'), '');
+      for (let i = 0; i < 2000 && ended === undefined; i += 1) await sleep(5);
+      if (ended === undefined) writer.kill('SIGKILL');
+    }
+    rmSync(binDir, { recursive: true, force: true });
     sys.db.close();
   }
 });

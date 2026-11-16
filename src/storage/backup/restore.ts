@@ -282,10 +282,18 @@ export function restoreBackup(options: RestoreOptions): RestoreReport {
     const staging = join(dirname(databasePath), `.${randomBytes(12).toString('hex')}.restoring`);
     const { db, inspection } = stageAndInspect(backupDir, ledger, staging, MANIFEST_FILE);
     let createdRoot = false;
+    let preparedRoot = false;
     let placed = false;
     let unsynced: { readonly previousDigest: string | null; readonly digest: string; readonly cause: unknown } | undefined;
     try {
-      createdRoot = prepareEmptyDirectory(blobRoot);
+      try {
+        createdRoot = prepareEmptyDirectory(blobRoot);
+        preparedRoot = true;
+      } catch (error) {
+        // Checked empty before the run: a change now is a refusal found during the run, not a usage error.
+        if (error instanceof StorageUsageError) throw new RestoreRefusedError([`the target blob root changed during the restore: ${error.message}`]);
+        throw error;
+      }
       const target = openBlobStore({ root: blobRoot, maxBytes: inspection.blobLimit });
       for (const tenant of inspection.report.tenants) {
         for (const digest of inspection.blobs.list(tenant.tenant_id)) {
@@ -319,7 +327,8 @@ export function restoreBackup(options: RestoreOptions): RestoreReport {
         linkSync(staging, databasePath);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-          throw new StorageUsageError('the target database path appeared during the restore; restore never overwrites a database', { cause: error });
+          // A refusal found during the run (refused, exit 1), not a usage error.
+          throw new RestoreRefusedError(['the target database path appeared during the restore; restore never overwrites a database']);
         }
         throw error;
       }
@@ -340,8 +349,10 @@ export function restoreBackup(options: RestoreOptions): RestoreReport {
       // Only the database file this run placed; never journal files at the
       // target name, which this run did not create.
       if (placed) removeQuietly(databasePath);
+      // Only what this run wrote: the root it created, or the entries of the
+      // empty root it prepared; never a root that changed before that.
       if (createdRoot) removeQuietly(blobRoot);
-      else if (lstatSync(blobRoot, { throwIfNoEntry: false }) !== undefined) for (const name of readdirSync(blobRoot)) removeQuietly(join(blobRoot, name));
+      else if (preparedRoot && lstatSync(blobRoot, { throwIfNoEntry: false }) !== undefined) for (const name of readdirSync(blobRoot)) removeQuietly(join(blobRoot, name));
       throw error;
     }
     if (unsynced !== undefined) {

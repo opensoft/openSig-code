@@ -319,7 +319,13 @@ export async function createBackup(options: CreateBackupOptions): Promise<Backup
       };
       writePrivateFile(join(staging, STAGED_MANIFEST_FILE), canonicalBytes(manifest as unknown as JsonValue));
       syncDirectory(staging);
-      checkFinalDirectory(final);
+      try {
+        checkFinalDirectory(final);
+      } catch (error) {
+        // Checked before the run: a change now is a refusal found during the run, not a usage error.
+        if (error instanceof StorageUsageError) throw new BackupError(`the backup directory changed during the backup: ${error.message}`, { cause: error });
+        throw error;
+      }
 
       // The commit point: one atomic replace of the ledger.
       const result = session.commit(next, { publishing: { staging, final }, io: options.io });
