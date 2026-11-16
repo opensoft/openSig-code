@@ -12,7 +12,9 @@
 //   crash-committed  SIGKILL right after the rename onto the ledger returns
 //                    (after the commit point)
 // op: record (recordExportedHead) | backup (createBackup) | loop (record seq
-// 1..n of a synthetic chain, retrying while the ledger is locked).
+// 1..n of a synthetic chain, retrying while the ledger is locked) | hold (open
+// a LedgerSession, write <barrier>/ready, keep the lock until <barrier>/go,
+// then release; a live lock holder for the damaged-lock tests).
 // Faults are injected through node:fs (node:test mock), the same in any
 // version of the code. Prints one JSON line. All data is synthetic.
 
@@ -21,7 +23,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { dirname, join } from 'node:path';
 import { mock } from 'node:test';
 
-import { createBackup, readLedger, recordExportedHead } from '../../../src/storage/backup/index.ts';
+import { createBackup, LedgerSession, readLedger, recordExportedHead } from '../../../src/storage/backup/index.ts';
 
 const [mode, op, configJson] = process.argv.slice(2);
 const cfg = JSON.parse(configJson);
@@ -106,6 +108,16 @@ if (op === 'record') {
     }
   }
   process.stdout.write(`${JSON.stringify({ ok: true, lost, retries })}\n`);
+} else if (op === 'hold') {
+  const session = LedgerSession.open(cfg.ledgerPath);
+  fs.writeFileSync(join(cfg.barrier, 'ready'), String(process.pid));
+  const deadline = Date.now() + 60_000;
+  while (!fs.existsSync(join(cfg.barrier, 'go'))) {
+    if (Date.now() > deadline) break;
+    sleep(5);
+  }
+  session.release();
+  process.stdout.write(`${JSON.stringify({ ok: true })}\n`);
 } else {
   throw new Error(`unknown op ${op}`);
 }

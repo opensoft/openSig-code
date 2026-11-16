@@ -10,7 +10,9 @@
 //   node scripts/backup.mjs --complete-staged DIR --ledger FILE
 //   node scripts/backup.mjs --discard-staged DIR --ledger FILE [--abandon-committed LEDGER_DIGEST]
 //   node scripts/backup.mjs --retire-tenant TENANT_ID --db FILE --ledger FILE
+//   node scripts/backup.mjs --resync-ledger LEDGER_DIGEST --ledger FILE
 //   node scripts/backup.mjs --break-lock NONCE --ledger FILE
+//   node scripts/backup.mjs --break-lock damaged --ledger FILE
 //
 // All paths must be absolute. The ledger is the exported-head ledger beside
 // the backups, on the local filesystem of the single service host. A missing
@@ -22,21 +24,28 @@
 //
 // Status and exit code:
 //   published                       0  backup or --complete-staged published (parent fsynced)
-//   discarded                       0  uncommitted staging deleted
-//   abandoned-committed             0  pending committed staging deleted; the ledger stays ahead
-//   verified / restored / retired / lock-broken   0
+//   discarded                       0  uncommitted staging deleted (the path deleted is reported)
+//   abandoned-committed             0  pending committed staging deleted; the ledger stays as committed
+//   ledger-synced                   0  --resync-ledger re-committed the current ledger bytes
+//   verified / restored / retired / lock-broken / damaged-lock-moved   0
 //   refused                         1  pre-commit refusal or failure, or a refused recovery
+//   committed-unsynced             74  a ledger write other than a backup passed the rename but its
+//                                      directory fsync failed; recover with --resync-ledger
 //   committed-pending-publication  75  the ledger is committed, the backup is not yet published
-//   (usage errors exit 2)
+//   (usage errors exit 2; 74 and 75 mean only their own status)
 
 import {
+  breakDamagedLock,
   breakLedgerLock,
   completeStaged,
   createBackup,
+  DAMAGED_LOCK,
   discardStaged,
+  LedgerCommitUnsyncedError,
   PendingPublicationError,
   RestoreRefusedError,
   restoreBackup,
+  resyncLedger,
   retireTenant,
   verifyBackup,
 } from '../src/storage/backup/index.ts';
@@ -48,9 +57,11 @@ const USAGE = [
   '     | backup.mjs --complete-staged DIR --ledger FILE',
   '     | backup.mjs --discard-staged DIR --ledger FILE [--abandon-committed LEDGER_DIGEST]',
   '     | backup.mjs --retire-tenant TENANT_ID --db FILE --ledger FILE',
-  '     | backup.mjs --break-lock NONCE --ledger FILE',
+  '     | backup.mjs --resync-ledger LEDGER_DIGEST --ledger FILE',
+  '     | backup.mjs --break-lock NONCE|damaged --ledger FILE',
 ].join('\n');
 
+const EXIT_UNSYNCED = 74;
 const EXIT_PENDING = 75;
 
 const COMMANDS = {
@@ -60,6 +71,7 @@ const COMMANDS = {
   '--complete-staged': { values: ['ledger'], optional: [], flags: [] },
   '--discard-staged': { values: ['ledger'], optional: ['abandon-committed'], flags: [] },
   '--retire-tenant': { values: ['db', 'ledger'], optional: [], flags: [] },
+  '--resync-ledger': { values: ['ledger'], optional: [], flags: [] },
   '--break-lock': { values: ['ledger'], optional: [], flags: [] },
 };
 
@@ -145,13 +157,28 @@ async function run({ command, target, values, flags }) {
         ledgerPath: values.ledger,
         ...(Object.hasOwn(values, 'abandon-committed') ? { abandonCommitted: values['abandon-committed'] } : {}),
       });
-      return line(`${result.status} directory=${result.directory}`);
+      if (result.status === 'discarded') return line(`discarded directory=${result.directory}`);
+      const consequence =
+        result.headsChanged === true
+          ? 'the ledger stays as committed, ahead of every published backup; every restore refuses until a backup carrying the committed heads is published'
+          : result.headsChanged === false
+            ? 'the ledger stays as committed; this backup did not change the ledger heads, so a published backup that carries them stays restorable'
+            : 'the ledger stays as committed';
+      return line(`abandoned-committed directory=${result.directory} ledger-digest=${result.ledgerDigest}: the staged backup was deleted; ${consequence}`);
     }
     case '--retire-tenant': {
       const retired = retireTenant({ databasePath: values.db, ledgerPath: values.ledger, tenantId: target, clock });
       return line(`retired tenant=${target} seq=${retired.seq}`);
     }
+    case '--resync-ledger': {
+      const synced = resyncLedger(target, { ledgerPath: values.ledger });
+      return line(`ledger-synced ledger=${synced.ledgerPath} ledger-digest=${synced.ledgerDigest}`);
+    }
     case '--break-lock': {
+      if (target === DAMAGED_LOCK) {
+        const moved = breakDamagedLock(values.ledger);
+        return line(`damaged-lock-moved path=${moved.movedTo}`);
+      }
       const holder = breakLedgerLock(values.ledger, target);
       return line(`lock-broken pid=${holder.pid} host=${holder.hostname}`);
     }
@@ -176,12 +203,14 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    if (error?.code === 'storage_usage') return usage(error.message);
-    if (error?.code === 'ledger_commit_unsynced') {
-      line(`failed ledger_commit_unsynced: ${error.message}`);
-      process.exitCode = 1;
+    if (error instanceof LedgerCommitUnsyncedError) {
+      line(
+        `committed-unsynced ledger=${error.ledgerPath} previous-digest=${error.previousDigest ?? 'none'} ledger-digest=${error.ledgerDigest} recover="${error.recovery}": ${error.message}`,
+      );
+      process.exitCode = EXIT_UNSYNCED;
       return;
     }
+    if (error?.code === 'storage_usage') return usage(error.message);
     line(`refused ${error?.code ?? 'error'}: ${error?.message ?? String(error)}`);
     process.exitCode = 1;
   }

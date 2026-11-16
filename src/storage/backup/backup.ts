@@ -8,7 +8,9 @@
 //
 // Order of a backup:
 // 1. Write it into a staging directory, `.staging-<random>-<final name>`,
-//    beside the final directory.
+//    beside the final directory, with its manifest as manifest.staged.json:
+//    staging is recognised by that staged manifest, so a copy of or a link
+//    to an uncommitted staging is never a backup that verifies.
 // 2. Verify it: every tenant's chain verifies and contains the head recorded
 //    in the exported-head ledger; a ledger tenant missing from the database,
 //    or a retired tenant that reappears, refuses; every blob a row still
@@ -16,15 +18,19 @@
 // 3. Under the ledger lock, taken before the snapshot is closed: re-read the
 //    ledger and re-check every tenant against it, then commit every tenant's
 //    new head in ONE atomic replace. The ledger rename is the commit point.
-// 4. Still under the lock, publish: rename staging to the final name, fsync
-//    the parent directory, and clear the publication record.
+// 4. Still under the lock, publish: rename staging to the final name, rename
+//    manifest.staged.json to manifest.json inside it (the final manifest
+//    exists only under the final name, and only after the commit point),
+//    fsync the backup directory and the parent, and clear the publication
+//    record.
 // Any refusal or failure before the commit point leaves the ledger
 // byte-identical and removes this run's staging (BackupError, LedgerError,
 // LedgerLockedError: status refused). After it, the staged backup is
 // preserved under exactly one name and PendingPublicationError is raised
 // (status committed-pending-publication): a failed ledger-directory fsync
-// (then nothing is published), a failed staging rename, or a failed parent
-// fsync. While a pending committed staging exists, a backup changes nothing.
+// (then nothing is published), a failed staging rename, a failed rename of
+// the final manifest, or a failed parent fsync. While a pending committed
+// staging exists, a backup changes nothing.
 //
 // Blob size limit (Codex [17]): the backup opens the source and target blob
 // stores with the source store's configured limit (maxBlobBytes, CLI
@@ -66,6 +72,8 @@ export const BACKUP_SCHEMA = 'opensig.backup/1';
 export const DATABASE_FILE = 'opensig.db';
 export const BLOBS_DIRECTORY = 'blobs';
 export const MANIFEST_FILE = 'manifest.json';
+/** The manifest of a staged (not yet published) backup. */
+export const STAGED_MANIFEST_FILE = 'manifest.staged.json';
 const STAGING = /^\.staging-([0-9a-f]{24})-(.+)$/;
 
 export interface BackupTenant {
@@ -123,6 +131,11 @@ export function checkBlobLimit(value: unknown, name = 'blob size limit'): number
 /** True for a staging directory name (`.staging-<random>-<final name>`). */
 export function isStagingDirectory(path: string): boolean {
   return STAGING.test(basename(path));
+}
+
+/** True when the directory holds a staged manifest: staging under any name (a copy or a link included). */
+export function hasStagedManifest(dir: string): boolean {
+  return lstatSync(join(dir, STAGED_MANIFEST_FILE), { throwIfNoEntry: false }) !== undefined;
 }
 
 /** The final directory a staging directory publishes to. */
@@ -304,7 +317,7 @@ export async function createBackup(options: CreateBackupOptions): Promise<Backup
         database: { file: DATABASE_FILE, sha256: database.sha256, bytes: database.bytes },
         tenants,
       };
-      writePrivateFile(join(staging, MANIFEST_FILE), canonicalBytes(manifest as unknown as JsonValue));
+      writePrivateFile(join(staging, STAGED_MANIFEST_FILE), canonicalBytes(manifest as unknown as JsonValue));
       syncDirectory(staging);
       checkFinalDirectory(final);
 
@@ -319,6 +332,12 @@ export async function createBackup(options: CreateBackupOptions): Promise<Backup
         io.rename(staging, final);
       } catch (cause) {
         throw new PendingPublicationError(staging, result.digest, 'renaming the staging directory to its final name failed', { cause });
+      }
+      try {
+        io.rename(join(final, STAGED_MANIFEST_FILE), join(final, MANIFEST_FILE));
+        io.syncDirectory(final);
+      } catch (cause) {
+        throw new PendingPublicationError(final, result.digest, 'publishing the final manifest failed after the rename', { cause });
       }
       try {
         io.syncDirectory(dirname(final));

@@ -22,7 +22,20 @@
 // OR-26 an injected post-commit I/O failure (ledger-directory fsync, staging
 //       rename, parent fsync) through the internal io seam keeps the staged
 //       backup and reports exit 75;
-// OR-27 the blob size limit is carried through backup, verify and restore.
+// OR-27 the blob size limit is carried through backup, verify and restore;
+// OR-28 a non-backup ledger writer whose directory fsync fails after the
+//       rename reports committed-unsynced (exit 74); --resync-ledger;
+// OR-29 a surviving intent record keeps a no-head-change staging pending,
+//       and the abandon message is truthful;
+// OR-30 a first restore removes only the database files it created, and
+//       nothing after the commit point;
+// OR-31 --discard-staged never deletes a backup under its final name;
+// OR-32 staging is recognised by its staged manifest (copies and links);
+// OR-33 the digest CAS sits immediately before the rename;
+// OR-34 --discard-staged identifies the staging by its real path and reports
+//       the path it deleted;
+// OR-35 the lock descriptor is held for the whole session and released on
+//       every path; --break-lock damaged.
 // All data is synthetic. The backup module is imported as a namespace so that
 // every test reports its own failure against an older API.
 
@@ -39,15 +52,18 @@ import fs, {
   openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
+  utimesSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { hostname } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { after, mock, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -55,6 +71,7 @@ import { canonicalize } from '../../src/domain/canonical/index.ts';
 import { verifyChain } from '../../src/storage/audit/index.ts';
 import * as backupApi from '../../src/storage/backup/index.ts';
 import * as blobsApi from '../../src/storage/blobs/index.ts';
+import { openDatabase } from '../../src/storage/db/index.ts';
 import * as retentionApi from '../../src/storage/retention/index.ts';
 import { makeScratch } from '../storage/support/fixtures.mjs';
 import {
@@ -75,12 +92,15 @@ import {
 const { BackupError, createBackup, LedgerError, readLedger, recordExportedHead, requiredBlobRefs, restoreBackup, RestoreRefusedError, verifyBackup } = backupApi;
 // A-009 additions.
 const { breakLedgerLock, completeStaged, discardStaged, LedgerSession, pendingPublication, PendingPublicationError, readLedgerLock } = backupApi;
+// A-010 additions.
+const { breakDamagedLock, LedgerCommitUnsyncedError, resyncLedger, withLedgerSession } = backupApi;
 const { BlobDisposer, RetentionService } = retentionApi;
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..');
 const SCRIPT = join(REPO_ROOT, 'scripts', 'backup.mjs');
 const CHILD = join(HERE, 'support', 'ledger-child.mjs');
+const CLI_FAULT = join(HERE, 'support', 'cli-fault.mjs');
 const LEDGER_FILE = 'exported-heads.json';
 const LOCK_SCHEMA = 'opensig.ledger-lock/1';
 const scratch = makeScratch();
@@ -250,6 +270,44 @@ function deadPid() {
   return run.pid;
 }
 
+/** scripts/backup.mjs with the ledger-directory fsync failing after the ledger rename (fault injected at node:fs in that process). */
+function cliFault(ledgerPath, ...args) {
+  return spawnSync(process.execPath, [CLI_FAULT, 'ledger-dir-fsync', ledgerPath, ...args], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000 });
+}
+
+/** io seam: the ledger-directory fsync fails once a rename onto the ledger has returned. */
+function failDirFsync(ledgerPath) {
+  let renamed = false;
+  return {
+    rename(from, to) {
+      renameSync(from, to);
+      if (to === ledgerPath) renamed = true;
+    },
+    syncDirectory(path) {
+      if (renamed && path === dirname(ledgerPath)) throw ioError('EIO', path);
+      fsyncDirectory(path);
+    },
+  };
+}
+
+/** This user's processes in /proc: those whose open files can be inspected, and those that cannot (non-dumpable). */
+function userProcesses() {
+  const inspectable = [];
+  const uninspectable = [];
+  for (const name of readdirSync('/proc')) {
+    if (!/^[0-9]+$/.test(name)) continue;
+    try {
+      if (statSync(`/proc/${name}`).uid !== process.getuid()) continue;
+      readdirSync(`/proc/${name}/fd`);
+      inspectable.push(Number(name));
+    } catch (error) {
+      if (error.code !== 'ENOENT') uninspectable.push(Number(name));
+    }
+  }
+  return { inspectable, uninspectable };
+}
+
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const isPending = (error) => error?.code === 'committed_pending_publication';
 const claimsUnchanged = (message) => /byte-identical|unchanged|nothing was (written|recorded|changed)/.test(message);
 
@@ -366,10 +424,10 @@ test('[OR-16] a crash after the ledger rename keeps the staged backup and the lo
     const staged = stagingDirs(sys);
     assert.equal(staged.length, 1, 'the staged backup is preserved under exactly one name');
     const staging = join(sys.backups, staged[0]);
-    assert.deepEqual(readdirSync(staging).sort(), ['blobs', 'manifest.json', 'opensig.db']);
+    assert.deepEqual(readdirSync(staging).sort(), ['blobs', 'manifest.staged.json', 'opensig.db'], 'staging holds only the staged manifest');
     assert.notEqual(sha(sys.ledgerPath), before, 'the ledger is committed (post-commit)');
     assert.deepEqual(seqs(sys), [5, 7], 'every tenant is ahead, in the one replace');
-    const manifest = JSON.parse(readFileSync(join(staging, 'manifest.json'), 'utf8'));
+    const manifest = JSON.parse(readFileSync(join(staging, 'manifest.staged.json'), 'utf8'));
     assert.deepEqual(manifest.tenants.map((tenant) => tenant.audit_head.seq), [5, 7]);
     const lock = readLedgerLock(sys.ledgerPath);
     assert.equal(lock.pid, crash.pid, 'the lock stays held by the dead writer');
@@ -435,9 +493,10 @@ test('[OR-17] --discard-staged deletes only uncommitted staging; the pending com
     // An uncommitted staging (a published backup already carries its heads) is discarded.
     const copy = stagingName('bk1-copy');
     cpSync(bk1, copy, { recursive: true });
+    const copyReal = realpathSync(copy);
     const discarded = cli('--discard-staged', copy, '--ledger', sys.ledgerPath);
     assert.equal(discarded.status, 0, discarded.stdout + discarded.stderr);
-    assert.equal(discarded.stdout, `backup: discarded directory=${copy}\n`);
+    assert.equal(discarded.stdout, `backup: discarded directory=${copyReal}\n`);
     assert.equal(existsSync(copy), false);
     // Verify and restore refuse a staging directory, whatever it holds.
     cpSync(bk1, copy, { recursive: true });
@@ -469,7 +528,7 @@ test('[OR-17] --discard-staged deletes only uncommitted staging; the pending com
     await assert.rejects(backup(sys, 'bk2'), (error) => error.code === 'ledger_locked');
     assert.deepEqual(stagingDirs(sys), [crashed]);
     assert.equal(breakLedgerLock(sys.ledgerPath, lock.nonce).pid, crash.pid);
-    assert.deepEqual(discardStaged(join(sys.backups, crashed), { ledgerPath: sys.ledgerPath }), { status: 'discarded', directory: join(sys.backups, crashed) });
+    assert.deepEqual(discardStaged(join(sys.backups, crashed), { ledgerPath: sys.ledgerPath }), { status: 'discarded', directory: realpathSync(sys.backups) + sep + crashed });
     assert.deepEqual(stagingDirs(sys), []);
     assert.deepEqual(ledgerFiles(sys), [LEDGER_FILE], 'the stale publication record was removed under the lock');
 
@@ -531,9 +590,13 @@ test('[OR-17] --discard-staged deletes only uncommitted staging; the pending com
     assert.deepEqual(state(sys), frozen);
 
     // Abandon with the matching digest: the staging is deleted, the ledger stays ahead.
+    const pendingReal = realpathSync(pending);
     const abandoned = cli('--discard-staged', pending, '--ledger', sys.ledgerPath, '--abandon-committed', digest);
     assert.equal(abandoned.status, 0, abandoned.stdout + abandoned.stderr);
-    assert.equal(abandoned.stdout, `backup: abandoned-committed directory=${pending}\n`);
+    assert.equal(
+      abandoned.stdout,
+      `backup: abandoned-committed directory=${pendingReal} ledger-digest=${digest}: the staged backup was deleted; the ledger stays as committed, ahead of every published backup; every restore refuses until a backup carrying the committed heads is published\n`,
+    );
     assert.equal(existsSync(pending), false);
     assert.equal(sha(sys.ledgerPath), digest, 'the ledger stays as committed');
     assert.deepEqual(ledgerFiles(sys), [LEDGER_FILE]);
@@ -564,19 +627,6 @@ test('[OR-17] --discard-staged deletes only uncommitted staging; the pending com
     assert.deepEqual(ledgerFiles(sys), [LEDGER_FILE]);
     assert.deepEqual(verifyBackup({ backupDir: final3, ledgerPath: sys.ledgerPath }).tenants.map((tenant) => tenant.head.seq), [6, 6]);
 
-    // Abandoned by its staging name while it lives under the final name: it is deleted wherever it is.
-    appendEvents(sys, sys.tenants[0], 1);
-    const final4 = join(sys.backups, 'bk4');
-    renamed = false;
-    const failParent4 = { ...failParent, rename(from, to) { renamed ||= to === final4; renameSync(from, to); } };
-    const kept4 = await settle(backup(sys, 'bk4', { io: failParent4 }));
-    assert.equal(kept4.error.directory, final4);
-    const record = pendingPublication(sys.ledgerPath);
-    assert.notEqual(record.staging, final4);
-    assert.equal(discardStaged(record.staging, { ledgerPath: sys.ledgerPath, abandonCommitted: sha(sys.ledgerPath) }).status, 'abandoned-committed');
-    assert.equal(existsSync(final4), false, 'the abandoned backup is gone under either name');
-    assert.deepEqual(ledgerFiles(sys), [LEDGER_FILE]);
-    assert.deepEqual(seqs(sys), [7, 6], 'the ledger stays as committed');
   } finally {
     sys.db.close();
   }
@@ -1076,11 +1126,34 @@ test('[OR-24] --first-restore writes the restored heads under the lock, all or n
 
 // ------------------------------------------------------------------- OR-26
 
-test('[OR-26] an injected post-commit I/O failure (ledger-directory fsync, staging rename, parent fsync) keeps the staged backup and reports exit 75; nothing changes until it is completed', async () => {
+test('[OR-26] an injected post-commit I/O failure (ledger-directory fsync, staging rename, final manifest, parent fsync) keeps the staged backup and reports exit 75; nothing changes until --complete-staged, which re-commits the ledger by a fresh replace', async () => {
   const sys = system({ tenants: 2, events: 3 });
   try {
     await backup(sys, 'bk1', { firstBackup: true });
     const bk1 = join(sys.backups, 'bk1');
+
+    // --complete-staged re-commits the ledger by a fresh atomic replace (a
+    // new file renamed over it), never a bare re-fsync of its directory.
+    appendEvents(sys, sys.tenants[1], 1);
+    const recommitFinal = join(sys.backups, 'bk-recommit');
+    const unpublished = await settle(
+      backup(sys, 'bk-recommit', {
+        io: {
+          rename(from, to) {
+            if (to === recommitFinal) throw ioError('EXDEV', to);
+            renameSync(from, to);
+          },
+        },
+      }),
+    );
+    assert.equal(isPending(unpublished.error), true);
+    const committedBytes = sha(sys.ledgerPath);
+    const committedInode = statSync(sys.ledgerPath).ino;
+    const recommitted = cli('--complete-staged', unpublished.error.directory, '--ledger', sys.ledgerPath);
+    assert.equal(recommitted.status, 0, recommitted.stdout + recommitted.stderr);
+    assert.equal(sha(sys.ledgerPath), committedBytes, 'the same ledger bytes');
+    assert.notEqual(statSync(sys.ledgerPath).ino, committedInode, '--complete-staged replaced the ledger file by a fresh atomic replace, not only re-fsynced its directory');
+    assert.deepEqual(readdirSync(recommitFinal).sort(), ['blobs', 'manifest.json', 'opensig.db']);
 
     // The ledger-directory fsync after the rename fails, injected at node:fs
     // (the same fault on any version of the code).
@@ -1105,9 +1178,9 @@ test('[OR-26] an injected post-commit I/O failure (ledger-directory fsync, stagi
     assert.equal(claimsUnchanged(unsynced.error.message), false, 'no message says the ledger is unchanged');
     assert.equal(existsSync(join(sys.backups, 'bk2')), false, 'after a failed ledger-directory fsync nothing is published');
     assert.deepEqual(stagingDirs(sys).map((name) => join(sys.backups, name)), [unsynced.error.directory], 'the staged backup is preserved');
-    assert.deepEqual(readdirSync(unsynced.error.directory).sort(), ['blobs', 'manifest.json', 'opensig.db']);
+    assert.deepEqual(readdirSync(unsynced.error.directory).sort(), ['blobs', 'manifest.staged.json', 'opensig.db']);
     assert.equal(unsynced.error.ledgerDigest, sha(sys.ledgerPath));
-    assert.deepEqual(seqs(sys), [4, 3], 'the ledger is committed');
+    assert.deepEqual(seqs(sys), [4, 4], 'the ledger is committed');
     assert.equal(readLedgerLock(sys.ledgerPath), undefined, 'the failing run released the lock');
     assert.match(unsynced.error.message, /--complete-staged /);
     completeStaged(unsynced.error.directory, { ledgerPath: sys.ledgerPath });
@@ -1132,6 +1205,7 @@ test('[OR-26] an injected post-commit I/O failure (ledger-directory fsync, stagi
           };
         },
         kept: 'staging',
+        listing: ['blobs', 'manifest.staged.json', 'opensig.db'],
         detail: /the ledger directory fsync failed after the commit, so nothing was published/,
       },
       {
@@ -1143,7 +1217,20 @@ test('[OR-26] an injected post-commit I/O failure (ledger-directory fsync, stagi
           },
         }),
         kept: 'staging',
+        listing: ['blobs', 'manifest.staged.json', 'opensig.db'],
         detail: /renaming the staging directory to its final name failed/,
+      },
+      {
+        label: 'final manifest',
+        io: (final) => ({
+          rename(from, to) {
+            if (to === join(final, 'manifest.json')) throw ioError('EIO', to);
+            renameSync(from, to);
+          },
+        }),
+        kept: 'final',
+        listing: ['blobs', 'manifest.staged.json', 'opensig.db'],
+        detail: /publishing the final manifest failed after the rename/,
       },
       {
         label: 'parent fsync',
@@ -1161,11 +1248,12 @@ test('[OR-26] an injected post-commit I/O failure (ledger-directory fsync, stagi
           };
         },
         kept: 'final',
+        listing: ['blobs', 'manifest.json', 'opensig.db'],
         detail: /the parent directory fsync failed after the rename/,
       },
     ];
     let index = 3;
-    for (const { label, io, kept, detail } of cases) {
+    for (const { label, io, kept, listing, detail } of cases) {
       appendEvents(sys, sys.tenants[1], 1);
       const name = `bk${index}`;
       index += 1;
@@ -1186,7 +1274,7 @@ test('[OR-26] an injected post-commit I/O failure (ledger-directory fsync, stagi
         assert.deepEqual(staged, [], `${label}: kept under the final name only`);
         assert.equal(failed.error.directory, final);
       }
-      assert.deepEqual(readdirSync(failed.error.directory).sort(), ['blobs', 'manifest.json', 'opensig.db']);
+      assert.deepEqual(readdirSync(failed.error.directory).sort(), listing);
       assert.equal(readLedgerLock(sys.ledgerPath), undefined);
 
       // While it is pending: backup, verify and restore report 75 and change nothing.
@@ -1208,14 +1296,18 @@ test('[OR-26] an injected post-commit I/O failure (ledger-directory fsync, stagi
       assert.equal(existsSync(pendingTarget.databasePath), false);
       assert.deepEqual(state(sys), frozen, `${label}: nothing changed while pending`);
 
-      if (label === 'staging rename') {
-        // A repeated I/O failure during recovery is pending again.
+      if (label === 'staging rename' || label === 'ledger-directory fsync') {
+        // A repeated I/O failure during recovery (here the staging rename, or
+        // the directory fsync after the re-commit) is pending again.
         assert.throws(() => completeStaged(failed.error.directory, { ledgerPath: sys.ledgerPath, io: io(final) }), isPending);
         assert.deepEqual(state(sys), frozen);
       }
+      const inode = statSync(sys.ledgerPath).ino;
       const completed = cli('--complete-staged', failed.error.directory, '--ledger', sys.ledgerPath);
       assert.equal(completed.status, 0, completed.stdout + completed.stderr);
       assert.equal(completed.stdout, `backup: published directory=${final}\n`);
+      assert.notEqual(statSync(sys.ledgerPath).ino, inode, `${label}: --complete-staged re-committed the ledger by a fresh replace`);
+      assert.deepEqual(readdirSync(final).sort(), ['blobs', 'manifest.json', 'opensig.db']);
       assert.deepEqual(stagingDirs(sys), []);
       assert.deepEqual(ledgerFiles(sys), [LEDGER_FILE]);
       assert.equal(sha(sys.ledgerPath), digest);
@@ -1297,6 +1389,640 @@ test('[OR-27] the blob size limit is carried through backup, verify and restore:
       assert.equal(run.status, 2, `${value}: ${run.stdout}${run.stderr}`);
     }
     assert.deepEqual(stagingDirs(sys), []);
+  } finally {
+    sys.db.close();
+  }
+});
+
+// ------------------------------------------------------------------- OR-28
+
+test('[OR-28] a ledger writer other than a backup whose ledger-directory fsync fails after the rename reports committed-unsynced (exit 74), rolls nothing back, and recovers with --resync-ledger', async () => {
+  const sys = system({ tenants: 2, events: 3 });
+  try {
+    await backup(sys, 'bk1', { firstBackup: true });
+    const [tenantA, tenantB] = sys.tenants;
+    deleteTenant(sys, tenantB);
+    const before = sha(sys.ledgerPath);
+
+    // --retire-tenant, with the fault injected at node:fs in the CLI process.
+    const retired = cliFault(sys.ledgerPath, '--retire-tenant', tenantB, '--db', sys.path, '--ledger', sys.ledgerPath);
+    assert.equal(retired.status, 74, `committed-unsynced exits 74 (${retired.stdout}${retired.stderr})`);
+    const after = sha(sys.ledgerPath);
+    assert.notEqual(after, before, 'the retirement is visible: nothing was rolled back');
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(sys.ledgerPath, 'utf8')).retired), [tenantB]);
+    const prefix = `backup: committed-unsynced ledger=${sys.ledgerPath} previous-digest=${before} ledger-digest=${after} recover="--resync-ledger ${after} --ledger ${sys.ledgerPath}": `;
+    assert.ok(retired.stdout.startsWith(prefix), retired.stdout);
+    assert.match(retired.stdout, new RegExp(`previous digest ${before}; new digest ${after}`), 'the message names both digests');
+    assert.doesNotMatch(retired.stdout, /unchanged|byte-identical|durable/i, 'it never says the ledger is unchanged, byte-identical or durable');
+    assert.deepEqual(ledgerFiles(sys), [LEDGER_FILE], 'the lock was released');
+
+    // --resync-ledger with another digest refuses and changes nothing.
+    const inode = statSync(sys.ledgerPath).ino;
+    const stale = cli('--resync-ledger', before, '--ledger', sys.ledgerPath);
+    assert.equal(stale.status, 1);
+    assert.match(stale.stdout, new RegExp(`^backup: refused recovery_refused: the ledger digest is ${after}, not ${before}: .*nothing was changed`));
+    assert.deepEqual([sha(sys.ledgerPath), statSync(sys.ledgerPath).ino], [after, inode]);
+    assert.equal(cli('--resync-ledger', 'not-a-digest', '--ledger', sys.ledgerPath).status, 2);
+    // With the current digest it re-commits the same bytes by a fresh atomic replace.
+    const synced = cli('--resync-ledger', after, '--ledger', sys.ledgerPath);
+    assert.equal(synced.status, 0, synced.stdout + synced.stderr);
+    assert.equal(synced.stdout, `backup: ledger-synced ledger=${sys.ledgerPath} ledger-digest=${after}\n`);
+    assert.equal(sha(sys.ledgerPath), after);
+    assert.notEqual(statSync(sys.ledgerPath).ino, inode, 'a fresh replace, never a bare re-fsync');
+    assert.deepEqual(ledgerFiles(sys), [LEDGER_FILE]);
+
+    // A first restore: the restored database stays in place.
+    const firstLedgerDir = scratch.dir();
+    const firstLedger = join(firstLedgerDir, LEDGER_FILE);
+    const restoredTarget = target();
+    const restored = cliFault(firstLedger, 'restore', '--from', join(sys.backups, 'bk1'), '--ledger', firstLedger, '--db', restoredTarget.databasePath, '--blobs', restoredTarget.blobRoot, '--first-restore');
+    assert.equal(restored.status, 74, restored.stdout + restored.stderr);
+    const firstDigest = sha(firstLedger);
+    assert.ok(restored.stdout.startsWith(`backup: committed-unsynced ledger=${firstLedger} previous-digest=none ledger-digest=${firstDigest} recover="--resync-ledger ${firstDigest} --ledger ${firstLedger}": `), restored.stdout);
+    assert.doesNotMatch(restored.stdout, /unchanged|byte-identical|durable/i);
+    const restoredDb = openDatabase({ path: restoredTarget.databasePath });
+    try {
+      assert.deepEqual(restoredDb.listTenantIds(), sys.tenants, 'the restored database was not rolled back');
+    } finally {
+      restoredDb.close();
+    }
+    assert.deepEqual(Object.keys(readLedger(firstLedger)).sort(), sys.tenants);
+    assert.deepEqual(readdirSync(firstLedgerDir), [LEDGER_FILE]);
+
+    // recordExportedHead (library): the typed committed-unsynced status, and
+    // nothing that depends on the new head runs.
+    appendEvents(sys, tenantA, 1);
+    const recordBefore = sha(sys.ledgerPath);
+    let dependentEffect = false;
+    assert.throws(
+      () => {
+        recordExportedHead(sys.ledgerPath, tenantA, headOf(sys, tenantA), { clock, source: 'receipt', digestAt: digestAtOf(sys, tenantA), io: failDirFsync(sys.ledgerPath) });
+        dependentEffect = true; // for example, releasing a receipt that names the new head
+      },
+      (error) =>
+        error instanceof LedgerCommitUnsyncedError &&
+        error.status === 'committed-unsynced' &&
+        error.code === 'committed_unsynced' &&
+        error.previousDigest === recordBefore &&
+        error.ledgerDigest === sha(sys.ledgerPath) &&
+        error.recovery === `--resync-ledger ${sha(sys.ledgerPath)} --ledger ${sys.ledgerPath}` &&
+        !/unchanged|byte-identical|durable/i.test(error.message),
+    );
+    assert.equal(dependentEffect, false, 'nothing that depends on the new head ran');
+    assert.equal(readLedger(sys.ledgerPath)[tenantA].seq, 4, 'the head is recorded, not rolled back');
+    const current = sha(sys.ledgerPath);
+    assert.throws(() => resyncLedger(current, { ledgerPath: sys.ledgerPath, io: failDirFsync(sys.ledgerPath) }), (error) => error instanceof LedgerCommitUnsyncedError && error.ledgerDigest === current);
+    assert.deepEqual(resyncLedger(current, { ledgerPath: sys.ledgerPath }), { status: 'ledger-synced', ledgerPath: sys.ledgerPath, ledgerDigest: current });
+
+    // Exit 74 means only committed-unsynced: a backup in the same situation is 75.
+    appendEvents(sys, tenantA, 1);
+    const backupFault = cliFault(sys.ledgerPath, 'create', '--db', sys.path, '--blobs', sys.blobRoot, '--out', join(sys.backups, 'bk-fault'), '--ledger', sys.ledgerPath);
+    assert.equal(backupFault.status, 75, backupFault.stdout + backupFault.stderr);
+    assert.match(backupFault.stdout, /^backup: committed-pending-publication /);
+  } finally {
+    sys.db.close();
+  }
+});
+
+// ------------------------------------------------------------------- OR-29
+
+test('[OR-29] a surviving intent record keeps a staging that changed no head pending, and the abandon message is truthful about it (T30D-1)', async () => {
+  const sys = system({ tenants: 2, events: 3 });
+  try {
+    await backup(sys, 'bk1', { firstBackup: true });
+    const bk1 = join(sys.backups, 'bk1');
+    const digest = sha(sys.ledgerPath);
+    // No event since bk1, so the next backup changes no head. It crashes
+    // after writing its intent record, before the ledger rename.
+    const crashWithIntent = () => {
+      const crash = runChild('crash-temp', 'backup', { databasePath: sys.path, blobRoot: sys.blobRoot, outDir: join(sys.backups, 'bk2'), ledgerPath: sys.ledgerPath });
+      assert.equal(crash.signal, 'SIGKILL');
+      breakLedgerLock(sys.ledgerPath, readLedgerLock(sys.ledgerPath).nonce);
+      const staged = stagingDirs(sys);
+      assert.equal(staged.length, 1);
+      return join(sys.backups, staged[0]);
+    };
+    let staging = crashWithIntent();
+    assert.equal(sha(sys.ledgerPath), digest, 'the ledger bytes cannot show whether the rename happened');
+    assert.equal(pendingPublication(sys.ledgerPath)?.staging, staging, 'the surviving intent record keeps the staging pending');
+    assert.throws(() => verifyBackup({ backupDir: bk1, ledgerPath: sys.ledgerPath }), isPending, 'pending even though bk1 carries the same heads');
+    const stagingReal = realpathSync(staging);
+    const abandoned = cli('--discard-staged', staging, '--ledger', sys.ledgerPath, '--abandon-committed', digest);
+    assert.equal(abandoned.status, 0, abandoned.stdout + abandoned.stderr);
+    assert.equal(
+      abandoned.stdout,
+      `backup: abandoned-committed directory=${stagingReal} ledger-digest=${digest}: the staged backup was deleted; the ledger stays as committed; this backup did not change the ledger heads, so a published backup that carries them stays restorable\n`,
+    );
+    assert.deepEqual(ledgerFiles(sys), [LEDGER_FILE], 'abandoning clears the intent record');
+    assert.equal(verifyBackup({ backupDir: bk1, ledgerPath: sys.ledgerPath }).tenants.length, 2, 'the published backup with the same heads stays restorable');
+    assert.equal(restoreBackup({ backupDir: bk1, ledgerPath: sys.ledgerPath, ...target() }).tenants.length, 2);
+
+    // Completing it instead publishes a second backup with the same heads.
+    staging = crashWithIntent();
+    const completed = cli('--complete-staged', staging, '--ledger', sys.ledgerPath);
+    assert.equal(completed.status, 0, completed.stdout + completed.stderr);
+    assert.deepEqual(ledgerFiles(sys), [LEDGER_FILE], '--complete-staged clears the intent record');
+    const heads = (dir) => verifyBackup({ backupDir: dir, ledgerPath: sys.ledgerPath }).tenants.map((tenant) => tenant.head);
+    assert.deepEqual(heads(join(sys.backups, 'bk2')), heads(bk1));
+
+    // A backup that changed the heads: the abandon message says the ledger is ahead, and restores refuse.
+    appendEvents(sys, sys.tenants[0], 1);
+    const final = join(sys.backups, 'bk3');
+    const failed = await settle(
+      backup(sys, 'bk3', {
+        io: {
+          rename(from, to) {
+            if (to === final) throw ioError('EXDEV', to);
+            renameSync(from, to);
+          },
+        },
+      }),
+    );
+    assert.equal(isPending(failed.error), true);
+    const ahead = sha(sys.ledgerPath);
+    const pendingReal = realpathSync(failed.error.directory);
+    const abandonedAhead = cli('--discard-staged', failed.error.directory, '--ledger', sys.ledgerPath, '--abandon-committed', ahead);
+    assert.equal(abandonedAhead.status, 0, abandonedAhead.stdout + abandonedAhead.stderr);
+    assert.equal(
+      abandonedAhead.stdout,
+      `backup: abandoned-committed directory=${pendingReal} ledger-digest=${ahead}: the staged backup was deleted; the ledger stays as committed, ahead of every published backup; every restore refuses until a backup carrying the committed heads is published\n`,
+    );
+    assert.throws(() => restoreBackup({ backupDir: join(sys.backups, 'bk2'), ledgerPath: sys.ledgerPath, ...target() }), (error) => error instanceof RestoreRefusedError && /older than the last exported head/.test(error.message));
+  } finally {
+    sys.db.close();
+  }
+});
+
+// ------------------------------------------------------------------- OR-30
+
+test('[OR-30] a first restore that fails before its commit point removes only the database files it created, never a database that appears at the target, and nothing after the commit point (T30D-3)', async () => {
+  const sys = system({ tenants: 1, events: 3, blobs: true });
+  try {
+    await backup(sys, 'bk1', { firstBackup: true });
+    const bk1 = join(sys.backups, 'bk1');
+
+    // Journal files at the target name that this run did not create.
+    const dir = scratch.dir();
+    const databasePath = join(dir, 'restored.db');
+    const blobRoot = join(dir, 'blobs');
+    const foreign = new Map([
+      [`${databasePath}-wal`, syntheticBytes('foreign-wal', 64)],
+      [`${databasePath}-journal`, syntheticBytes('foreign-journal', 64)],
+    ]);
+    for (const [path, bytes] of foreign) writeFileSync(path, bytes);
+    const ledgerDir = scratch.dir();
+    const ledgerPath = join(ledgerDir, LEDGER_FILE);
+    const failRename = {
+      rename(from, to) {
+        if (to === ledgerPath) throw ioError('EIO', to);
+        renameSync(from, to);
+      },
+    };
+    assert.throws(() => restoreBackup({ backupDir: bk1, ledgerPath, firstRestore: true, clock, io: failRename, databasePath, blobRoot }), (error) => error.code === 'EIO');
+    for (const [path, bytes] of foreign) {
+      assert.equal(existsSync(path), true, `${basename(path)} was not created by this run and is not removed`);
+      assert.deepEqual(readFileSync(path), bytes);
+    }
+    assert.equal(existsSync(databasePath), false, 'the database file this run placed is removed');
+    assert.equal(existsSync(blobRoot), false);
+    assert.deepEqual(readdirSync(dir).sort(), [...foreign.keys()].map((path) => basename(path)).sort(), 'no staging file is left');
+    assert.deepEqual(readdirSync(ledgerDir), [], 'the ledger is still missing, with no lock, record or temp file');
+
+    // A database that appears at the target during the run is never replaced or removed.
+    const raceDir = scratch.dir();
+    const raceDb = join(raceDir, 'restored.db');
+    const raceBlobs = join(raceDir, 'blobs');
+    const another = syntheticBytes('another-database', 4096);
+    hookFs('openSync', (real, path, ...rest) => {
+      const text = String(path);
+      if (!existsSync(raceDb) && text.startsWith(`${raceBlobs}${sep}`) && text.endsWith('.partial')) writeFileSync(raceDb, another);
+      return real.call(fs, path, ...rest);
+    });
+    let raced;
+    try {
+      raced = await settle(Promise.resolve().then(() => restoreBackup({ backupDir: bk1, ledgerPath, firstRestore: true, clock, databasePath: raceDb, blobRoot: raceBlobs })));
+    } finally {
+      unhookFs();
+    }
+    assert.equal(raced.ok, false, 'the restore refuses rather than replace a database');
+    assert.match(raced.error.message, /never overwrites a database/);
+    assert.deepEqual(readFileSync(raceDb), another, 'the database that appeared is untouched');
+    assert.equal(existsSync(raceBlobs), false);
+    assert.deepEqual(readdirSync(raceDir), ['restored.db']);
+    assert.deepEqual(readdirSync(ledgerDir), []);
+
+    // After the commit point nothing is removed (committed-unsynced).
+    const lateDir = scratch.dir();
+    const lateLedger = join(scratch.dir(), LEDGER_FILE);
+    const late = { databasePath: join(lateDir, 'restored.db'), blobRoot: join(lateDir, 'blobs') };
+    assert.throws(() => restoreBackup({ backupDir: bk1, ledgerPath: lateLedger, firstRestore: true, clock, io: failDirFsync(lateLedger), ...late }), (error) => error instanceof LedgerCommitUnsyncedError);
+    const lateDb = openDatabase({ path: late.databasePath });
+    try {
+      assert.deepEqual(lateDb.listTenantIds(), sys.tenants, 'the restored database stays');
+    } finally {
+      lateDb.close();
+    }
+    assert.equal(blobsApi.openBlobStore({ root: late.blobRoot }).list(sys.tenants[0]).length, 3, 'the restored blobs stay');
+    assert.deepEqual(Object.keys(readLedger(lateLedger)), sys.tenants);
+  } finally {
+    sys.db.close();
+  }
+});
+
+// ------------------------------------------------------------------- OR-31
+
+test('[OR-31] --discard-staged, with or without --abandon-committed, acts only on the exact staging name and never deletes a backup under its final name (T30D-4 rejected)', async () => {
+  const sys = system({ tenants: 2, events: 3 });
+  try {
+    await backup(sys, 'bk1', { firstBackup: true });
+    appendEvents(sys, sys.tenants[0], 1);
+    const final = join(sys.backups, 'bk2');
+    let renamed = false;
+    const failParent = {
+      rename(from, to) {
+        renameSync(from, to);
+        if (to === final) renamed = true;
+      },
+      syncDirectory(path) {
+        if (renamed && path === sys.backups) throw ioError('EIO', path);
+        fsyncDirectory(path);
+      },
+    };
+    const kept = await settle(backup(sys, 'bk2', { io: failParent }));
+    assert.equal(kept.error?.directory, final, 'the pending backup is under its final name');
+    const record = pendingPublication(sys.ledgerPath);
+    assert.notEqual(record.staging, final);
+    const digest = sha(sys.ledgerPath);
+    const listing = readdirSync(final).sort();
+    for (const args of [[record.staging, '--abandon-committed', digest], [record.staging], [final, '--abandon-committed', digest], [final]]) {
+      const run = cli('--discard-staged', args[0], '--ledger', sys.ledgerPath, ...args.slice(1));
+      assert.equal(run.status, 1, `${args.join(' ')}: ${run.stdout}${run.stderr}`);
+      assert.match(run.stdout, /^backup: refused recovery_refused: .*nothing was deleted\n$/);
+      assert.ok(run.stdout.includes(`--complete-staged ${final}`), `the refusal says where the backup is: ${run.stdout}`);
+      assert.deepEqual(readdirSync(final).sort(), listing, 'the backup under its final name is untouched');
+    }
+    assert.equal(pendingPublication(sys.ledgerPath)?.final, final, 'still pending');
+    const completed = cli('--complete-staged', final, '--ledger', sys.ledgerPath);
+    assert.equal(completed.status, 0, completed.stdout + completed.stderr);
+    const published = cli('--discard-staged', final, '--ledger', sys.ledgerPath);
+    assert.equal(published.status, 1);
+    assert.match(published.stdout, /is not a staging directory/);
+    assert.deepEqual(readdirSync(final).sort(), ['blobs', 'manifest.json', 'opensig.db'], 'a published backup is never discarded');
+  } finally {
+    sys.db.close();
+  }
+});
+
+// ------------------------------------------------------------------- OR-32
+
+test('[OR-32] staging is recognised by its staged manifest: a copy of, or a link to, an uncommitted staging directory is refused by verify and restore (T30R2-3)', async () => {
+  const sys = system({ tenants: 1, events: 3 });
+  try {
+    await backup(sys, 'bk1', { firstBackup: true });
+    assert.deepEqual(readdirSync(join(sys.backups, 'bk1')).sort(), ['blobs', 'manifest.json', 'opensig.db'], 'a published backup holds only the final manifest');
+    appendEvents(sys, sys.tenants[0], 2);
+    const crash = runChild('crash-temp', 'backup', { databasePath: sys.path, blobRoot: sys.blobRoot, outDir: join(sys.backups, 'bk2'), ledgerPath: sys.ledgerPath });
+    assert.equal(crash.signal, 'SIGKILL');
+    const [name] = stagingDirs(sys);
+    const staging = join(sys.backups, name);
+    const copy = join(sys.backups, 'copy-of-staging');
+    cpSync(staging, copy, { recursive: true });
+    const link = join(sys.backups, 'link-to-staging');
+    symlinkSync(staging, link);
+    for (const dir of [copy, link]) {
+      const verified = cli('verify', '--from', dir, '--ledger', sys.ledgerPath);
+      assert.equal(verified.status, 1, `${basename(dir)} is not a published backup (${verified.stdout}${verified.stderr})`);
+      assert.equal(verified.stdout, 'backup: refused 1 reason(s): the directory holds a staged manifest (manifest.staged.json): it is staging, not a published backup\n');
+      const refusedTarget = target();
+      assert.throws(() => restoreBackup({ backupDir: dir, ledgerPath: sys.ledgerPath, ...refusedTarget }), RestoreRefusedError);
+      assert.equal(existsSync(refusedTarget.databasePath), false);
+      assert.equal(existsSync(refusedTarget.blobRoot), false);
+    }
+    // Without its staged manifest it is still no backup: the final manifest is missing.
+    rmSync(join(copy, 'manifest.staged.json'));
+    assert.throws(() => verifyBackup({ backupDir: copy, ledgerPath: sys.ledgerPath }), (error) => error instanceof RestoreRefusedError && error.reasons.includes('manifest is missing or not valid JSON'));
+    assert.deepEqual(readdirSync(staging).sort(), ['blobs', 'manifest.staged.json', 'opensig.db']);
+    breakLedgerLock(sys.ledgerPath, readLedgerLock(sys.ledgerPath).nonce);
+  } finally {
+    sys.db.close();
+  }
+});
+
+// ------------------------------------------------------------------- OR-33
+
+test('[OR-33] the digest CAS sits immediately before the rename: a replacement made out of protocol during the temp write is refused, never overwritten (T30R2-4)', () => {
+  const dir = scratch.dir();
+  const ledgerPath = join(dir, LEDGER_FILE);
+  const tenant = sid('tenant');
+  const chain = { 1: hex('cas-1'), 2: hex('cas-2') };
+  const digestAt = (seq) => chain[seq];
+  recordExportedHead(ledgerPath, tenant, { seq: 1, digest: chain[1] }, { clock, source: 'receipt', digestAt, createIfMissing: true });
+  const session = LedgerSession.open(ledgerPath);
+  let outOfBand;
+  try {
+    const next = session.plan({ heads: new Map([[tenant, { head: { seq: 2, digest: chain[2] }, digestAt }]]), source: 'receipt', clock });
+    const io = {
+      writeFile(path, data) {
+        writeExclusive(path, data);
+        if (path.endsWith('.tmp')) {
+          // A writer that ignores the lock replaces the ledger while the temp file is written.
+          const value = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+          value.tenants[tenant] = { ...value.tenants[tenant], exported_at: new Date(BASE_TIME + 9_000_000).toISOString() };
+          writeFileSync(ledgerPath, canonicalize(value));
+          outOfBand = sha(ledgerPath);
+        }
+      },
+    };
+    assert.throws(() => session.commit(next, { io }), (error) => error instanceof LedgerError && /changed while it was locked \(digest mismatch\); nothing was written/.test(error.message));
+  } finally {
+    session.release();
+  }
+  assert.match(outOfBand ?? '', /^[0-9a-f]{64}$/);
+  assert.equal(sha(ledgerPath), outOfBand, 'the replacement made during the temp write is kept, not overwritten');
+  assert.equal(readLedger(ledgerPath)[tenant].seq, 1);
+  assert.deepEqual(readdirSync(dir), [LEDGER_FILE], 'the temp file was removed and the lock released');
+});
+
+// ------------------------------------------------------------------- OR-34
+
+test('[OR-34] --discard-staged identifies the staging by its real path, under any spelling, and reports the directory it actually deleted (T30R2-5)', async () => {
+  const sys = system({ tenants: 2, events: 3 });
+  try {
+    await backup(sys, 'bk1', { firstBackup: true });
+    appendEvents(sys, sys.tenants[1], 1);
+    const final = join(sys.backups, 'bk2');
+    const failed = await settle(
+      backup(sys, 'bk2', {
+        io: {
+          rename(from, to) {
+            if (to === final) throw ioError('EXDEV', to);
+            renameSync(from, to);
+          },
+        },
+      }),
+    );
+    assert.equal(isPending(failed.error), true);
+    const staging = failed.error.directory;
+    const real = realpathSync(staging);
+    const alias = join(dirname(sys.backups), 'backups-alias');
+    symlinkSync(sys.backups, alias);
+    const spellings = [join(alias, basename(staging)), `${sys.backups}${sep}..${sep}${basename(sys.backups)}${sep}${basename(staging)}`];
+    const digest = sha(sys.ledgerPath);
+    for (const spelling of spellings) {
+      const refused = cli('--discard-staged', spelling, '--ledger', sys.ledgerPath);
+      assert.equal(refused.status, 1, `the pending committed staging is refused under the spelling ${spelling} (${refused.stdout})`);
+      assert.match(refused.stdout, /is the pending committed staging/);
+      assert.ok(existsSync(join(staging, 'manifest.staged.json')), 'nothing was deleted');
+    }
+    const abandoned = cli('--discard-staged', spellings[0], '--ledger', sys.ledgerPath, '--abandon-committed', digest);
+    assert.equal(abandoned.status, 0, abandoned.stdout + abandoned.stderr);
+    assert.ok(abandoned.stdout.startsWith(`backup: abandoned-committed directory=${real} ledger-digest=${digest}: `), `the deleted path is reported, not the name given (${abandoned.stdout})`);
+    assert.equal(existsSync(real), false);
+    assert.deepEqual(ledgerFiles(sys), [LEDGER_FILE]);
+
+    const copy = join(sys.backups, `.staging-${'b'.repeat(24)}-bk-copy`);
+    cpSync(join(sys.backups, 'bk1'), copy, { recursive: true });
+    const copyReal = realpathSync(copy);
+    const discarded = cli('--discard-staged', join(alias, basename(copy)), '--ledger', sys.ledgerPath);
+    assert.equal(discarded.stdout, `backup: discarded directory=${copyReal}\n`);
+    assert.equal(existsSync(copy), false);
+  } finally {
+    sys.db.close();
+  }
+});
+
+// ------------------------------------------------------------------- OR-35
+
+test('[OR-35] the lock owner holds its descriptor for the whole session and releases it on every path; --break-lock damaged moves aside only an unparseable lock older than 60 s that no live writer holds (T30R2-1)', async () => {
+  const sys = system({ tenants: 2, events: 3 });
+  try {
+    await backup(sys, 'bk1', { firstBackup: true });
+    const lockPath = `${sys.ledgerPath}.lock`;
+    const age = (path, seconds) => {
+      const time = new Date(Date.now() - seconds * 1000);
+      utimesSync(path, time, time);
+    };
+    const torn = Buffer.from('{"schema":"opensig.ledger-lock/1","pid":');
+
+    // (a) A live writer in another process holds the session; its lock
+    // content is torn and older than 60 s. The damaged path refuses.
+    const barrier = scratch.dir('opensig-barrier-');
+    const holder = spawn(process.execPath, [CHILD, 'free', 'hold', JSON.stringify({ ledgerPath: sys.ledgerPath, barrier })], { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    const holderExit = new Promise((resolveExit) => holder.on('exit', (code, signal) => resolveExit({ code, signal })));
+    try {
+      for (let i = 0; i < 6000 && !existsSync(join(barrier, 'ready')); i += 1) await sleep(5);
+      assert.ok(existsSync(join(barrier, 'ready')), 'the writer holds the lock');
+      const held = statSync(lockPath);
+      writeFileSync(lockPath, torn); // in place: the same file the writer holds
+      age(lockPath, 120);
+      const refused = cli('--break-lock', 'damaged', '--ledger', sys.ledgerPath);
+      assert.equal(refused.status, 1, `a damaged lock whose writer is live is not broken (${refused.stdout}${refused.stderr})`);
+      assert.match(refused.stdout, new RegExp(`^backup: refused ledger_invalid: the damaged ledger lock is held by pid ${holder.pid}, a live writer; the lock was not moved`));
+      const still = statSync(lockPath);
+      assert.deepEqual([still.dev, still.ino], [held.dev, held.ino], '(a) the lock is untouched');
+      assert.deepEqual(readFileSync(lockPath), torn);
+
+      // (b) The writer crashes: the same aged, torn lock is moved aside.
+      holder.kill('SIGKILL');
+      assert.equal((await holderExit).signal, 'SIGKILL');
+    } finally {
+      if (holder.exitCode === null && holder.signalCode === null) holder.kill('SIGKILL');
+    }
+    // Through the CLI the whole of /proc is inspected. A process of this user
+    // that /proc does not let anyone but root inspect (a non-dumpable one,
+    // such as ssh-agent) means refuse, naming it, never assume it is not a
+    // holder; then the success path is shown over the inspectable processes.
+    const { inspectable, uninspectable } = userProcesses();
+    const moved = cli('--break-lock', 'damaged', '--ledger', sys.ledgerPath);
+    let movedTo;
+    if (uninspectable.length === 0) {
+      assert.equal(moved.status, 0, moved.stdout + moved.stderr);
+      movedTo = /^backup: damaged-lock-moved path=(\S+)\n$/.exec(moved.stdout)?.[1];
+    } else {
+      assert.equal(moved.status, 1, moved.stdout + moved.stderr);
+      assert.match(moved.stdout, /^backup: refused ledger_invalid: process\(es\) [0-9, ]+ of this user cannot be inspected, so it cannot be shown that none holds the damaged lock; the lock was not moved\n$/);
+      for (const pid of uninspectable) assert.match(moved.stdout, new RegExp(`\\b${pid}\\b`), `the refusal names pid ${pid}`);
+      assert.deepEqual(readFileSync(lockPath), torn, 'refused: the lock is untouched');
+      movedTo = breakDamagedLock(sys.ledgerPath, { pids: () => inspectable }).movedTo;
+    }
+    assert.match(movedTo ?? '', new RegExp(`^${escapeRegExp(lockPath)}\\.damaged-\\d{4}-\\d\\d-\\d\\dT\\d\\d-\\d\\d-\\d\\d-\\d{3}Z$`), moved.stdout);
+    assert.deepEqual(readFileSync(movedTo), torn, '(b) moved aside, never deleted');
+    assert.equal(existsSync(lockPath), false);
+    LedgerSession.open(sys.ledgerPath).release();
+    rmSync(movedTo);
+
+    // The 60 s rule, on the file's mtime and an injectable clock.
+    writeFileSync(lockPath, torn, { flag: 'wx', mode: 0o600 });
+    const mtime = statSync(lockPath).mtimeMs;
+    const young = cli('--break-lock', 'damaged', '--ledger', sys.ledgerPath);
+    assert.equal(young.status, 1);
+    assert.match(young.stdout, /it is moved aside only when older than 60 s; the lock was not moved/);
+    const scanned = userProcesses().inspectable;
+    assert.ok(scanned.includes(process.pid));
+    const scan = { pids: () => scanned };
+    assert.throws(() => breakDamagedLock(sys.ledgerPath, { ...scan, now: () => mtime + 59_000 }), /only when older than 60 s/);
+    const aged = breakDamagedLock(sys.ledgerPath, { ...scan, now: () => mtime + 61_000 });
+    assert.deepEqual(readFileSync(aged.movedTo), torn);
+    rmSync(aged.movedTo);
+
+    // (c) A lock that parses is never touched by the damaged path.
+    const nonce = createHash('sha256').update('or35-parsable').digest('hex').slice(0, 32);
+    writeFileSync(lockPath, lockRecord({ pid: deadPid(), nonce }), { flag: 'wx', mode: 0o600 });
+    age(lockPath, 120);
+    const parsable = statSync(lockPath);
+    const parsableBytes = readFileSync(lockPath);
+    const notDamaged = cli('--break-lock', 'damaged', '--ledger', sys.ledgerPath);
+    assert.equal(notDamaged.status, 1);
+    assert.match(notDamaged.stdout, /the ledger lock parses \(pid \d+ on .*\); a lock that parses is broken only with --break-lock <nonce>; the lock was not moved/);
+    assert.deepEqual([readFileSync(lockPath), statSync(lockPath).ino], [parsableBytes, parsable.ino], '(c) untouched');
+    assert.equal(cli('--break-lock', nonce, '--ledger', sys.ledgerPath).status, 0);
+
+    // (d) /proc, or one of this user's processes, cannot be inspected: refused.
+    writeFileSync(lockPath, torn, { flag: 'wx', mode: 0o600 });
+    age(lockPath, 120);
+    hookFs('readdirSync', (real, path, ...rest) => {
+      if (String(path) === '/proc') throw ioError('EACCES', path);
+      return real.call(fs, path, ...rest);
+    });
+    try {
+      assert.throws(() => breakDamagedLock(sys.ledgerPath), (error) => error instanceof LedgerError && /\/proc cannot be read/.test(error.message));
+    } finally {
+      unhookFs();
+    }
+    hookFs('readdirSync', (real, path, ...rest) => {
+      if (String(path) === `/proc/${process.pid}/fd`) throw ioError('EACCES', path);
+      return real.call(fs, path, ...rest);
+    });
+    try {
+      assert.throws(
+        () => breakDamagedLock(sys.ledgerPath, scan),
+        (error) => error instanceof LedgerError && new RegExp(`process\\(es\\) (?:[0-9]+, )*${process.pid}(?:, [0-9]+)* of this user cannot be inspected`).test(error.message),
+      );
+    } finally {
+      unhookFs();
+    }
+    assert.deepEqual(readFileSync(lockPath), torn, '(d) untouched');
+
+    // (e) The lock is replaced between the check and the move: it is not moved.
+    const replacement = Buffer.from('another damaged lock');
+    let swapped = false;
+    hookFs('readdirSync', (real, path, ...rest) => {
+      if (!swapped && String(path) === '/proc') {
+        swapped = true;
+        rmSync(lockPath);
+        writeFileSync(lockPath, replacement, { flag: 'wx', mode: 0o600 });
+        age(lockPath, 120);
+      }
+      return real.call(fs, path, ...rest);
+    });
+    try {
+      assert.throws(() => breakDamagedLock(sys.ledgerPath, scan), (error) => error instanceof LedgerError && /changed while it was being checked; the lock was not moved/.test(error.message));
+    } finally {
+      unhookFs();
+    }
+    assert.ok(swapped);
+    assert.deepEqual(readFileSync(lockPath), replacement, '(e) the replacement stays in place');
+    assert.equal(ledgerFiles(sys).some((entry) => entry.includes('.damaged-')), false, 'nothing was moved aside');
+    rmSync(lockPath);
+
+    // (f) Every session path releases: no lock file remains, and this process
+    // holds no descriptor on the lock afterwards.
+    const identities = [];
+    const capture = () => {
+      const stat = statSync(lockPath);
+      identities.push({ dev: stat.dev, ino: stat.ino });
+    };
+    const holdsDescriptor = ({ dev, ino }) =>
+      readdirSync('/proc/self/fd').some((fd) => {
+        try {
+          const stat = statSync(`/proc/self/fd/${fd}`);
+          return stat.dev === dev && stat.ino === ino;
+        } catch {
+          return false;
+        }
+      });
+    const assertReleased = (label) => {
+      const identity = identities.at(-1);
+      assert.ok(identity !== undefined, `${label}: the session held the lock`);
+      assert.equal(holdsDescriptor(identity), false, `${label}: the lock descriptor is closed`);
+      assert.equal(existsSync(lockPath), false, `${label}: no lock file remains`);
+      identities.length = 0;
+    };
+    const [tenantA] = sys.tenants;
+    const capturing = (digestAt) => (seq) => {
+      capture();
+      return digestAt(seq);
+    };
+    // While a session runs, this process holds the descriptor.
+    const live = LedgerSession.open(sys.ledgerPath);
+    capture();
+    assert.equal(holdsDescriptor(identities.at(-1)), true, 'the owner holds the lock descriptor during the session');
+    live.release();
+    assertReleased('explicit release');
+    appendEvents(sys, tenantA, 1);
+    recordExportedHead(sys.ledgerPath, tenantA, headOf(sys, tenantA), { clock, source: 'receipt', digestAt: capturing(digestAtOf(sys, tenantA)) });
+    assertReleased('success');
+    assert.throws(
+      () => recordExportedHead(sys.ledgerPath, tenantA, { seq: 99, digest: hex('not-in-chain') }, { clock, source: 'receipt', digestAt: capturing((seq) => (seq === 99 ? hex('not-in-chain') : hex('other'))) }),
+      LedgerError,
+    );
+    assertReleased('refused');
+    appendEvents(sys, tenantA, 1);
+    assert.throws(
+      () => recordExportedHead(sys.ledgerPath, tenantA, headOf(sys, tenantA), { clock, source: 'receipt', digestAt: capturing(digestAtOf(sys, tenantA)), io: failDirFsync(sys.ledgerPath) }),
+      LedgerCommitUnsyncedError,
+    );
+    assertReleased('committed-unsynced (exit 74)');
+    appendEvents(sys, tenantA, 1);
+    const finalF = join(sys.backups, 'bk-f');
+    await assert.rejects(
+      backup(sys, 'bk-f', {
+        io: {
+          rename(from, to) {
+            if (to === finalF) {
+              capture();
+              throw ioError('EXDEV', to);
+            }
+            renameSync(from, to);
+          },
+        },
+      }),
+      isPending,
+    );
+    assertReleased('committed-pending-publication (exit 75)');
+    assert.throws(
+      () =>
+        withLedgerSession(sys.ledgerPath, { recovery: true }, () => {
+          capture();
+          throw new Error('synthetic failure inside the session');
+        }),
+      /synthetic failure inside the session/,
+    );
+    assertReleased('thrown error');
+    const pendingStaging = pendingPublication(sys.ledgerPath).staging;
+    completeStaged(pendingStaging, { ledgerPath: sys.ledgerPath, io: { syncDirectory: (path) => (capture(), fsyncDirectory(path)) } });
+    assertReleased('recovery');
+
+    // A lock replaced during a session is lost: never unlinked, reported, and the descriptor is closed.
+    const lostSession = LedgerSession.open(sys.ledgerPath);
+    capture();
+    rmSync(lockPath);
+    writeFileSync(lockPath, 'a lock that is not this session\'s', { flag: 'wx', mode: 0o600 });
+    const warnings = [];
+    const onWarning = (warning) => warnings.push(warning);
+    process.on('warning', onWarning);
+    let status;
+    try {
+      status = lostSession.release();
+      await new Promise((resolveTick) => setImmediate(resolveTick));
+    } finally {
+      process.off('warning', onWarning);
+    }
+    assert.equal(status, 'lost');
+    assert.equal(readFileSync(lockPath, 'utf8'), "a lock that is not this session's", 'a lock that is not the session\'s is never unlinked');
+    assert.equal(holdsDescriptor(identities.at(-1)), false, 'the descriptor is closed');
+    assert.ok(warnings.some((warning) => warning.code === 'OPENSIG_LEDGER_LOCK_LOST'), 'the lost lock is reported');
+    rmSync(lockPath);
   } finally {
     sys.db.close();
   }

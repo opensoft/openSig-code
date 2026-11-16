@@ -11,23 +11,38 @@
 // file. A write (LedgerSession):
 // 1. takes the exclusive lock `${ledger}.lock`, created with O_CREAT|O_EXCL
 //    and recording pid, hostname, start time and a random nonce; contention
-//    refuses at once (LedgerLockedError) and never waits;
+//    refuses at once (LedgerLockedError) and never waits. The owner keeps the
+//    lock file descriptor open for the whole session, so a live owner is
+//    visible in /proc/<pid>/fd and a crashed one loses it;
 // 2. re-reads the ledger and the SHA-256 of its bytes under the lock;
 // 3. checks ancestry for every tenant it updates: the chain a new head comes
 //    from must contain the recorded head unchanged;
-// 4. compares the digest with the one read under the lock (CAS) immediately
-//    before ONE atomic replace (temp file, fsync, rename, directory fsync);
-// 5. releases the lock (only its own, by nonce).
+// 4. does ONE atomic replace (temp file, fsync, rename, directory fsync),
+//    comparing the digest with the one read under the lock (CAS) right
+//    before the rename;
+// 5. releases the lock on every path, errors included: only when the lock
+//    path is still the file it holds (device and inode) does it unlink it;
+//    otherwise it never unlinks and reports the lock as lost. It then closes
+//    the descriptor. Only a crash leaves a lock behind.
 // A stale lock is never broken automatically: breakLedgerLock() needs the
 // lock's nonce, a lock recorded on this host, and a recorded pid that is not
-// alive (the operator's --break-lock <nonce>). Single host, local filesystem.
+// alive (the operator's --break-lock <nonce>). A damaged lock (no parsable
+// record, so no nonce) is moved aside by --break-lock damaged only when it is
+// older than 60 seconds and no process of the invoking user holds a
+// descriptor on it (checked through /proc; refused when /proc or any of the
+// user's processes cannot be inspected), re-checking its identity just
+// before the move; a lock that parses is never touched by that path. Single host, local
+// filesystem.
 //
 // Commit point (rule 3). The ledger rename is the commit point: everything
 // before it returns is pre-commit (the ledger is byte-identical on any
 // failure); from the moment it returns the run is post-commit, even if the
-// directory fsync then fails. A backup that commits records its publication
-// intent first, in `${ledger}.publishing` (staging and final directory, and
-// the digest of the ledger bytes being committed). While that record names
+// directory fsync then fails. A writer other than a backup reports that case
+// as committed-unsynced (LedgerCommitUnsyncedError, exit 74) and recovers
+// with --resync-ledger <digest>, which re-commits the same bytes by a fresh
+// replace; nothing is rolled back. A backup that commits records its
+// publication intent first, in `${ledger}.publishing` (staging and final
+// directory, and the digests of the ledger bytes before and after). While that record names
 // the current ledger digest, the backup it names is the pending committed
 // staging: every ledger writer except the recovery operations, and backup,
 // verify and restore, report committed-pending-publication and change
@@ -45,7 +60,22 @@
 // ("retired" is present only when a tenant has been retired.)
 
 import { createHash, randomBytes } from 'node:crypto';
-import { closeSync, constants as fsConstants, fsyncSync, lstatSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeSync } from 'node:fs';
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs';
 import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -117,6 +147,7 @@ export class LedgerError extends StorageError {
  * --complete-staged, or --discard-staged with --abandon-committed.
  */
 export class PendingPublicationError extends StorageError {
+  readonly status = 'committed-pending-publication' as const;
   readonly directory: string;
   readonly ledgerDigest: string;
   readonly recovery: string;
@@ -129,6 +160,33 @@ export class PendingPublicationError extends StorageError {
       options,
     );
     this.directory = directory;
+    this.ledgerDigest = ledgerDigest;
+    this.recovery = recovery;
+  }
+}
+
+/**
+ * Post-commit, for a ledger writer other than a backup (first restore,
+ * --retire-tenant, recordExportedHead): the rename over the ledger returned
+ * but the ledger-directory fsync failed. The new ledger is visible and may
+ * not survive a crash. Nothing is rolled back; recover with --resync-ledger.
+ */
+export class LedgerCommitUnsyncedError extends StorageError {
+  readonly status = 'committed-unsynced' as const;
+  readonly ledgerPath: string;
+  readonly previousDigest: string | null;
+  readonly ledgerDigest: string;
+  readonly recovery: string;
+
+  constructor(ledgerPath: string, previousDigest: string | null, ledgerDigest: string, what: string, options?: { cause?: unknown }) {
+    const recovery = `--resync-ledger ${ledgerDigest} --ledger ${ledgerPath}`;
+    super(
+      'committed_unsynced',
+      `${what} was committed to the exported-head ledger ${ledgerPath} (previous digest ${previousDigest ?? 'none: the ledger did not exist'}; new digest ${ledgerDigest}), but the ledger directory fsync failed after the rename: the new ledger is visible and may not survive a crash. Nothing was rolled back; do not act on the new head until the ledger is resynced with ${recovery}`,
+      options,
+    );
+    this.ledgerPath = ledgerPath;
+    this.previousDigest = previousDigest;
     this.ledgerDigest = ledgerDigest;
     this.recovery = recovery;
   }
@@ -265,6 +323,12 @@ export interface PublishingRecord {
   readonly final: string;
   /** SHA-256 of the ledger bytes committed for this backup. */
   readonly ledger_digest: string;
+  /**
+   * SHA-256 of the ledger bytes before that commit (null: there was no
+   * ledger). Equal to ledger_digest when the backup changed no head.
+   * Undefined only in a record written before this field existed.
+   */
+  readonly previous_digest?: string | null;
   readonly created_at: string;
 }
 
@@ -283,14 +347,18 @@ function readPublishing(ledgerPath: string): PublishingRecord | undefined {
   } catch (error) {
     throw new LedgerError('the ledger publication record is damaged', { cause: error });
   }
-  if (!isObject(value) || value['schema'] !== PUBLISHING_SCHEMA || Object.keys(value).sort().join(',') !== 'created_at,final,ledger_digest,schema,staging') {
+  const keys = isObject(value) ? Object.keys(value).sort().join(',') : '';
+  if (!isObject(value) || value['schema'] !== PUBLISHING_SCHEMA || (keys !== 'created_at,final,ledger_digest,previous_digest,schema,staging' && keys !== 'created_at,final,ledger_digest,schema,staging')) {
     throw new LedgerError('the ledger publication record is damaged');
   }
-  const { staging, final, ledger_digest: digest, created_at: createdAt } = value;
+  const { staging, final, ledger_digest: digest, previous_digest: previous, created_at: createdAt } = value;
   if (typeof staging !== 'string' || typeof final !== 'string' || typeof digest !== 'string' || !DIGEST.test(digest) || typeof createdAt !== 'string') {
     throw new LedgerError('the ledger publication record is damaged');
   }
-  return { staging, final, ledger_digest: digest, created_at: createdAt };
+  if (previous !== undefined && previous !== null && (typeof previous !== 'string' || !DIGEST.test(previous))) {
+    throw new LedgerError('the ledger publication record is damaged');
+  }
+  return { staging, final, ledger_digest: digest, ...(previous === undefined ? {} : { previous_digest: previous as string | null }), created_at: createdAt };
 }
 
 /** The current ledger digest, or null when the ledger is missing. */
@@ -366,7 +434,13 @@ function tryReadLock(ledgerPath: string): LockRecord | undefined {
   }
 }
 
-function acquireLock(ledgerPath: string): LockRecord {
+/** A held lock: its record and the open descriptor the owner keeps for the whole session. */
+interface LockHandle {
+  readonly record: LockRecord;
+  readonly fd: number;
+}
+
+function acquireLock(ledgerPath: string): LockHandle {
   const path = lockPathOf(ledgerPath);
   const record: LockRecord = { pid: process.pid, hostname: hostname(), started_at: new Date().toISOString(), nonce: randomBytes(16).toString('hex') };
   let fd: number;
@@ -376,28 +450,47 @@ function acquireLock(ledgerPath: string): LockRecord {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new LedgerLockedError(tryReadLock(ledgerPath));
     throw error;
   }
+  const handle: LockHandle = { record, fd };
   try {
     const data = Buffer.from(canonicalize({ schema: LOCK_SCHEMA, ...record } as unknown as JsonValue), 'utf8');
     let offset = 0;
     while (offset < data.byteLength) offset += writeSync(fd, data, offset, data.byteLength - offset);
     fsyncSync(fd);
+    syncDirectory(dirname(path));
   } catch (error) {
-    closeSync(fd);
-    unlinkSync(path);
+    try {
+      releaseLock(ledgerPath, handle);
+    } catch {
+      // Reported through the original error; the next writer sees any lock left.
+    }
     throw error;
   }
-  closeSync(fd);
-  syncDirectory(dirname(path));
-  return record;
+  // The descriptor stays open until releaseLock(): a live owner is visible in /proc.
+  return handle;
 }
 
-/** Remove the lock if it is still ours (same nonce). Returns false when it is not. */
-function releaseLock(ledgerPath: string, record: LockRecord): boolean {
-  const current = tryReadLock(ledgerPath);
-  if (current === undefined || current.nonce !== record.nonce) return false;
-  unlinkSync(lockPathOf(ledgerPath));
-  syncDirectory(dirname(ledgerPath));
-  return true;
+/**
+ * Remove the lock only while the lock path is still the file this handle
+ * holds (same device and inode), then close the descriptor. Returns false
+ * when the path is gone or is another file: the lock was lost, and a lock
+ * that is not this handle's is never unlinked. The descriptor is closed in
+ * every case.
+ */
+function releaseLock(ledgerPath: string, handle: LockHandle): boolean {
+  const path = lockPathOf(ledgerPath);
+  let removed = false;
+  try {
+    const held = fstatSync(handle.fd);
+    const current = lstatSync(path, { throwIfNoEntry: false });
+    if (current !== undefined && current.isFile() && current.dev === held.dev && current.ino === held.ino) {
+      unlinkSync(path);
+      removed = true;
+      syncDirectory(dirname(path));
+    }
+  } finally {
+    closeSync(handle.fd);
+  }
+  return removed;
 }
 
 function pidAlive(pid: number): boolean {
@@ -410,15 +503,29 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/** The word --break-lock takes, instead of a nonce, for a damaged lock. */
+export const DAMAGED_LOCK = 'damaged';
+/** A damaged lock younger than this may belong to a writer still creating it. */
+export const DAMAGED_LOCK_MIN_AGE_MS = 60_000;
+
 /**
  * Break a stale ledger lock (the operator's --break-lock <nonce>). Refused
  * unless the nonce matches, the lock was taken on this host, and its pid is
- * no longer alive. Returns the removed lock.
+ * no longer alive. Returns the removed lock. `--break-lock damaged` goes to
+ * breakDamagedLock() instead.
  */
 export function breakLedgerLock(ledgerPath: string, nonce: string): LockRecord {
   checkAbsolute(ledgerPath, 'ledger path');
-  if (typeof nonce !== 'string' || !NONCE.test(nonce)) throw new StorageUsageError('the lock nonce must be 32 hexadecimal characters');
-  const holder = readLedgerLock(ledgerPath);
+  if (typeof nonce !== 'string' || !NONCE.test(nonce)) throw new StorageUsageError(`the lock nonce must be 32 hexadecimal characters (or "${DAMAGED_LOCK}" for a damaged lock)`);
+  let holder: LockRecord | undefined;
+  try {
+    holder = readLedgerLock(ledgerPath);
+  } catch (error) {
+    if (error instanceof LedgerError) {
+      throw new LedgerError(`${error.message}; a damaged lock has no nonce and is broken only with --break-lock ${DAMAGED_LOCK}`, { cause: error });
+    }
+    throw error;
+  }
   if (holder === undefined) throw new LedgerError('the exported-head ledger is not locked; nothing to break');
   if (holder.nonce !== nonce) throw new LedgerError('the nonce does not match the ledger lock; the lock was not broken');
   if (holder.hostname !== hostname()) throw new LedgerError(`the ledger lock was taken on host ${holder.hostname}, not this host; the lock was not broken`);
@@ -426,6 +533,139 @@ export function breakLedgerLock(ledgerPath: string, nonce: string): LockRecord {
   unlinkSync(lockPathOf(ledgerPath));
   syncDirectory(dirname(ledgerPath));
   return holder;
+}
+
+interface DamagedLockIdentity {
+  readonly dev: number;
+  readonly ino: number;
+  readonly mtimeMs: number;
+  readonly digest: string;
+}
+
+/** Identify a damaged lock file; refuses a missing lock, a non-file and a lock that parses. */
+function damagedLockIdentity(path: string): DamagedLockIdentity {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (stat === undefined) throw new LedgerError('the exported-head ledger is not locked; nothing to break');
+  if (!stat.isFile()) throw new LedgerError('the ledger lock path is not a regular file; the lock was not moved');
+  const bytes = readFileSync(path);
+  let parsed: LockRecord | undefined;
+  try {
+    parsed = parseLock(bytes);
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed !== undefined) {
+    throw new LedgerError(
+      `the ledger lock parses (pid ${parsed.pid} on ${parsed.hostname}, nonce ${parsed.nonce}); a lock that parses is broken only with --break-lock <nonce>; the lock was not moved`,
+    );
+  }
+  return { dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, digest: sha256(bytes) };
+}
+
+const errnoOf = (error: unknown): string | undefined => (error as NodeJS.ErrnoException)?.code;
+
+/**
+ * The processes of the invoking user that hold a descriptor on the file
+ * (/proc/<pid>/fd entries resolving to its device and inode), and the
+ * processes of that user (or of unknown owner) that could not be inspected.
+ * Throws when /proc itself cannot be read: absence of a holder must be
+ * shown, never assumed.
+ */
+function lockHolders(target: DamagedLockIdentity, candidates?: () => Iterable<number>): { readonly holders: readonly number[]; readonly uninspectable: readonly number[] } {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+  let entries: string[];
+  try {
+    if (uid === undefined) throw new Error('no user id on this platform');
+    entries = readdirSync('/proc');
+    readdirSync('/proc/self/fd');
+    if (candidates !== undefined) entries = [...candidates()].map(String);
+  } catch (cause) {
+    throw new LedgerError('/proc cannot be read, so it cannot be shown that no process holds the damaged lock; the lock was not moved', { cause });
+  }
+  const holders: number[] = [];
+  const uninspectable: number[] = [];
+  for (const name of entries) {
+    if (!/^[0-9]+$/.test(name)) continue;
+    const pid = Number(name);
+    let owner: number;
+    try {
+      owner = statSync(`/proc/${name}`).uid;
+    } catch (cause) {
+      if (errnoOf(cause) !== 'ENOENT') uninspectable.push(pid);
+      continue;
+    }
+    if (owner !== uid) continue;
+    let fds: string[];
+    try {
+      fds = readdirSync(`/proc/${name}/fd`);
+    } catch (cause) {
+      if (errnoOf(cause) !== 'ENOENT') uninspectable.push(pid);
+      continue;
+    }
+    for (const fd of fds) {
+      let stat;
+      try {
+        stat = statSync(`/proc/${name}/fd/${fd}`);
+      } catch (cause) {
+        if (errnoOf(cause) === 'ENOENT') continue;
+        uninspectable.push(pid);
+        break;
+      }
+      if (stat.dev === target.dev && stat.ino === target.ino) {
+        holders.push(pid);
+        break;
+      }
+    }
+  }
+  return { holders, uninspectable };
+}
+
+export interface DamagedLockOptions {
+  /** Clock for the 60-second rule, in epoch milliseconds (tests). */
+  readonly now?: () => number;
+  /**
+   * Internal seam for tests; never exposed by the CLI: the processes to
+   * inspect instead of every process listed in /proc (/proc must still be
+   * readable).
+   */
+  readonly pids?: () => Iterable<number>;
+}
+
+/**
+ * Move a damaged ledger lock aside (the operator's --break-lock damaged).
+ * Only when all hold: its content still does not parse as a lock record; it
+ * is older than 60 seconds; no process of the invoking user holds a
+ * descriptor on it (/proc; refused, naming them, when /proc or any of the
+ * user's processes cannot be inspected; the owner holds its descriptor for
+ * the whole session, so this shows no live writer owns it); and, re-checked
+ * just before the move, it is the same file (device, inode and digest). The file is moved to
+ * `${ledger}.lock.damaged-<time>`, never deleted. Returns that path.
+ */
+export function breakDamagedLock(ledgerPath: string, options: DamagedLockOptions = {}): { readonly movedTo: string } {
+  checkAbsolute(ledgerPath, 'ledger path');
+  const path = lockPathOf(ledgerPath);
+  const first = damagedLockIdentity(path);
+  const now = (options.now ?? Date.now)();
+  if (!Number.isFinite(now)) throw new StorageUsageError('the damaged-lock clock returned an invalid time');
+  const age = now - first.mtimeMs;
+  if (age < DAMAGED_LOCK_MIN_AGE_MS) {
+    throw new LedgerError(`the damaged ledger lock is ${Math.max(0, Math.floor(age / 1000))} s old; it is moved aside only when older than ${DAMAGED_LOCK_MIN_AGE_MS / 1000} s; the lock was not moved`);
+  }
+  const { holders, uninspectable } = lockHolders(first, options.pids);
+  if (holders.length > 0) throw new LedgerError(`the damaged ledger lock is held by pid ${holders.join(', ')}, a live writer; the lock was not moved`);
+  if (uninspectable.length > 0) {
+    throw new LedgerError(`process(es) ${uninspectable.join(', ')} of this user cannot be inspected, so it cannot be shown that none holds the damaged lock; the lock was not moved`);
+  }
+  const again = damagedLockIdentity(path);
+  if (again.dev !== first.dev || again.ino !== first.ino || again.digest !== first.digest) {
+    throw new LedgerError('the ledger lock changed while it was being checked; the lock was not moved');
+  }
+  const movedTo = `${path}.damaged-${new Date(now).toISOString().replace(/[:.]/g, '-')}`;
+  // link + unlink: never replaces an existing file at the target.
+  linkSync(path, movedTo);
+  unlinkSync(path);
+  syncDirectory(dirname(path));
+  return { movedTo };
 }
 
 // ------------------------------------------------------- the locked writer
@@ -448,6 +688,8 @@ export interface SessionOptions extends ReadLedgerOptions {
 /** The outcome of a commit: the committed digest, and whether the directory fsync completed. */
 export interface CommitResult {
   readonly digest: string;
+  /** The digest of the ledger bytes the commit replaced (null: there was no ledger). */
+  readonly previousDigest: string | null;
   /** False when the ledger rename returned but the directory fsync failed (post-commit). */
   readonly durable: boolean;
   readonly cause?: unknown;
@@ -467,13 +709,14 @@ export class LedgerSession {
   /** A stale publication record removed when the session opened (a crash before its commit point). */
   readonly stale: PublishingRecord | undefined;
   readonly #digest: string | null;
-  readonly #lock: LockRecord;
+  readonly #lock: LockHandle;
   #committed = false;
   #released = false;
+  #releaseStatus: 'released' | 'lost' | 'failed' = 'released';
 
   private constructor(
     path: string,
-    lock: LockRecord,
+    lock: LockHandle,
     bytes: Buffer | null,
     document: LedgerDocument,
     pending: PublishingRecord | undefined,
@@ -515,7 +758,11 @@ export class LedgerSession {
       }
       return new LedgerSession(path, lock, bytes, document, pending, stale);
     } catch (error) {
-      releaseLock(path, lock);
+      try {
+        releaseLock(path, lock);
+      } catch {
+        // Reported through the original error.
+      }
       throw error;
     }
   }
@@ -526,7 +773,7 @@ export class LedgerSession {
   }
 
   get lock(): LockRecord {
-    return this.#lock;
+    return this.#lock.record;
   }
 
   /**
@@ -567,39 +814,73 @@ export class LedgerSession {
 
   /**
    * Write `next` with ONE atomic replace: (with `publishing`) the publication
-   * record, then a digest compare-and-swap against the bytes read under the
-   * lock, the private temp file and its fsync, the rename over the ledger
-   * (the commit point), and the directory fsync. Any failure before the
-   * rename returns throws and leaves the ledger byte-identical. After it
-   * returns, a failed directory fsync is reported as durable: false, never
-   * thrown. At most once per session.
+   * record, then the private temp file and its fsync, a digest
+   * compare-and-swap against the bytes read under the lock right before the
+   * rename over the ledger (the commit point), and the directory fsync. Any
+   * failure before the rename returns throws and leaves the ledger
+   * byte-identical. After it returns, a failed directory fsync is reported as
+   * durable: false, never thrown. At most once per session.
    */
   commit(next: LedgerDocument, options: { readonly publishing?: { readonly staging: string; readonly final: string }; readonly io?: Partial<LedgerIo> } = {}): CommitResult {
-    if (this.#released) throw new StorageUsageError('the ledger session was released');
-    if (this.#committed) throw new StorageUsageError('a ledger session commits at most once');
+    this.#begin();
     if (this.pending !== undefined) throw new StorageUsageError('a pending committed staging must be completed or abandoned first');
-    this.#committed = true;
-    const io = withDefaultIo(options.io);
     const bytes = serialize(next);
     // Validate what is about to be written exactly as a reader will.
     parseDocument(bytes);
+    return this.#replace(bytes, options);
+  }
+
+  /**
+   * Re-commit the ledger's current bytes by a fresh atomic replace (temp
+   * file, fsync, rename, directory fsync), never a bare re-fsync: after an
+   * earlier fsync error a retried fsync can succeed without the entry being
+   * durable. Used by --resync-ledger and --complete-staged; allowed while a
+   * pending committed staging exists (the bytes do not change). At most once
+   * per session, instead of commit().
+   */
+  recommit(io?: Partial<LedgerIo>): CommitResult {
+    this.#begin();
+    const bytes = readLedgerBytes(this.path);
+    if (bytes === null || this.#digest === null) throw missing();
+    if (sha256(bytes) !== this.#digest) throw new LedgerError('the exported-head ledger changed while it was locked (digest mismatch); nothing was written');
+    parseDocument(bytes);
+    return this.#replace(bytes, io === undefined ? {} : { io });
+  }
+
+  #begin(): void {
+    if (this.#released) throw new StorageUsageError('the ledger session was released');
+    if (this.#committed) throw new StorageUsageError('a ledger session commits at most once');
+    this.#committed = true;
+  }
+
+  #replace(bytes: Buffer, options: { readonly publishing?: { readonly staging: string; readonly final: string }; readonly io?: Partial<LedgerIo> }): CommitResult {
+    const io = withDefaultIo(options.io);
     const digest = sha256(bytes);
+    const previousDigest = this.#digest;
     const directory = dirname(this.path);
     const record = publishingPathOf(this.path);
     let recorded = false;
     const temp = join(directory, `.${randomBytes(12).toString('hex')}.tmp`);
     try {
       if (options.publishing !== undefined) {
-        const value = { schema: PUBLISHING_SCHEMA, staging: options.publishing.staging, final: options.publishing.final, ledger_digest: digest, created_at: new Date().toISOString() };
+        const value = {
+          schema: PUBLISHING_SCHEMA,
+          staging: options.publishing.staging,
+          final: options.publishing.final,
+          ledger_digest: digest,
+          previous_digest: previousDigest,
+          created_at: new Date().toISOString(),
+        };
         io.writeFile(record, Buffer.from(canonicalize(value as unknown as JsonValue), 'utf8'));
         recorded = true;
         io.syncDirectory(directory);
       }
+      io.writeFile(temp, bytes);
+      // CAS immediately before the replace (rule 1).
       const current = readLedgerBytes(this.path);
-      if ((current === null ? null : sha256(current)) !== this.#digest) {
+      if ((current === null ? null : sha256(current)) !== previousDigest) {
         throw new LedgerError('the exported-head ledger changed while it was locked (digest mismatch); nothing was written');
       }
-      io.writeFile(temp, bytes);
       io.rename(temp, this.path);
     } catch (error) {
       rmSync(temp, { force: true });
@@ -610,9 +891,9 @@ export class LedgerSession {
     try {
       io.syncDirectory(directory);
     } catch (cause) {
-      return { digest, durable: false, cause };
+      return { digest, previousDigest, durable: false, cause };
     }
-    return { digest, durable: true };
+    return { digest, previousDigest, durable: true };
   }
 
   /** Remove the publication record (after publication, or on abandon). */
@@ -625,17 +906,27 @@ export class LedgerSession {
   }
 
   /**
-   * Release the lock (only if it is still this session's). Best effort: a lock
-   * that cannot be removed stays held and is reported to the next writer.
+   * Release the lock and close its descriptor. 'released': the lock path was
+   * still this session's file and was removed. 'lost': the path was gone or
+   * another file, so it was not unlinked; this is reported as a process
+   * warning (OPENSIG_LEDGER_LOCK_LOST). 'failed': removing it failed after
+   * the identity check (the descriptor is still closed; a lock file left
+   * behind is reported to the next writer with its nonce).
    */
-  release(): void {
-    if (this.#released) return;
+  release(): 'released' | 'lost' | 'failed' {
+    if (this.#released) return this.#releaseStatus;
     this.#released = true;
     try {
-      releaseLock(this.path, this.#lock);
+      this.#releaseStatus = releaseLock(this.path, this.#lock) ? 'released' : 'lost';
     } catch {
-      // The next writer reports the lock and its nonce; see breakLedgerLock.
+      this.#releaseStatus = 'failed';
     }
+    if (this.#releaseStatus === 'lost') {
+      process.emitWarning(`the exported-head ledger lock ${lockPathOf(this.path)} was lost during the session (nonce ${this.#lock.record.nonce}): the lock path was removed or replaced; it was not unlinked`, {
+        code: 'OPENSIG_LEDGER_LOCK_LOST',
+      });
+    }
+    return this.#releaseStatus;
   }
 }
 
@@ -660,12 +951,17 @@ export interface RecordOptions {
   readonly digestAt: (seq: number) => string | undefined;
   /** Create the ledger if it is missing (explicit first runs only). */
   readonly createIfMissing?: boolean;
+  /** Internal seam for failure injection in tests; never exposed by the CLI. */
+  readonly io?: Partial<LedgerIo>;
 }
 
 /**
  * Record that `head` left the system for `tenantId`, through the locked
  * writer path. Requires ancestry; keeps the more advanced head; refuses at
- * once when the ledger is locked.
+ * once when the ledger is locked. When the rename over the ledger returned
+ * but the directory fsync failed, throws LedgerCommitUnsyncedError
+ * (committed-unsynced): the head is recorded but must not be acted on until
+ * --resync-ledger succeeds.
  */
 export function recordExportedHead(path: string, tenantId: string, head: { readonly seq: number; readonly digest: string }, options: RecordOptions): ExportedHead {
   if (!TENANT.test(tenantId)) throw new StorageUsageError('tenant id is malformed');
@@ -676,9 +972,9 @@ export function recordExportedHead(path: string, tenantId: string, head: { reado
     const entry = next.tenants[tenantId];
     if (entry === undefined) throw new LedgerError('the head was not recorded');
     if (session.existed && serialize(next).equals(serialize(session.document))) return entry;
-    const result = session.commit(next);
+    const result = session.commit(next, options.io === undefined ? {} : { io: options.io });
     if (!result.durable) {
-      throw new StorageError('ledger_commit_unsynced', `the head was committed to the ledger (digest ${result.digest}) but the ledger directory fsync failed`, { cause: result.cause });
+      throw new LedgerCommitUnsyncedError(session.path, result.previousDigest, result.digest, `the exported head of tenant ${tenantId} (seq ${entry.seq})`, { cause: result.cause });
     }
     return entry;
   });
