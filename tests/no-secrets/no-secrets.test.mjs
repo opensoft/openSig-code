@@ -655,6 +655,61 @@ test('[NS-09] quoted literals spelt like variable names are reported; unquoted r
   expectNoContent(result, values);
 });
 
+test('[NS-08] a file removed from the index but kept on disk is scanned even when git pairs it with a rename', () => {
+  const repo = newRepo();
+  const bytes = randomBytes(256);
+  put(repo, 'conf/legacy.p12', bytes);
+  put(repo, 'README.md', '# Synthetic repository\n');
+  track(repo, '.');
+  commit(repo);
+  git(repo, 'rm', '-q', '--cached', '--', 'conf/legacy.p12'); // removed from the index, kept on disk
+  put(repo, 'conf/renamed.bin', bytes);
+  track(repo, 'conf/renamed.bin');
+  assert.match(git(repo, 'diff', '--cached', '--name-status', '-M'), /^R\d*\tconf\/legacy\.p12\tconf\/renamed\.bin$/m, 'git pairs the two as a rename');
+  assert.deepEqual(git(repo, 'diff', '--cached', '--name-only', '-M').trim().split('\n'), ['conf/renamed.bin'], 'rename detection lists only the new name');
+  const result = scan(repo);
+  assert.equal(result.code, 1, result.stdout);
+  expectFinding(result, 'pkcs12-content', 'conf/legacy.p12', 'path');
+});
+
+test('[NS-10] a literal that merely contains ${ is reported; only a whole placeholder that would expand is exempt', () => {
+  const repo = newRepo();
+  const dollarBrace = '$' + '{'; // built at run time so this file's own scan sees no sample
+  const alnum = (length) => randomBytes(length * 2).toString('base64').replace(/[^A-Za-z0-9]/g, '').slice(0, length);
+  const parts = Array.from({ length: 8 }, () => alnum(8));
+  const line = (...pieces) => `${pieces.join('')}\n`;
+  const positives = {
+    // An unterminated ${ inside a JSON literal.
+    'conf/unterminated.json': `${JSON.stringify({ password: parts[0] + dollarBrace + parts[1] })}\n`,
+    // Single quotes never expand in a shell file: the whole value is literal text.
+    'scripts/single.sh': line('DB_PASSWORD', "='", dollarBrace, 'NOT_EXPANDED}', parts[2], "'"),
+    'scripts/single-whole.sh': line('API_TOKEN', "='", dollarBrace, 'OPENSIG_API_TOKEN}', "'"),
+    // Double quotes expand, but the literal around the reference remains.
+    'scripts/double-mixed.sh': line('CLIENT_SECRET', '="', dollarBrace, 'PREFIX}', parts[3], '"'),
+    'conf/terminated.json': `${JSON.stringify({ apiKey: parts[4] + dollarBrace + 'X}' })}\n`,
+    // A URL password that only contains a placeholder.
+    'conf/url.yaml': line('url: postgres://svc:', parts[5], dollarBrace, 'X}', parts[6], '@db.example.test/app'),
+  };
+  const negatives = {
+    'conf/whole.json': `${JSON.stringify({ password: `${dollarBrace}OPENSIG_DB_PASSWORD}` })}\n`,
+    'scripts/whole.sh': [
+      line('DB_PASSWORD', '="', dollarBrace, 'OPENSIG_DB_PASSWORD}', '"'),
+      line('API_KEY', '=', dollarBrace, 'OPENSIG_API_KEY}'),
+      line('X_SECRET', '=$(openssl rand -hex 32)'),
+      line('Z_PASSWORD', '=$HOME/.config/synthetic'),
+    ].join(''),
+    'deploy/compose.yaml': line('api_key: ', "'", dollarBrace, 'OPENSIG_API_KEY}', "'"),
+    'conf/url-whole.yaml': line('url: postgres://svc:', dollarBrace, 'OPENSIG_DB_PASSWORD}', '@db.example.test/app'),
+  };
+  for (const [file, content] of Object.entries({ ...positives, ...negatives })) put(repo, file, content);
+  track(repo, '.');
+  const result = scan(repo);
+  assert.equal(result.code, 1);
+  for (const file of Object.keys(positives)) expectFinding(result, 'secret-assignment', file, 'index');
+  for (const file of Object.keys(negatives)) expectNoFinding(result, file);
+  expectNoContent(result, parts.slice(0, 7));
+});
+
 test('staged and working-tree content of tracked files is scanned; untracked files are not', () => {
   const repo = newRepo();
   put(repo, 'conf/app.yaml', 'mode: development\n');

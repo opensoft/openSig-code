@@ -5,11 +5,14 @@
 //
 //   node scripts/no-secrets.mjs [repository-dir]
 //
-// Paths scanned: `git ls-files` plus `git diff --cached --name-only`. For each
-// path the staged (index) content is scanned and, where it differs, the
-// working-tree content too. Untracked files are not scanned. A path removed
-// from both the index and the working tree (a staged deletion) is skipped:
-// nothing of it remains to commit. A copy left in either place is scanned.
+// Paths scanned: `git ls-files` plus `git diff --cached --name-only
+// --no-renames`. For each path the staged (index) content is scanned and,
+// where it differs, the working-tree content too. Other untracked files are
+// not scanned. A path removed from both the index and the working tree (a
+// staged deletion) is skipped: nothing of it remains to commit. A listed path
+// still in the index, or still present in the working tree, is scanned; with
+// --no-renames that includes a file removed from the index but kept on disk,
+// which git's rename detection would otherwise report only under its new name.
 //
 // Rules (stable names):
 //   private-key-pem    PEM private-key blocks of any type: on their own lines,
@@ -31,8 +34,10 @@
 //                      A quoted value is always a literal, even when spelt
 //                      like a variable name; only unquoted values can be
 //                      variable references (OTHER_VAR, process.env.X).
-//                      Interpolation placeholders (${VAR}, $VAR, $(cmd),
-//                      {{x}}) are never literals.
+//                      A value that is wholly one placeholder (${VAR}, $VAR,
+//                      $(cmd), {{x}}) is exempt only where it would expand
+//                      (unquoted, double-quoted, or outside shell and .env
+//                      files); a value that merely contains ${ is a literal.
 //
 // Content encodings. The PEM and PKCS#12 rules run on every file, binary or
 // not, and also on its UTF-16 decoding whenever it contains a NUL byte. Text
@@ -87,8 +92,9 @@ function indexEntries(root) {
   return entries;
 }
 
+/** Paths with staged changes. --no-renames lists both sides of a rename, so a removed path is never hidden behind its new name. */
 function stagedPaths(root) {
-  return git(root, ['diff', '--cached', '--name-only', '-z']).toString('utf8').split('\0').filter(Boolean);
+  return git(root, ['diff', '--cached', '--name-only', '--no-renames', '-z']).toString('utf8').split('\0').filter(Boolean);
 }
 
 /** Read blob contents by object id through one `git cat-file --batch` call. */
@@ -415,7 +421,9 @@ const TYPE_TERM = String.raw`&?(?:'[A-Za-z_]+[ \t]+)?(?:mut[ \t]+)?[A-Za-z_$][\w
 const TYPE = String.raw`${TYPE_TERM}(?:[ \t]*\|[ \t]*${TYPE_TERM})*`;
 
 // A value: double-quoted, single-quoted, backtick (no interpolation) or bare.
-const VALUE = String.raw`(?:"((?:[^"\\\r\n]|\\.)*)"|'((?:[^'\\\r\n]|\\.)*)'|` + '`((?:[^`\\\\\\r\\n$]|\\\\.)*)`' + String.raw`|([^\s"'` + '`' + String.raw`,;#&|)\]}]+))`;
+// A bare value may hold balanced ${...} groups (up to 256 characters each), so
+// an unquoted ${NAME} is read whole rather than cut before its closing brace.
+const VALUE = String.raw`(?:"((?:[^"\\\r\n]|\\.)*)"|'((?:[^'\\\r\n]|\\.)*)'|` + '`((?:[^`\\\\\\r\\n$]|\\\\.)*)`' + String.raw`|((?:\$\{[^{}\s]{0,256}\}|[^\s"'` + '`' + String.raw`,;#&|)\]}])+))`;
 
 // An optional "-" or "--" flag prefix, NAME (optionally quoted, optionally
 // followed by TypeScript "?" or "!"), then an operator: Go ":=", a typed
@@ -439,16 +447,23 @@ const BARE_VALUE_EXTENSIONS = new Set(['', '.ini', '.cfg', '.conf', '.properties
 // Files where a backtick is shell command substitution, not a string literal.
 const SHELL_EXTENSIONS = new Set(['', '.sh', '.bash', '.zsh']);
 
-// Interpolation placeholders: they expand even inside quotes (${VAR}, $(command),
-// $VAR, {{name}}, <name>, %VAR%), so they never count as literals.
-const PLACEHOLDER_VALUE = /^(?:\$\{[^}]*\}|\$\(.*\)|\$[A-Za-z_][A-Za-z0-9_]*|\{\{.*\}\}|<[^>]*>|%[A-Za-z_][A-Za-z0-9_]*%)$/;
+// A value that is wholly one interpolation placeholder: ${NAME}, $NAME,
+// $(command), {{name}}, <name> or %NAME%. Each form excludes its own closing
+// bracket, so `${a}literal${b}` or `$(a)literal$(b)` is not "wholly" one.
+// Such a value is exempt only where it would be expanded (NS-10): unquoted,
+// double-quoted, or in a file that is not shell-like (YAML, JSON, TypeScript,
+// templates), never single-quoted in a shell or .env file, where it is a
+// literal. A value that merely contains ${ is a literal.
+const PLACEHOLDER_VALUE = /^(?:\$\{[^{}]*\}|\$\([^()]*\)|\$[A-Za-z_][A-Za-z0-9_]*|\{\{[^{}]*\}\}|<[^<>]*>|%[A-Za-z_][A-Za-z0-9_]*%)$/;
+// Unquoted only: a command substitution cut at its first space by the value
+// tokenizer ($(openssl rand -hex 32) reads as "$(openssl"), and a variable
+// followed by a path ($HOME/.config/x; no braces).
+const BARE_SUBSTITUTION = /^\$\(/;
+const VARIABLE_PATH = /^\$[A-Za-z_][A-Za-z0-9_]*\/[^\s]*$/;
 // Variable references: only an unquoted value can refer to another variable
 // (OTHER_VAR, process.env.X, import.meta.env.X). Quoted, the same spelling is
 // a literal string (Codex [3], NS-09).
 const REFERENCE_EXPRESSION = /^(?:process\.env|import\.meta\.env)\b/;
-// A shell expansion or command substitution at the start of a value ($VAR,
-// ${VAR}, $(command)), even when an unquoted value is cut at its first space.
-const EXPANSION_PREFIX = /^\$[A-Za-z_({]/;
 const PLACEHOLDER_WORDS = /example|placeholder|redacted|changeme|change[_-]me|replace[_-]?me|your[_-]|dummy|sample|not[_-]?a[_-]?secret|xxxx|\*\*\*\*/i;
 
 function normalizeName(name) {
@@ -473,16 +488,24 @@ function namesVariable(value) {
   return value.includes('_') || (value.length < 16 && !/[0-9]/.test(value));
 }
 
+/** Whether a value written with `quote` (null, 'double', 'single' or 'backtick') would be expanded. */
+function expands(quote, shell) {
+  return quote === null || quote === 'double' || !shell;
+}
+
 /**
  * Whether `value`, assigned to secret name `name`, is a literal secret.
- * `quoted` says whether the value was written inside quotes: a variable
- * reference is exempt only when it is unquoted.
+ * `quote` is how the value was written (null when unquoted, else 'double',
+ * 'single' or 'backtick') and `shell` whether the file is shell-like. A
+ * variable reference is exempt only unquoted (NS-09); a placeholder only when
+ * it is the whole value and would be expanded there (NS-10).
  */
-function isLiteralSecret(value, name, { quoted }) {
+function isLiteralSecret(value, name, { quote, shell }) {
   if (value.length < 8) return false;
-  if (value.includes('${') || EXPANSION_PREFIX.test(value)) return false;
-  if (PLACEHOLDER_VALUE.test(value) || PLACEHOLDER_WORDS.test(value)) return false;
-  if (!quoted && (namesVariable(value) || REFERENCE_EXPRESSION.test(value))) return false;
+  if (expands(quote, shell) && PLACEHOLDER_VALUE.test(value)) return false;
+  if (quote === null && (BARE_SUBSTITUTION.test(value) || VARIABLE_PATH.test(value))) return false;
+  if (PLACEHOLDER_WORDS.test(value)) return false;
+  if (quote === null && (namesVariable(value) || REFERENCE_EXPRESSION.test(value))) return false;
   if (/^(?:true|false|null|none|undefined)$/i.test(value)) return false;
   if (value.toLowerCase() === name.toLowerCase()) return false;
   return true;
@@ -490,7 +513,7 @@ function isLiteralSecret(value, name, { quoted }) {
 
 function isLiteralUrlPassword(user, password) {
   if (password.length < 4 || /^\d{1,5}$/.test(password)) return false; // too short, or host:port
-  if (password.includes('${') || EXPANSION_PREFIX.test(password) || PLACEHOLDER_VALUE.test(password) || REFERENCE_EXPRESSION.test(password)) return false;
+  if (PLACEHOLDER_VALUE.test(password) || REFERENCE_EXPRESSION.test(password)) return false; // wholly a placeholder (NS-10)
   if (PLACEHOLDER_WORDS.test(password) || URL_PASSWORD_PLACEHOLDER.test(password)) return false;
   return password.toLowerCase() !== user.toLowerCase();
 }
@@ -518,14 +541,16 @@ function assignmentIndexes(text, { bare, shell }) {
     const backtick = match[7];
     if (backtick !== undefined && shell) continue; // shell command substitution
     const quoted = match[5] ?? match[6] ?? backtick;
+    const quote = match[5] !== undefined ? 'double' : match[6] !== undefined ? 'single' : backtick !== undefined ? 'backtick' : null;
     const bareCounts = bare || (flag !== undefined && operator === '=');
     const value = quoted ?? (bareCounts ? match[8] : undefined);
-    if (value === undefined || !isLiteralSecret(value, name, { quoted: quoted !== undefined })) continue;
+    if (value === undefined || !isLiteralSecret(value, name, { quote, shell })) continue;
     if (add(match.index)) return indexes;
   }
   for (const match of text.matchAll(GO_TYPED)) {
     const value = match[2] ?? match[3];
-    if (!isSecretName(match[1]) || !isLiteralSecret(value, match[1], { quoted: true })) continue;
+    const quote = match[2] !== undefined ? 'double' : 'backtick';
+    if (!isSecretName(match[1]) || !isLiteralSecret(value, match[1], { quote, shell })) continue;
     if (add(match.index)) return indexes;
   }
   for (const match of text.matchAll(URL_CREDENTIALS)) {
@@ -643,7 +668,9 @@ export function scanRepository(dir) {
   for (const path of paths) {
     // A path removed from both the index and the working tree (a staged
     // deletion) has nothing left to commit, so no rule applies to it (Codex
-    // [4], NS-08). A copy left in either place is still scanned.
+    // [4], NS-08). A listed path still in the index or still on disk is
+    // scanned; stagedPaths uses --no-renames so a path removed from the index
+    // but kept on disk is listed even when git would pair it with a rename.
     if (!byPath.has(path) && !existsInWorktree(root, path)) continue;
     scanned += 1;
     for (const finding of pathFindings(path)) add({ ...finding, file: path, source: 'path' });
