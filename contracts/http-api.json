@@ -1,0 +1,4500 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "openSig Corporate Signing MVP",
+    "version": "0.2.2-draft",
+    "license": {
+      "name": "Apache-2.0",
+      "identifier": "Apache-2.0"
+    },
+    "description": "Proposed contract (draft 0.2, 2026-11-08); no deployed endpoint is claimed. Tenant comes from the verified principal, never from a body or path. Operator principals are classified by configured claim mapping as human-operator (roles sender, tenant_admin) or service (role service; e.g. Hermes, openChart, openPractice). No operator browser session exists in the MVP: operator clients send bearer tokens; JWKS come from configuration only; algorithms, issuer, audience and clock skew are pinned. Recipients use a separate cookie scheme after invitation plus mailbox challenge. No capability value (invitation, code, session, CSRF token) ever appears in a URL path, query, redirect, Referer or log; the invitation is carried in the mailed link's URL fragment. Cross-tenant absence and inaccessibility are both 404. Every 4xx body is Error. The role-by-operation matrix is x-opensig-role-matrix; the Hermes tool mapping is x-opensig-hermes-tools."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8443",
+      "description": "Local synthetic development only (loopback bind)"
+    }
+  ],
+  "tags": [
+    {
+      "name": "envelopes"
+    },
+    {
+      "name": "recipient"
+    },
+    {
+      "name": "artifacts"
+    },
+    {
+      "name": "webhooks"
+    }
+  ],
+  "x-opensig-role-definitions": {
+    "sender": "human operator who prepares and sends envelopes",
+    "tenant_admin": "human operator who administers webhooks and finalization retries",
+    "service": "non-human principal (Hermes, healthcare adapters); can never confirm sends, approve, register callbacks or void",
+    "recipient": "bound recipient session (cookie); the only principal that can approve or decline",
+    "anonymous": "unauthenticated; static shell and challenge/session creation only"
+  },
+  "x-opensig-role-matrix": {
+    "createEnvelope": {
+      "roles": [
+        "sender",
+        "service"
+      ],
+      "scopes": [
+        "envelopes:write"
+      ]
+    },
+    "readEnvelope": {
+      "roles": [
+        "sender",
+        "tenant_admin",
+        "service"
+      ],
+      "scopes": [
+        "envelopes:read"
+      ]
+    },
+    "uploadDocument": {
+      "roles": [
+        "sender",
+        "service"
+      ],
+      "scopes": [
+        "envelopes:write"
+      ]
+    },
+    "prepareEnvelope": {
+      "roles": [
+        "sender",
+        "service"
+      ],
+      "scopes": [
+        "envelopes:write"
+      ]
+    },
+    "readRecipientPreview": {
+      "roles": [
+        "sender",
+        "tenant_admin",
+        "service"
+      ],
+      "scopes": [
+        "envelopes:read"
+      ]
+    },
+    "confirmSend": {
+      "roles": [
+        "sender",
+        "tenant_admin"
+      ],
+      "scopes": [
+        "envelopes:confirm-send"
+      ]
+    },
+    "sendEnvelope": {
+      "roles": [
+        "sender",
+        "service"
+      ],
+      "scopes": [
+        "envelopes:send"
+      ]
+    },
+    "voidEnvelope": {
+      "roles": [
+        "sender",
+        "tenant_admin"
+      ],
+      "scopes": [
+        "envelopes:void"
+      ]
+    },
+    "reissueEnvelope": {
+      "roles": [
+        "sender",
+        "tenant_admin"
+      ],
+      "scopes": [
+        "envelopes:write"
+      ]
+    },
+    "resendInvitation": {
+      "roles": [
+        "sender",
+        "tenant_admin"
+      ],
+      "scopes": [
+        "envelopes:send"
+      ]
+    },
+    "retryFinalization": {
+      "roles": [
+        "tenant_admin"
+      ],
+      "scopes": [
+        "finalization:retry"
+      ]
+    },
+    "readVerification": {
+      "roles": [
+        "sender",
+        "tenant_admin",
+        "service"
+      ],
+      "scopes": [
+        "artifacts:read"
+      ]
+    },
+    "downloadFinalPdf": {
+      "roles": [
+        "sender",
+        "tenant_admin",
+        "service"
+      ],
+      "scopes": [
+        "artifacts:read"
+      ]
+    },
+    "downloadPackage": {
+      "roles": [
+        "sender",
+        "tenant_admin",
+        "service"
+      ],
+      "scopes": [
+        "artifacts:read"
+      ]
+    },
+    "createWebhookRegistration": {
+      "roles": [
+        "tenant_admin"
+      ],
+      "scopes": [
+        "webhooks:admin"
+      ]
+    },
+    "readWebhookRegistration": {
+      "roles": [
+        "tenant_admin"
+      ],
+      "scopes": [
+        "webhooks:admin"
+      ]
+    },
+    "disableWebhookRegistration": {
+      "roles": [
+        "tenant_admin"
+      ],
+      "scopes": [
+        "webhooks:admin"
+      ]
+    },
+    "rotateWebhookKey": {
+      "roles": [
+        "tenant_admin"
+      ],
+      "scopes": [
+        "webhooks:admin"
+      ]
+    },
+    "revokeWebhookKey": {
+      "roles": [
+        "tenant_admin"
+      ],
+      "scopes": [
+        "webhooks:admin"
+      ]
+    },
+    "openReviewShell": {
+      "roles": [
+        "anonymous"
+      ],
+      "scopes": []
+    },
+    "requestChallenge": {
+      "roles": [
+        "anonymous"
+      ],
+      "scopes": []
+    },
+    "createRecipientSession": {
+      "roles": [
+        "anonymous"
+      ],
+      "scopes": []
+    },
+    "readRecipientSession": {
+      "roles": [
+        "recipient"
+      ],
+      "scopes": []
+    },
+    "endRecipientSession": {
+      "roles": [
+        "recipient"
+      ],
+      "scopes": []
+    },
+    "readRecipientDocument": {
+      "roles": [
+        "recipient"
+      ],
+      "scopes": []
+    },
+    "readRecipientManifest": {
+      "roles": [
+        "recipient"
+      ],
+      "scopes": []
+    },
+    "approveAsHuman": {
+      "roles": [
+        "recipient"
+      ],
+      "scopes": []
+    },
+    "declineAsRecipient": {
+      "roles": [
+        "recipient"
+      ],
+      "scopes": []
+    }
+  },
+  "x-opensig-hermes-tools": {
+    "prepare_envelope": {
+      "operations": [
+        "createEnvelope",
+        "uploadDocument",
+        "prepareEnvelope",
+        "readRecipientPreview"
+      ],
+      "returns": "envelope id, version, document_digest, manifest_digest, recipients_digest and the recipient preview"
+    },
+    "request_signatures": {
+      "operations": [
+        "sendEnvelope"
+      ],
+      "inputs": "envelope id, expected_version, authorization_reference (a human operator's SendConfirmation for this exact version and digests)",
+      "returns": "envelope status only; never invitation links, codes or mail content"
+    },
+    "get_status": {
+      "operations": [
+        "readEnvelope"
+      ]
+    },
+    "retrieve_completed_package": {
+      "operations": [
+        "downloadPackage",
+        "readVerification"
+      ]
+    },
+    "never_exposed": [
+      "approveAsHuman",
+      "declineAsRecipient",
+      "createRecipientSession",
+      "requestChallenge",
+      "confirmSend",
+      "createWebhookRegistration",
+      "rotateWebhookKey",
+      "voidEnvelope",
+      "retryFinalization"
+    ]
+  },
+  "paths": {
+    "/v1/envelopes": {
+      "post": {
+        "operationId": "createEnvelope",
+        "summary": "Create a draft envelope with declared recipients",
+        "tags": [
+          "envelopes"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "envelopes:write"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "service"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnvelopeCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created; recipient IDs are server-generated and returned with their ordinals",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "get": {
+        "operationId": "readEnvelope",
+        "summary": "Read envelope status, recipients and artifact summary",
+        "tags": [
+          "envelopes"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "envelopes:read"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "tenant_admin",
+          "service"
+        ],
+        "responses": {
+          "200": {
+            "description": "Envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/document": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "put": {
+        "operationId": "uploadDocument",
+        "summary": "Upload or replace the single PDF while in draft",
+        "tags": [
+          "envelopes"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "envelopes:write"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "service"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/pdf": {
+              "schema": {
+                "type": "string",
+                "contentMediaType": "application/pdf",
+                "description": "At most 10 MiB (streaming cap) and 50 pages; parsed only in the isolated parse service; draft only; pages with an effective CropBox different from the MediaBox are rejected (cropbox_differs)"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Document accepted after isolated parsing; page geometry returned for field placement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/prepare": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "post": {
+        "operationId": "prepareEnvelope",
+        "summary": "Validate fields and freeze document and field manifest",
+        "tags": [
+          "envelopes"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "envelopes:write"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "service"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Prepare"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Prepared; document_digest and manifest_digest frozen",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/preview": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "get": {
+        "operationId": "readRecipientPreview",
+        "summary": "Read the recipient/document preview a human confirms before sending",
+        "tags": [
+          "envelopes"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "envelopes:read"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "tenant_admin",
+          "service"
+        ],
+        "responses": {
+          "200": {
+            "description": "Preview of a prepared envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecipientPreview"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/send-confirmations": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "post": {
+        "operationId": "confirmSend",
+        "summary": "Human operator confirms the recipient preview (creates an authorization_reference)",
+        "tags": [
+          "envelopes"
+        ],
+        "description": "Rejected with 403 for any service principal, including Hermes. Digests must equal the current preview.",
+        "security": [
+          {
+            "operatorOAuth": [
+              "envelopes:confirm-send"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "tenant_admin"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendConfirmationCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Confirmation recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendConfirmation"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/send": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "post": {
+        "operationId": "sendEnvelope",
+        "summary": "Send: mail the first recipient's invitation (mail only; nothing returned to the caller)",
+        "tags": [
+          "envelopes"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "envelopes:send"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "service"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Send"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Sent; recipient 1 invited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/void": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "post": {
+        "operationId": "voidEnvelope",
+        "summary": "Void before the finalization reservation (409 once finalizing or completed)",
+        "tags": [
+          "envelopes"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "envelopes:void"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "tenant_admin"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Void"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Voided; outstanding sessions and invitations revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/reissue": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "post": {
+        "operationId": "reissueEnvelope",
+        "summary": "Create a new draft linked to a declined, expired or voided envelope",
+        "tags": [
+          "envelopes"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "envelopes:write"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "tenant_admin"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VersionOnly"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "New draft envelope (reissue_of set); copies source, recipients and document, never approvals",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/recipients/{recipient_id}/resend-invitation": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        },
+        {
+          "$ref": "#/components/parameters/RecipientId"
+        }
+      ],
+      "post": {
+        "operationId": "resendInvitation",
+        "summary": "Revoke the current-turn recipient's outstanding invitation and sessions and mail a new invitation",
+        "tags": [
+          "envelopes"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "envelopes:send"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "tenant_admin"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VersionOnly"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted (generic)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Accepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/finalization/retry": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "post": {
+        "operationId": "retryFinalization",
+        "summary": "Retry finalization only from job_status retryable or failed (else 409 finalization_not_retryable)",
+        "tags": [
+          "artifacts"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "finalization:retry"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "tenant_admin"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VersionOnly"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Retry scheduled; never creates approvals",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/verification": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "get": {
+        "operationId": "readVerification",
+        "summary": "Read the stored verification report of the completed artifact",
+        "tags": [
+          "artifacts"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "artifacts:read"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "tenant_admin",
+          "service"
+        ],
+        "responses": {
+          "200": {
+            "description": "Verification report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerificationReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/final-pdf": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "get": {
+        "operationId": "downloadFinalPdf",
+        "summary": "Download final.pdf exact bytes (completed only)",
+        "tags": [
+          "artifacts"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "artifacts:read"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "tenant_admin",
+          "service"
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact sealed bytes; ETag is the quoted artifact_digest",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "contentMediaType": "application/pdf"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/envelopes/{envelope_id}/package": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/EnvelopeId"
+        }
+      ],
+      "get": {
+        "operationId": "downloadPackage",
+        "summary": "Download the evidence package ZIP (completed only)",
+        "tags": [
+          "artifacts"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "artifacts:read"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "sender",
+          "tenant_admin",
+          "service"
+        ],
+        "responses": {
+          "200": {
+            "description": "ZIP of final.pdf, approval-manifest.json (ApprovalManifest), audit-receipt.json (AuditReceipt), verification.json (VerificationReport) and package-index.json (PackageIndex); ETag is the quoted package_digest. Never contains keys, tokens or codes.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/zip": {
+                "schema": {
+                  "type": "string",
+                  "contentMediaType": "application/zip"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/webhook-registrations": {
+      "post": {
+        "operationId": "createWebhookRegistration",
+        "summary": "Register an HTTPS callback (human tenant administrators only)",
+        "tags": [
+          "webhooks"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "webhooks:admin"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "tenant_admin"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookRegistrationCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Registration and first signing key (secret shown once)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookRegistrationCreated"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/webhook-registrations/{registration_id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/RegistrationId"
+        }
+      ],
+      "get": {
+        "operationId": "readWebhookRegistration",
+        "summary": "Read a registration (no secrets)",
+        "tags": [
+          "webhooks"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "webhooks:admin"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "tenant_admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Registration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookRegistration"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "disableWebhookRegistration",
+        "summary": "Disable a registration and revoke its keys",
+        "tags": [
+          "webhooks"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "webhooks:admin"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "tenant_admin"
+        ],
+        "responses": {
+          "204": {
+            "description": "Disabled"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/webhook-registrations/{registration_id}/keys": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/RegistrationId"
+        }
+      ],
+      "post": {
+        "operationId": "rotateWebhookKey",
+        "summary": "Issue a new HMAC key; the previous key stays valid for overlap_seconds",
+        "tags": [
+          "webhooks"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "webhooks:admin"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "tenant_admin"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookKeyRotate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "New key (secret shown once)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookKeyIssued"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/webhook-registrations/{registration_id}/keys/{key_id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/RegistrationId"
+        },
+        {
+          "$ref": "#/components/parameters/KeyId"
+        }
+      ],
+      "delete": {
+        "operationId": "revokeWebhookKey",
+        "summary": "Revoke one signing key immediately",
+        "tags": [
+          "webhooks"
+        ],
+        "security": [
+          {
+            "operatorOAuth": [
+              "webhooks:admin"
+            ]
+          }
+        ],
+        "x-opensig-roles": [
+          "tenant_admin"
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/sign": {
+      "get": {
+        "operationId": "openReviewShell",
+        "summary": "Static review shell; the invitation travels only in the URL fragment (#i=...)",
+        "tags": [
+          "recipient"
+        ],
+        "security": [],
+        "x-opensig-roles": [
+          "anonymous"
+        ],
+        "responses": {
+          "200": {
+            "description": "Static HTML shell with strict CSP (no inline script or eval), frame-ancestors 'none' and Referrer-Policy no-referrer. GET, HEAD and prefetch never consume, approve or change state.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/recipient-session/challenges": {
+      "post": {
+        "operationId": "requestChallenge",
+        "summary": "Mail a challenge code for an invitation (generic response; no enumeration)",
+        "tags": [
+          "recipient"
+        ],
+        "description": "Rate-limited per invitation and per client address. A new code supersedes the previous one. Codes expire after 10 minutes.",
+        "security": [],
+        "x-opensig-roles": [
+          "anonymous"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChallengeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted (generic, whether or not the invitation is valid)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Accepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/recipient-session": {
+      "post": {
+        "operationId": "createRecipientSession",
+        "summary": "Exchange invitation plus challenge code for a bound recipient session",
+        "tags": [
+          "recipient"
+        ],
+        "description": "Five wrong codes lock the current challenge; twenty wrong codes per invitation over its lifetime revoke the invitation (resend required). Failures are generic 401.",
+        "security": [],
+        "x-opensig-roles": [
+          "anonymous"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Session created; Set-Cookie __Host-opensig_rs (HttpOnly; Secure; SameSite=Strict; Path=/)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecipientSessionState"
+                }
+              }
+            },
+            "headers": {
+              "Set-Cookie": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "get": {
+        "operationId": "readRecipientSession",
+        "summary": "Read the bound review state and every approval input",
+        "tags": [
+          "recipient"
+        ],
+        "security": [
+          {
+            "recipientSession": []
+          }
+        ],
+        "x-opensig-roles": [
+          "recipient"
+        ],
+        "responses": {
+          "200": {
+            "description": "Bound session state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecipientSessionState"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "endRecipientSession",
+        "summary": "End the session and clear the cookie",
+        "tags": [
+          "recipient"
+        ],
+        "security": [
+          {
+            "recipientSession": []
+          }
+        ],
+        "x-opensig-roles": [
+          "recipient"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Ended"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/v1/recipient-session/document": {
+      "get": {
+        "operationId": "readRecipientDocument",
+        "summary": "Exact frozen PDF bytes bound to the session",
+        "tags": [
+          "recipient"
+        ],
+        "security": [
+          {
+            "recipientSession": []
+          }
+        ],
+        "x-opensig-roles": [
+          "recipient"
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact frozen bytes; SHA-256 equals RecipientSessionState.document.digest. Cache-Control no-store; Content-Disposition inline; this response alone allows frame-ancestors 'self' so the shell can embed the browser's PDF viewer.",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "contentMediaType": "application/pdf"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/recipient-session/manifest": {
+      "get": {
+        "operationId": "readRecipientManifest",
+        "summary": "Canonical frozen field manifest bound to the session",
+        "tags": [
+          "recipient"
+        ],
+        "security": [
+          {
+            "recipientSession": []
+          }
+        ],
+        "x-opensig-roles": [
+          "recipient"
+        ],
+        "responses": {
+          "200": {
+            "description": "Canonical manifest; SHA-256 of these exact bytes equals manifest_digest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FieldManifest"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/recipient-session/approval": {
+      "post": {
+        "operationId": "approveAsHuman",
+        "summary": "Approve as the bound recipient (recipient session only)",
+        "tags": [
+          "recipient"
+        ],
+        "description": "No operator or service credential can call this (401). Out-of-order, stale version, digest or consent mismatch: 409 with no approval recorded.",
+        "security": [
+          {
+            "recipientSession": []
+          }
+        ],
+        "x-opensig-roles": [
+          "recipient"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Approval"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Approval recorded (or the original receipt for an exact retry)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/v1/recipient-session/decline": {
+      "post": {
+        "operationId": "declineAsRecipient",
+        "summary": "Decline as the bound recipient",
+        "tags": [
+          "recipient"
+        ],
+        "security": [
+          {
+            "recipientSession": []
+          }
+        ],
+        "x-opensig-roles": [
+          "recipient"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Decline"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Generic outcome",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeclineOutcome"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    }
+  },
+  "webhooks": {
+    "envelopeEvent": {
+      "post": {
+        "operationId": "deliverEnvelopeEvent",
+        "summary": "Signed, replay-safe callback to a registered HTTPS destination",
+        "description": "HMAC-SHA256 over '<timestamp>.<raw body>' with the registration key named by X-OpenSig-Key-Id. Consumers reject timestamps older than 5 minutes, deduplicate event_id for at least the 72-hour maximum retry horizon, and fetch canonical status with their own credential before acting.",
+        "parameters": [
+          {
+            "name": "X-OpenSig-Signature",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^v1=[0-9a-f]{64}$"
+            }
+          },
+          {
+            "name": "X-OpenSig-Timestamp",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{10}$"
+            }
+          },
+          {
+            "name": "X-OpenSig-Key-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{16,64}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Acknowledged; any other status or a timeout schedules a bounded retry with the same event_id"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Every 4xx/5xx body. Messages are generic; no token, cookie, code, key, PDF content or other-tenant fact appears.",
+        "properties": {
+          "code": {
+            "enum": [
+              "invalid_request",
+              "unauthenticated",
+              "forbidden",
+              "not_found",
+              "version_conflict",
+              "state_conflict",
+              "order_conflict",
+              "idempotency_conflict",
+              "confirmation_required",
+              "confirmation_invalid",
+              "not_completed",
+              "payload_too_large",
+              "unsupported_media_type",
+              "unsupported_pdf",
+              "field_out_of_bounds",
+              "unsupported_characters",
+              "rate_limited",
+              "locked",
+              "csrf_failed",
+              "origin_rejected",
+              "digest_mismatch",
+              "consent_mismatch",
+              "finalization_not_retryable",
+              "destination_not_allowed",
+              "precondition_required",
+              "internal"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "correlation_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{8,64}$"
+          },
+          "details": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "field": {
+                  "type": "string",
+                  "maxLength": 100
+                },
+                "code": {
+                  "type": "string",
+                  "maxLength": 60
+                }
+              },
+              "required": [
+                "field",
+                "code"
+              ]
+            }
+          }
+        },
+        "required": [
+          "code",
+          "correlation_id"
+        ]
+      },
+      "Source": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "app": {
+            "enum": [
+              "hermes",
+              "openchart",
+              "openpractice",
+              "manual"
+            ]
+          },
+          "record": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "version": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "required": [
+          "app",
+          "record",
+          "version"
+        ]
+      },
+      "RecipientInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Operator-declared recipient. The operator confirms the role; mailbox control is the only assurance collected.",
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 254
+          },
+          "role": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "ordinal": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2
+          }
+        },
+        "required": [
+          "email",
+          "role",
+          "ordinal"
+        ]
+      },
+      "EnvelopeCreate": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Tenant comes from the verified principal, never from the body. Ordinals must be exactly 1 or 1..2 without gaps.",
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/Source"
+          },
+          "recipients": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {
+              "$ref": "#/components/schemas/RecipientInput"
+            }
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Optional; default created_at + 7 days; at most created_at + 30 days. Invitations expire at the earlier of 7 days after sending and this time."
+          }
+        },
+        "required": [
+          "source",
+          "recipients"
+        ]
+      },
+      "PrincipalRef": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "human-operator",
+              "service"
+            ]
+          },
+          "ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Opaque tenant-scoped principal reference, not the raw token subject"
+          }
+        },
+        "required": [
+          "kind",
+          "ref"
+        ]
+      },
+      "PageGeometry": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Displayed page size after applying /Rotate, in PDF points. Pages whose effective (inherited) CropBox differs from the MediaBox are rejected at upload (422 unsupported_pdf, detail cropbox_differs), so the displayed page always equals the MediaBox with /Rotate applied.",
+        "properties": {
+          "number": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50
+          },
+          "width": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "height": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "rotate": {
+            "enum": [
+              0,
+              90,
+              180,
+              270
+            ]
+          }
+        },
+        "required": [
+          "number",
+          "width",
+          "height",
+          "rotate"
+        ]
+      },
+      "DocumentSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10485760
+          },
+          "pages": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50,
+            "items": {
+              "$ref": "#/components/schemas/PageGeometry"
+            }
+          }
+        },
+        "required": [
+          "digest",
+          "bytes",
+          "pages"
+        ]
+      },
+      "Rect": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Normalized to the displayed (rotation-applied) page: origin top-left, x rightward, y downward, each value in [0,1]; x+width<=1 and y+height<=1 are enforced by the server (422 field_out_of_bounds). The server maps to PDF user space using the page's /Rotate and /MediaBox; pages with an effective CropBox different from the MediaBox never reach preparation (rejected at upload with detail cropbox_differs).",
+        "properties": {
+          "x": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "y": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "width": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 1
+          },
+          "height": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "width",
+          "height"
+        ]
+      },
+      "FieldInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Fields reference recipients by their declared ordinal, which the client already knows (fixes the unresolvable recipient_id).",
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]{1,40}$",
+            "description": "Unique within the envelope; keys field_values"
+          },
+          "recipient_ordinal": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50
+          },
+          "type": {
+            "enum": [
+              "signature",
+              "date"
+            ]
+          },
+          "rect": {
+            "$ref": "#/components/schemas/Rect"
+          }
+        },
+        "required": [
+          "key",
+          "recipient_ordinal",
+          "page",
+          "type",
+          "rect"
+        ]
+      },
+      "Field": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]{1,40}$"
+          },
+          "recipient_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "recipient_ordinal": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50
+          },
+          "type": {
+            "enum": [
+              "signature",
+              "date"
+            ]
+          },
+          "rect": {
+            "$ref": "#/components/schemas/Rect"
+          }
+        },
+        "required": [
+          "key",
+          "recipient_id",
+          "recipient_ordinal",
+          "page",
+          "type",
+          "rect"
+        ]
+      },
+      "FieldManifest": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Canonical field manifest frozen at prepare. manifest_digest = SHA-256 of its canonical JSON (keys sorted, UTF-8, no insignificant whitespace, numbers in shortest round-trip form).",
+        "properties": {
+          "schema": {
+            "const": "opensig.field-manifest/1"
+          },
+          "envelope_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "document_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "fields": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/components/schemas/Field"
+            }
+          }
+        },
+        "required": [
+          "schema",
+          "envelope_id",
+          "document_digest",
+          "fields"
+        ]
+      },
+      "Prepare": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Validates the uploaded PDF and fields, then freezes the document and the field manifest (state prepared). Each recipient needs at least one signature field.",
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "fields": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/components/schemas/FieldInput"
+            }
+          }
+        },
+        "required": [
+          "expected_version",
+          "fields"
+        ]
+      },
+      "RecipientView": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "ordinal": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2
+          },
+          "role": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "invited",
+              "approved",
+              "declined",
+              "expired",
+              "revoked"
+            ],
+            "description": "pending = not yet its turn or not sent; invited = invitation mailed and current turn; revoked = superseded by resend/reissue/void"
+          },
+          "invited_at": {
+            "oneOf": [
+              {
+                "type": "string",
+                "format": "date-time",
+                "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "approved_at": {
+            "oneOf": [
+              {
+                "type": "string",
+                "format": "date-time",
+                "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "approval_digest": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase hex SHA-256 over exact bytes"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "ordinal",
+          "role",
+          "email",
+          "status",
+          "invited_at",
+          "approved_at",
+          "approval_digest"
+        ]
+      },
+      "ArtifactSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "artifact_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 of final.pdf exact bytes"
+          },
+          "package_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 of the package ZIP exact bytes"
+          },
+          "integrity": {
+            "enum": [
+              "valid",
+              "invalid",
+              "indeterminate"
+            ]
+          },
+          "trust": {
+            "enum": [
+              "trusted",
+              "untrusted",
+              "indeterminate"
+            ]
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "artifact_digest",
+          "package_digest",
+          "integrity",
+          "trust",
+          "completed_at"
+        ]
+      },
+      "FinalizationStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "job_status": {
+            "enum": [
+              "pending",
+              "running",
+              "retryable",
+              "failed",
+              "succeeded"
+            ]
+          },
+          "attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_attempts": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "retry_at": {
+            "oneOf": [
+              {
+                "type": "string",
+                "format": "date-time",
+                "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_error_code": {
+            "oneOf": [
+              {
+                "type": "string",
+                "maxLength": 60
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "job_status",
+          "attempts",
+          "max_attempts",
+          "retry_at",
+          "last_error_code"
+        ]
+      },
+      "Envelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Operator view. Never contains invitation links, challenge codes, session values, keys or another tenant's data. approvals_complete=true is the spec's 'fully approved' (state finalizing or completed).",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "state": {
+            "enum": [
+              "draft",
+              "prepared",
+              "sent",
+              "in-progress",
+              "finalizing",
+              "completed",
+              "declined",
+              "expired",
+              "voided"
+            ]
+          },
+          "created_by": {
+            "$ref": "#/components/schemas/PrincipalRef"
+          },
+          "source": {
+            "$ref": "#/components/schemas/Source"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          },
+          "reissue_of": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{16,64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reissued_as": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{16,64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "document": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DocumentSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "manifest_digest": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase hex SHA-256 over exact bytes"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fields": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/components/schemas/Field"
+            }
+          },
+          "recipients": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {
+              "$ref": "#/components/schemas/RecipientView"
+            }
+          },
+          "approvals_complete": {
+            "type": "boolean"
+          },
+          "send_confirmation": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "required": {
+                "type": "boolean",
+                "description": "True when created_by.kind is service"
+              },
+              "authorization_reference": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{16,64}$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "required",
+              "authorization_reference"
+            ]
+          },
+          "finalization": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FinalizationStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "artifact": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ArtifactSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "anchor_status": {
+            "enum": [
+              "disabled",
+              "fake"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "state",
+          "created_by",
+          "source",
+          "expires_at",
+          "reissue_of",
+          "reissued_as",
+          "document",
+          "manifest_digest",
+          "fields",
+          "recipients",
+          "approvals_complete",
+          "send_confirmation",
+          "finalization",
+          "artifact",
+          "anchor_status",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "RecipientPreview": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "What a human confirms before sending, and what Hermes validates before requesting signatures. recipients_digest = SHA-256 of canonical JSON of [{ordinal, role, email}] in ordinal order.",
+        "properties": {
+          "envelope_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "state": {
+            "const": "prepared"
+          },
+          "created_by": {
+            "$ref": "#/components/schemas/PrincipalRef"
+          },
+          "source": {
+            "$ref": "#/components/schemas/Source"
+          },
+          "document": {
+            "$ref": "#/components/schemas/DocumentSummary"
+          },
+          "manifest_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "recipients_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "recipients": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {
+              "$ref": "#/components/schemas/RecipientView"
+            }
+          },
+          "fields": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/components/schemas/Field"
+            }
+          },
+          "requires_human_confirmation": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "envelope_id",
+          "version",
+          "state",
+          "created_by",
+          "source",
+          "document",
+          "manifest_digest",
+          "recipients_digest",
+          "recipients",
+          "fields",
+          "requires_human_confirmation"
+        ]
+      },
+      "SendConfirmationCreate": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "document_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "manifest_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "recipients_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          }
+        },
+        "required": [
+          "expected_version",
+          "document_digest",
+          "manifest_digest",
+          "recipients_digest"
+        ]
+      },
+      "SendConfirmation": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "authorization_reference: created only by a human operator principal of the same tenant (never a service principal) for one exact envelope version and digest set; single use; expires 24 hours after creation or at envelope expiry, whichever is first.",
+        "properties": {
+          "authorization_reference": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "envelope_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "envelope_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "document_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "manifest_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "recipients_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "confirmed_by": {
+            "$ref": "#/components/schemas/PrincipalRef"
+          },
+          "confirmed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          }
+        },
+        "required": [
+          "authorization_reference",
+          "envelope_id",
+          "envelope_version",
+          "document_digest",
+          "manifest_digest",
+          "recipients_digest",
+          "confirmed_by",
+          "confirmed_at",
+          "expires_at"
+        ]
+      },
+      "Send": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Invitations are delivered by mail only; no link, token or code is ever returned to the caller. For a service-created envelope, authorization_reference is required and must name an unused, unexpired SendConfirmation for this exact version and digests (else 409 confirmation_required / confirmation_invalid). A service principal may never satisfy confirmation for itself.",
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "authorization_reference": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          }
+        },
+        "required": [
+          "expected_version"
+        ]
+      },
+      "VersionOnly": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "expected_version"
+        ]
+      },
+      "Void": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "reason_code": {
+            "enum": [
+              "sender-cancelled",
+              "superseded",
+              "error-in-document",
+              "other"
+            ]
+          }
+        },
+        "required": [
+          "expected_version",
+          "reason_code"
+        ]
+      },
+      "Accepted": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Generic outcome; reveals nothing about whether an invitation exists or was valid.",
+        "properties": {
+          "status": {
+            "const": "accepted"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "ChallengeRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "invitation": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "description": "Read by the review shell from the URL fragment (#i=...), which never reaches the server, logs or Referer"
+          }
+        },
+        "required": [
+          "invitation"
+        ]
+      },
+      "SessionCreate": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "invitation": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "description": "Read by the review shell from the URL fragment (#i=...), which never reaches the server, logs or Referer"
+          },
+          "code": {
+            "type": "string",
+            "pattern": "^[0-9A-HJ-NP-Z]{10}$",
+            "description": "Mailed challenge code: 10 characters of Crockford base32 (50 bits). Stored only as an HMAC under a server key; compared in constant time."
+          }
+        },
+        "required": [
+          "invitation",
+          "code"
+        ]
+      },
+      "ConsentText": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "string",
+            "pattern": "^[a-z0-9.-]{1,40}$"
+          },
+          "text_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 20000
+          }
+        },
+        "required": [
+          "version",
+          "text_digest",
+          "text"
+        ]
+      },
+      "RecipientSessionState": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Returns every approval input: digests, this recipient's fields, consent text and version, prior approval digest and the CSRF token.",
+        "properties": {
+          "envelope_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "envelope_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "envelope_state": {
+            "enum": [
+              "sent",
+              "in-progress",
+              "finalizing",
+              "completed",
+              "declined",
+              "expired",
+              "voided"
+            ]
+          },
+          "recipient": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{16,64}$"
+              },
+              "ordinal": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2
+              },
+              "role": {
+                "type": "string"
+              },
+              "email_masked": {
+                "type": "string",
+                "maxLength": 254
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "invited",
+                  "approved",
+                  "declined",
+                  "expired",
+                  "revoked"
+                ],
+                "description": "pending = not yet its turn or not sent; invited = invitation mailed and current turn; revoked = superseded by resend/reissue/void"
+              }
+            },
+            "required": [
+              "id",
+              "ordinal",
+              "role",
+              "email_masked",
+              "status"
+            ]
+          },
+          "turn": {
+            "enum": [
+              "yours",
+              "waiting-for-prior",
+              "done",
+              "closed"
+            ]
+          },
+          "document": {
+            "$ref": "#/components/schemas/DocumentSummary"
+          },
+          "manifest_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "fields": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/components/schemas/Field"
+            },
+            "description": "This recipient's fields only"
+          },
+          "prior_approval_digest": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase hex SHA-256 over exact bytes"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "consent": {
+            "$ref": "#/components/schemas/ConsentText"
+          },
+          "assurance": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "method": {
+                "const": "mailbox-challenge"
+              },
+              "level": {
+                "const": "mailbox-control"
+              },
+              "statement": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "method",
+              "level",
+              "statement"
+            ]
+          },
+          "seal_notice": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "States that the final document is sealed by the organization's certificate, not by a personal certificate"
+          },
+          "csrf_token": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 128
+          },
+          "session_expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          }
+        },
+        "required": [
+          "envelope_id",
+          "envelope_version",
+          "envelope_state",
+          "recipient",
+          "turn",
+          "document",
+          "manifest_digest",
+          "fields",
+          "prior_approval_digest",
+          "consent",
+          "assurance",
+          "seal_notice",
+          "csrf_token",
+          "session_expires_at"
+        ]
+      },
+      "DrawnSignatureValue": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Vector strokes in field-local normalized coordinates [0,1] (origin top-left). At most 50 strokes, 1000 points per stroke and 10000 points in total; rendered as PDF path operators, never as an image.",
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]{1,40}$"
+          },
+          "type": {
+            "const": "signature"
+          },
+          "mode": {
+            "const": "drawn"
+          },
+          "strokes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50,
+            "items": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 1000,
+              "items": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1
+                  }
+                ],
+                "minItems": 2,
+                "maxItems": 2
+              }
+            }
+          }
+        },
+        "required": [
+          "key",
+          "type",
+          "mode",
+          "strokes"
+        ]
+      },
+      "TypedSignatureValue": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Rendered in standard-14 Helvetica (not embedded). Characters outside WinAnsiEncoding are rejected with 422 unsupported_characters. Output is always encoded; never interpreted as markup.",
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]{1,40}$"
+          },
+          "type": {
+            "const": "signature"
+          },
+          "mode": {
+            "const": "typed"
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          }
+        },
+        "required": [
+          "key",
+          "type",
+          "mode",
+          "text"
+        ]
+      },
+      "DateFieldValue": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "No client value: the server fills the date (UTC, YYYY-MM-DD) from server time at approval and returns it in the receipt.",
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]{1,40}$"
+          },
+          "type": {
+            "const": "date"
+          }
+        },
+        "required": [
+          "key",
+          "type"
+        ]
+      },
+      "FieldValue": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/DrawnSignatureValue"
+          },
+          {
+            "$ref": "#/components/schemas/TypedSignatureValue"
+          },
+          {
+            "$ref": "#/components/schemas/DateFieldValue"
+          }
+        ]
+      },
+      "Approval": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Exactly one value per field of this recipient. Binding: document, manifest, prior approval, consent text and intended recipient (from the session). An exact retry returns the original receipt; a changed retry returns 409.",
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "document_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "manifest_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "prior_approval_digest": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase hex SHA-256 over exact bytes"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "consent_version": {
+            "type": "string",
+            "pattern": "^[a-z0-9.-]{1,40}$"
+          },
+          "consent_text_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "consent": {
+            "const": true
+          },
+          "field_values": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/components/schemas/FieldValue"
+            }
+          }
+        },
+        "required": [
+          "expected_version",
+          "document_digest",
+          "manifest_digest",
+          "prior_approval_digest",
+          "consent_version",
+          "consent_text_digest",
+          "consent",
+          "field_values"
+        ]
+      },
+      "ApprovalReceipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "approval_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "approval_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "recipient_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "envelope_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "envelope_state": {
+            "enum": [
+              "in-progress",
+              "finalizing"
+            ]
+          },
+          "date_values": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "string",
+                  "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+                }
+              },
+              "required": [
+                "key",
+                "value"
+              ]
+            }
+          },
+          "server_time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          }
+        },
+        "required": [
+          "approval_id",
+          "approval_digest",
+          "recipient_id",
+          "envelope_version",
+          "envelope_state",
+          "date_values",
+          "server_time"
+        ]
+      },
+      "Decline": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "reason_code": {
+            "enum": [
+              "not-my-document",
+              "disagree",
+              "other"
+            ]
+          }
+        },
+        "required": [
+          "expected_version"
+        ]
+      },
+      "DeclineOutcome": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "envelope_state": {
+            "const": "declined"
+          }
+        },
+        "required": [
+          "envelope_state"
+        ]
+      },
+      "VerificationReport": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Body of GET /verification and of verification.json in the package. Produced by the shipped verifier module, which is separate from the signer. revocation_status is not-checked and timestamp_status is absent while those checks are not implemented.",
+        "properties": {
+          "schema": {
+            "const": "opensig.verification/1"
+          },
+          "artifact_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 of final.pdf"
+          },
+          "integrity": {
+            "enum": [
+              "valid",
+              "invalid",
+              "indeterminate"
+            ]
+          },
+          "trust": {
+            "enum": [
+              "trusted",
+              "untrusted",
+              "indeterminate"
+            ]
+          },
+          "trust_anchor_ref": {
+            "oneOf": [
+              {
+                "type": "string",
+                "maxLength": 100
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision_coverage": {
+            "enum": [
+              "complete",
+              "incomplete",
+              "indeterminate"
+            ]
+          },
+          "seal_type": {
+            "const": "organization"
+          },
+          "signer_certificate_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "approval_evidence_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Value of the signed CMS attribute opensig-approval-evidence-digest (OID 2.25.254263291653419018820250361524609646248); the check approval-evidence-digest compares it with the package's approval-manifest.json"
+          },
+          "timestamp_status": {
+            "enum": [
+              "trusted",
+              "absent",
+              "invalid",
+              "indeterminate"
+            ]
+          },
+          "revocation_status": {
+            "enum": [
+              "good",
+              "revoked",
+              "unknown",
+              "not-checked"
+            ]
+          },
+          "verifier": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "maxLength": 80
+              },
+              "version": {
+                "type": "string",
+                "maxLength": 40
+              }
+            },
+            "required": [
+              "name",
+              "version"
+            ]
+          },
+          "verified_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "maxLength": 60
+                },
+                "result": {
+                  "enum": [
+                    "pass",
+                    "fail",
+                    "not-run"
+                  ]
+                },
+                "detail_code": {
+                  "type": "string",
+                  "maxLength": 60
+                }
+              },
+              "required": [
+                "id",
+                "result"
+              ]
+            }
+          }
+        },
+        "required": [
+          "schema",
+          "artifact_digest",
+          "integrity",
+          "trust",
+          "trust_anchor_ref",
+          "revision_coverage",
+          "seal_type",
+          "signer_certificate_sha256",
+          "approval_evidence_digest",
+          "timestamp_status",
+          "revocation_status",
+          "verifier",
+          "verified_at",
+          "checks"
+        ]
+      },
+      "ApprovalRecord": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "approval_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "recipient": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{16,64}$"
+              },
+              "ordinal": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2
+              },
+              "role": {
+                "type": "string"
+              },
+              "email": {
+                "type": "string",
+                "format": "email"
+              }
+            },
+            "required": [
+              "id",
+              "ordinal",
+              "role",
+              "email"
+            ]
+          },
+          "assurance": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "method": {
+                "const": "mailbox-challenge"
+              },
+              "level": {
+                "const": "mailbox-control"
+              }
+            },
+            "required": [
+              "method",
+              "level"
+            ]
+          },
+          "consent_version": {
+            "type": "string"
+          },
+          "consent_text_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "document_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "manifest_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "prior_approval_digest": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase hex SHA-256 over exact bytes"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "field_values": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldValue"
+            }
+          },
+          "date_values": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "field_values_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "server_time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          },
+          "approval_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          }
+        },
+        "required": [
+          "approval_id",
+          "recipient",
+          "assurance",
+          "consent_version",
+          "consent_text_digest",
+          "document_digest",
+          "manifest_digest",
+          "prior_approval_digest",
+          "field_values",
+          "date_values",
+          "field_values_digest",
+          "server_time",
+          "approval_digest"
+        ]
+      },
+      "ApprovalManifest": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "approval-manifest.json in the package. approval_digest = SHA-256 of the canonical JSON of the record without approval_digest; prior_approval_digest chains approvals in ordinal order. approval_evidence_digest = SHA-256 (lowercase hex) of the RFC 8785 canonical JSON of this manifest WITHOUT final_pdf_digest (every other field is fixed before sealing). That digest is committed inside the organization seal as the CMS signed attribute opensig-approval-evidence-digest (OID 2.25.254263291653419018820250361524609646248, value OCTET STRING of the 32 digest bytes), so replacing recipient identities, consent wording or approvals in this sidecar breaks the binding even if package-index.json is recomputed.",
+        "properties": {
+          "schema": {
+            "const": "opensig.approval-manifest/1"
+          },
+          "envelope_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "envelope_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "source": {
+            "$ref": "#/components/schemas/Source"
+          },
+          "document": {
+            "$ref": "#/components/schemas/DocumentSummary"
+          },
+          "field_manifest": {
+            "$ref": "#/components/schemas/FieldManifest"
+          },
+          "manifest_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "consent_texts": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/ConsentText"
+            }
+          },
+          "approvals": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {
+              "$ref": "#/components/schemas/ApprovalRecord"
+            }
+          },
+          "approved_composition_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 of the composed PDF before the seal"
+          },
+          "seal": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "const": "organization"
+              },
+              "signer_certificate_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase hex SHA-256 over exact bytes"
+              },
+              "development_certificate": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "type",
+              "signer_certificate_sha256",
+              "development_certificate"
+            ]
+          },
+          "seal_audit_anchor": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "This envelope's envelope.seal_started audit event, written before composition; its event_digest commits the tenant chain up to that point",
+            "properties": {
+              "seq": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "event_digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase hex SHA-256 over exact bytes"
+              }
+            },
+            "required": [
+              "seq",
+              "event_digest"
+            ]
+          },
+          "final_pdf_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          }
+        },
+        "required": [
+          "schema",
+          "envelope_id",
+          "envelope_version",
+          "source",
+          "document",
+          "field_manifest",
+          "manifest_digest",
+          "consent_texts",
+          "approvals",
+          "approved_composition_digest",
+          "seal",
+          "seal_audit_anchor",
+          "final_pdf_digest"
+        ]
+      },
+      "AuditEventRecord": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "One audit event carrying exactly its digest preimage. event_digest = SHA-256 (lowercase hex) of the RFC 8785 canonical JSON of this object without event_digest, i.e. of {schema, tenant_id, seq, type, actor{kind, ref}, server_time, envelope_id, subject_digest, metadata, prev_digest}. Any holder can recompute it from the receipt alone. metadata is the redacted object stored at write time (never capability values, codes, keys, contact secrets or PDF content); tenant_id and envelope_id are opaque identifiers, not capabilities.",
+        "properties": {
+          "schema": {
+            "const": "opensig.audit-event/1"
+          },
+          "tenant_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "type": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{1,60}$"
+          },
+          "actor": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "human-operator",
+                  "service",
+                  "recipient",
+                  "system"
+                ]
+              },
+              "ref": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              }
+            },
+            "required": [
+              "kind",
+              "ref"
+            ]
+          },
+          "server_time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          },
+          "envelope_id": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{16,64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "subject_digest": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase hex SHA-256 over exact bytes"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Redacted metadata exactly as hashed"
+          },
+          "prev_digest": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase hex SHA-256 over exact bytes"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "null only for seq 1 of the tenant chain"
+          },
+          "event_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          }
+        },
+        "required": [
+          "schema",
+          "tenant_id",
+          "seq",
+          "type",
+          "actor",
+          "server_time",
+          "envelope_id",
+          "subject_digest",
+          "metadata",
+          "prev_digest",
+          "event_digest"
+        ]
+      },
+      "AuditReceipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "audit-receipt.json: every event of this envelope from the tenant's hash chain, each with its full digest preimage (AuditEventRecord), plus the chain head at completion and the latest checkpoint. A holder can recompute every event_digest. prev_digest links to the tenant chain, whose events for other envelopes are omitted for confidentiality, so continuity is checkable only between consecutive seq values in the receipt; full-chain continuity is attested by chain_head_digest and the checkpoint and verified on restore. Tamper-evident, not tamper-proof.",
+        "properties": {
+          "schema": {
+            "const": "opensig.audit-receipt/1"
+          },
+          "envelope_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "events": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/AuditEventRecord"
+            }
+          },
+          "chain_head_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Lowercase hex SHA-256 over exact bytes"
+          },
+          "checkpoint": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "seq": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase hex SHA-256 over exact bytes"
+              },
+              "created_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+              }
+            },
+            "required": [
+              "seq",
+              "digest",
+              "created_at"
+            ]
+          }
+        },
+        "required": [
+          "schema",
+          "envelope_id",
+          "events",
+          "chain_head_digest",
+          "checkpoint"
+        ]
+      },
+      "PackageIndex": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "package-index.json. The ZIP holds exactly final.pdf, approval-manifest.json, audit-receipt.json, verification.json and package-index.json (store method, fixed timestamps, deterministic order).",
+        "properties": {
+          "schema": {
+            "const": "opensig.package-index/1"
+          },
+          "envelope_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "artifact_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "files": {
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "enum": [
+                    "final.pdf",
+                    "approval-manifest.json",
+                    "audit-receipt.json",
+                    "verification.json"
+                  ]
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$",
+                  "description": "Lowercase hex SHA-256 over exact bytes"
+                },
+                "bytes": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "path",
+                "sha256",
+                "bytes"
+              ]
+            }
+          }
+        },
+        "required": [
+          "schema",
+          "envelope_id",
+          "artifact_id",
+          "files"
+        ]
+      },
+      "WebhookRegistrationCreate": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "HTTPS only; destination must match the tenant allowlist; private, loopback, link-local, metadata and IPv4-mapped/alternate-form addresses are rejected at registration and again at every connection (resolve once, validate every A/AAAA record, connect to that address, no redirects, proxy env ignored).",
+        "properties": {
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://",
+            "maxLength": 2048
+          },
+          "event_types": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/WebhookEventType"
+            }
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 200
+          }
+        },
+        "required": [
+          "url",
+          "event_types"
+        ]
+      },
+      "WebhookEventType": {
+        "enum": [
+          "envelope.sent",
+          "envelope.completed",
+          "envelope.declined",
+          "envelope.expired",
+          "envelope.voided",
+          "envelope.finalization_failed"
+        ]
+      },
+      "WebhookKeyIssued": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "The secret is shown exactly once in this response and stored server-side only protected at rest.",
+        "properties": {
+          "key_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "secret": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 128
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          },
+          "previous_key_id": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{16,64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "previous_key_expires_at": {
+            "oneOf": [
+              {
+                "type": "string",
+                "format": "date-time",
+                "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "key_id",
+          "secret",
+          "created_at",
+          "previous_key_id",
+          "previous_key_expires_at"
+        ]
+      },
+      "WebhookRegistration": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "event_types": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebhookEventType"
+            }
+          },
+          "status": {
+            "enum": [
+              "active",
+              "disabled"
+            ]
+          },
+          "active_key_ids": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 2,
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{16,64}$"
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          }
+        },
+        "required": [
+          "id",
+          "url",
+          "event_types",
+          "status",
+          "active_key_ids",
+          "created_at"
+        ]
+      },
+      "WebhookRegistrationCreated": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "registration": {
+            "$ref": "#/components/schemas/WebhookRegistration"
+          },
+          "signing_key": {
+            "$ref": "#/components/schemas/WebhookKeyIssued"
+          }
+        },
+        "required": [
+          "registration",
+          "signing_key"
+        ]
+      },
+      "WebhookKeyRotate": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "overlap_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 86400
+          }
+        },
+        "required": [
+          "overlap_seconds"
+        ]
+      },
+      "WebhookEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Carries no PDF, names, contact details or tokens. Consumers fetch canonical status with their own credential before acting. event_id is stable across delivery retries.",
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "schema_version": {
+            "const": "1"
+          },
+          "type": {
+            "$ref": "#/components/schemas/WebhookEventType"
+          },
+          "envelope_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16,64}$"
+          },
+          "envelope_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "artifact_id": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{16,64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "artifact_digest": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Lowercase hex SHA-256 over exact bytes"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "occurred_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server UTC time; unsigned server time, never a trusted timestamp"
+          }
+        },
+        "required": [
+          "event_id",
+          "schema_version",
+          "type",
+          "envelope_id",
+          "envelope_version",
+          "artifact_id",
+          "artifact_digest",
+          "occurred_at"
+        ]
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "invalid_request: malformed JSON, schema violation or unknown property",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "unauthenticated: missing, expired or wrong-scheme credential (an operator bearer on a recipient route is 401)",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "forbidden / csrf_failed / origin_rejected: authenticated but role, scope, principal kind, CSRF token or origin not allowed",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "not_found: absent or inaccessible; identical for other tenants' resources",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "version_conflict, state_conflict, order_conflict, idempotency_conflict, confirmation_required, confirmation_invalid, digest_mismatch, consent_mismatch, not_completed or finalization_not_retryable",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "payload_too_large: request body over the route limit (10 MiB for PDF upload, enforced while streaming; 256 KiB for JSON)",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "UnsupportedMediaType": {
+        "description": "unsupported_media_type",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "unsupported_pdf (malformed, encrypted, already signed, over 50 pages, active content, effective CropBox different from MediaBox [details code cropbox_differs], unsupported features), field_out_of_bounds, unsupported_characters or destination_not_allowed",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "PreconditionRequired": {
+        "description": "precondition_required: If-Match missing on upload",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "rate_limited or locked",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "parameters": {
+      "EnvelopeId": {
+        "name": "envelope_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16,64}$"
+        }
+      },
+      "RecipientId": {
+        "name": "recipient_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16,64}$"
+        }
+      },
+      "RegistrationId": {
+        "name": "registration_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16,64}$"
+        }
+      },
+      "KeyId": {
+        "name": "key_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16,64}$"
+        }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "description": "Scoped by tenant, route and principal. Same key and same payload returns the original result; a changed payload is 409 idempotency_conflict.",
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{16,128}$"
+        }
+      },
+      "CsrfToken": {
+        "name": "X-CSRF-Token",
+        "in": "header",
+        "required": true,
+        "description": "Value from RecipientSessionState.csrf_token or the session-create response; bound to the session server-side. Origin must also match the deployment allowlist.",
+        "schema": {
+          "type": "string",
+          "minLength": 43,
+          "maxLength": 128
+        }
+      },
+      "IfMatch": {
+        "name": "If-Match",
+        "in": "header",
+        "required": true,
+        "description": "Expected envelope version as a quoted string, e.g. \"1\"",
+        "schema": {
+          "type": "string",
+          "pattern": "^\"[1-9][0-9]{0,9}\"$"
+        }
+      }
+    },
+    "securitySchemes": {
+      "operatorOAuth": {
+        "type": "oauth2",
+        "description": "OIDC access token validated against the configured issuer, audience and JWKS (configuration only; no discovery fetch at runtime). Allowed algorithms are pinned (RS256, ES256); clock skew at most 60 seconds. Scopes below; roles come from configured tenant-role claim mapping.",
+        "flows": {
+          "authorizationCode": {
+            "authorizationUrl": "https://issuer.invalid/authorize",
+            "tokenUrl": "https://issuer.invalid/token",
+            "scopes": {
+              "envelopes:read": "read envelopes and previews",
+              "envelopes:write": "create, upload, prepare, reissue",
+              "envelopes:send": "send and resend invitations",
+              "envelopes:confirm-send": "human confirmation of a recipient preview",
+              "envelopes:void": "void before finalization",
+              "finalization:retry": "retry failed finalization",
+              "artifacts:read": "read verification, final PDF and package",
+              "webhooks:admin": "manage webhook registrations and keys"
+            }
+          },
+          "clientCredentials": {
+            "tokenUrl": "https://issuer.invalid/token",
+            "scopes": {
+              "envelopes:read": "read envelopes and previews",
+              "envelopes:write": "create, upload, prepare",
+              "envelopes:send": "send with a human authorization_reference",
+              "artifacts:read": "read verification, final PDF and package"
+            }
+          }
+        }
+      },
+      "recipientSession": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Host-opensig_rs",
+        "description": "Opaque session value (stored hashed) bound to tenant, envelope, recipient, revision and manifest; HttpOnly, Secure, SameSite=Strict; 30-minute idle expiry; revoked by resend, reissue, void, decline or expiry. Mutations also require X-CSRF-Token and an allowlisted Origin."
+      }
+    }
+  }
+}

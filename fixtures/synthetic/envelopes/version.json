@@ -1,0 +1,734 @@
+{
+  "schema": "opensig.envelope-conformance-fixture/1",
+  "category": "version",
+  "cases": [
+    {
+      "id": "EC-VER-01",
+      "title": "upload with If-Match of the current version is accepted and advances the version",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "state",
+            "equals": "draft"
+          },
+          {
+            "path": "version",
+            "greaterThan": {
+              "$ctx": "version"
+            }
+          },
+          {
+            "path": "document.bytes",
+            "equals": {
+              "$ctx": "upload_bytes"
+            }
+          },
+          {
+            "path": "document.digest",
+            "equals": {
+              "$ctx": "upload_sha256"
+            }
+          },
+          {
+            "path": "document.pages",
+            "length": 1
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/parameters/IfMatch/description",
+          "text": "Expected envelope version as a quoted string"
+        },
+        {
+          "pointer": "#/paths/~1v1~1envelopes~1{envelope_id}~1document/put/responses/200/description",
+          "text": "Document accepted after isolated parsing; page geometry returned for field placement"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-02",
+      "title": "upload without If-Match requires a precondition",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1
+          }
+        },
+        "headers": {
+          "If-Match": null
+        }
+      },
+      "defect": {
+        "kind": "header-missing",
+        "header": "If-Match"
+      },
+      "expect": {
+        "status": 428,
+        "code": "precondition_required"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/PreconditionRequired/description",
+          "text": "precondition_required: If-Match missing on upload"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-03",
+      "title": "upload with If-Match of a version the envelope has not reached conflicts",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1
+          }
+        },
+        "headers": {
+          "If-Match": {
+            "$ctx": "if_match_next"
+          }
+        }
+      },
+      "defect": {
+        "kind": "version-mismatch"
+      },
+      "expect": {
+        "status": 409,
+        "code": "version_conflict"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Conflict/description",
+          "text": "version_conflict"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-04",
+      "title": "an unquoted If-Match version is malformed",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1
+          }
+        },
+        "headers": {
+          "If-Match": {
+            "$ctx": "version_text"
+          }
+        }
+      },
+      "defect": {
+        "kind": "header-invalid",
+        "header": "If-Match"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/parameters/IfMatch/schema/pattern",
+          "value": "^\"[1-9][0-9]{0,9}\"$"
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-05",
+      "title": "If-Match version zero is malformed",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1
+          }
+        },
+        "headers": {
+          "If-Match": "\"0\""
+        }
+      },
+      "defect": {
+        "kind": "header-invalid",
+        "header": "If-Match"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/parameters/IfMatch/schema/pattern",
+          "value": "^\"[1-9][0-9]{0,9}\"$"
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-06",
+      "title": "a weak If-Match validator is malformed",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1
+          }
+        },
+        "headers": {
+          "If-Match": {
+            "$ctx": "if_match_weak"
+          }
+        }
+      },
+      "defect": {
+        "kind": "header-invalid",
+        "header": "If-Match"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/parameters/IfMatch/schema/pattern",
+          "value": "^\"[1-9][0-9]{0,9}\"$"
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-07",
+      "title": "prepare with the current expected_version is accepted and advances the version",
+      "given": "draft-1-document",
+      "request": {
+        "operationId": "prepareEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "version"
+            },
+            "fields": [
+              {
+                "key": "sig_1",
+                "recipient_ordinal": 1,
+                "page": 1,
+                "type": "signature",
+                "rect": {
+                  "x": 0.1,
+                  "y": 0.8,
+                  "width": 0.3,
+                  "height": 0.08
+                }
+              }
+            ]
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "state",
+            "equals": "prepared"
+          },
+          {
+            "path": "version",
+            "greaterThan": {
+              "$ctx": "version"
+            }
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Prepare/required",
+          "value": [
+            "expected_version",
+            "fields"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-08",
+      "title": "prepare with an expected_version the envelope has not reached conflicts",
+      "given": "draft-1-document",
+      "request": {
+        "operationId": "prepareEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "next_version"
+            },
+            "fields": [
+              {
+                "key": "sig_1",
+                "recipient_ordinal": 1,
+                "page": 1,
+                "type": "signature",
+                "rect": {
+                  "x": 0.1,
+                  "y": 0.8,
+                  "width": 0.3,
+                  "height": 0.08
+                }
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "version-mismatch"
+      },
+      "expect": {
+        "status": 409,
+        "code": "version_conflict"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Conflict/description",
+          "text": "version_conflict"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-09",
+      "title": "expected_version zero is below the minimum",
+      "given": "draft-1-document",
+      "request": {
+        "operationId": "prepareEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": 0,
+            "fields": [
+              {
+                "key": "sig_1",
+                "recipient_ordinal": 1,
+                "page": 1,
+                "type": "signature",
+                "rect": {
+                  "x": 0.1,
+                  "y": 0.8,
+                  "width": 0.3,
+                  "height": 0.08
+                }
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Prepare/properties/expected_version/minimum",
+          "value": 1
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-10",
+      "title": "expected_version as a string is a schema violation",
+      "given": "draft-1-document",
+      "request": {
+        "operationId": "prepareEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "version_text"
+            },
+            "fields": [
+              {
+                "key": "sig_1",
+                "recipient_ordinal": 1,
+                "page": 1,
+                "type": "signature",
+                "rect": {
+                  "x": 0.1,
+                  "y": 0.8,
+                  "width": 0.3,
+                  "height": 0.08
+                }
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Prepare/properties/expected_version/type",
+          "value": "integer"
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-11",
+      "title": "prepare without expected_version is a schema violation",
+      "given": "draft-1-document",
+      "request": {
+        "operationId": "prepareEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "fields": [
+              {
+                "key": "sig_1",
+                "recipient_ordinal": 1,
+                "page": 1,
+                "type": "signature",
+                "rect": {
+                  "x": 0.1,
+                  "y": 0.8,
+                  "width": 0.3,
+                  "height": 0.08
+                }
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Prepare/required",
+          "value": [
+            "expected_version",
+            "fields"
+          ]
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-12",
+      "title": "void with the current expected_version is accepted and advances the version",
+      "given": "prepared-1",
+      "request": {
+        "operationId": "voidEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "version"
+            },
+            "reason_code": "sender-cancelled"
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "state",
+            "equals": "voided"
+          },
+          {
+            "path": "version",
+            "greaterThan": {
+              "$ctx": "version"
+            }
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/paths/~1v1~1envelopes~1{envelope_id}~1void/post/responses/200/description",
+          "text": "Voided; outstanding sessions and invitations revoked"
+        },
+        {
+          "pointer": "#/paths/~1v1~1envelopes~1{envelope_id}~1void/post/summary",
+          "text": "Void before the finalization reservation"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-13",
+      "title": "void with an expected_version the envelope has not reached conflicts",
+      "given": "prepared-1",
+      "request": {
+        "operationId": "voidEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "next_version"
+            },
+            "reason_code": "sender-cancelled"
+          }
+        }
+      },
+      "defect": {
+        "kind": "version-mismatch"
+      },
+      "expect": {
+        "status": 409,
+        "code": "version_conflict"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Conflict/description",
+          "text": "version_conflict"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-14",
+      "title": "void with a stale expected_version conflicts",
+      "given": "prepared-1",
+      "request": {
+        "operationId": "voidEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "previous_version"
+            },
+            "reason_code": "sender-cancelled"
+          }
+        }
+      },
+      "defect": {
+        "kind": "version-mismatch"
+      },
+      "expect": {
+        "status": 409,
+        "code": "version_conflict"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Conflict/description",
+          "text": "version_conflict"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-15",
+      "title": "send with a stale expected_version conflicts",
+      "given": "prepared-1",
+      "request": {
+        "operationId": "sendEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "previous_version"
+            }
+          }
+        }
+      },
+      "defect": {
+        "kind": "version-mismatch"
+      },
+      "expect": {
+        "status": 409,
+        "code": "version_conflict"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Conflict/description",
+          "text": "version_conflict"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-16",
+      "title": "send with expected_version zero is below the minimum",
+      "given": "prepared-1",
+      "request": {
+        "operationId": "sendEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": 0
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Send/properties/expected_version/minimum",
+          "value": 1
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-VER-17",
+      "title": "a fractional expected_version is a schema violation",
+      "given": "prepared-1",
+      "request": {
+        "operationId": "voidEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": 1.5,
+            "reason_code": "sender-cancelled"
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Void/properties/expected_version/type",
+          "value": "integer"
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    }
+  ]
+}

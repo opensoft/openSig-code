@@ -1,0 +1,777 @@
+{
+  "schema": "opensig.envelope-conformance-fixture/1",
+  "category": "unsupported-pdf",
+  "cases": [
+    {
+      "id": "EC-PDF-01",
+      "title": "a plain one-page PDF is accepted with its page geometry",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "document.pages",
+            "length": 1
+          },
+          {
+            "path": "document.pages[0]",
+            "equals": {
+              "number": 1,
+              "width": 612,
+              "height": 792,
+              "rotate": 0
+            }
+          },
+          {
+            "path": "document.digest",
+            "equals": {
+              "$ctx": "upload_sha256"
+            }
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/PageGeometry/description",
+          "text": "Displayed page size after applying /Rotate, in PDF points."
+        },
+        {
+          "pointer": "#/paths/~1v1~1envelopes~1{envelope_id}~1document/put/responses/200/description",
+          "text": "Document accepted after isolated parsing; page geometry returned for field placement"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-02",
+      "title": "a page rotated by 90 degrees reports its displayed geometry",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "rotate": 90
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "document.pages[0]",
+            "equals": {
+              "number": 1,
+              "width": 792,
+              "height": 612,
+              "rotate": 90
+            }
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/PageGeometry/description",
+          "text": "Displayed page size after applying /Rotate, in PDF points."
+        },
+        {
+          "pointer": "#/components/schemas/PageGeometry/properties/rotate/enum",
+          "value": [
+            0,
+            90,
+            180,
+            270
+          ]
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-03",
+      "title": "rotation and media box inherited from the page tree apply to the page",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "inherit": {
+              "rotate": 270,
+              "mediaBox": [
+                0,
+                0,
+                612,
+                792
+              ]
+            }
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "document.pages[0]",
+            "equals": {
+              "number": 1,
+              "width": 792,
+              "height": 612,
+              "rotate": 270
+            }
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/PageGeometry/description",
+          "text": "Displayed page size after applying /Rotate, in PDF points."
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-04",
+      "title": "each page of a mixed-rotation PDF reports its own geometry",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 3,
+            "rotate": [
+              0,
+              90,
+              180
+            ]
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "document.pages",
+            "length": 3
+          },
+          {
+            "path": "document.pages[0]",
+            "equals": {
+              "number": 1,
+              "width": 612,
+              "height": 792,
+              "rotate": 0
+            }
+          },
+          {
+            "path": "document.pages[1]",
+            "equals": {
+              "number": 2,
+              "width": 792,
+              "height": 612,
+              "rotate": 90
+            }
+          },
+          {
+            "path": "document.pages[2]",
+            "equals": {
+              "number": 3,
+              "width": 612,
+              "height": 792,
+              "rotate": 180
+            }
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/PageGeometry/description",
+          "text": "Displayed page size after applying /Rotate, in PDF points."
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-05",
+      "title": "an explicit crop box equal to the media box is accepted",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "cropBox": [
+              0,
+              0,
+              612,
+              792
+            ]
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "document.pages[0]",
+            "equals": {
+              "number": 1,
+              "width": 612,
+              "height": 792,
+              "rotate": 0
+            }
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/PageGeometry/description",
+          "text": "so the displayed page always equals the MediaBox with /Rotate applied"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-06",
+      "title": "a PDF with a cross-reference stream is accepted",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "xref": "stream"
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "document.pages",
+            "length": 1
+          },
+          {
+            "path": "document.pages[0]",
+            "equals": {
+              "number": 1,
+              "width": 612,
+              "height": 792,
+              "rotate": 0
+            }
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/paths/~1v1~1envelopes~1{envelope_id}~1document/put/responses/200/description",
+          "text": "Document accepted after isolated parsing; page geometry returned for field placement"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-07",
+      "title": "a page crop box that differs from its media box is rejected",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "cropBox": [
+              36,
+              36,
+              576,
+              756
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "cropbox-differs"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf",
+        "detailCodes": [
+          "cropbox_differs"
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Unprocessable/description",
+          "text": "effective CropBox different from MediaBox [details code cropbox_differs]"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-08",
+      "title": "a crop box inherited from the page tree that differs from the media box is rejected",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "inherit": {
+              "cropBox": [
+                36,
+                36,
+                576,
+                756
+              ]
+            }
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "cropbox-differs"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf",
+        "detailCodes": [
+          "cropbox_differs"
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/PageGeometry/description",
+          "text": "Pages whose effective (inherited) CropBox differs from the MediaBox are rejected at upload (422 unsupported_pdf, detail cropbox_differs)"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-09",
+      "title": "a body that is not a PDF is malformed",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "variant": "not-a-pdf"
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "malformed"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Unprocessable/description",
+          "text": "unsupported_pdf (malformed"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-10",
+      "title": "a truncated PDF without cross-reference data or trailer is malformed",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "variant": "truncated",
+            "pages": 1
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "malformed"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Unprocessable/description",
+          "text": "unsupported_pdf (malformed"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-11",
+      "title": "an encrypted PDF is unsupported",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "features": [
+              "encrypt"
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "encrypt"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Unprocessable/description",
+          "text": "encrypted"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-12",
+      "title": "a PDF with an existing signature dictionary is unsupported",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "features": [
+              "signature"
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "signature"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Unprocessable/description",
+          "text": "already signed"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-13",
+      "title": "a JavaScript open action is active content",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "features": [
+              "javascript-open-action"
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "javascript"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Unprocessable/description",
+          "text": "active content"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-14",
+      "title": "a launch open action is active content",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "features": [
+              "launch-open-action"
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "launch"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Unprocessable/description",
+          "text": "active content"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-15",
+      "title": "a rich-media annotation is active content",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "features": [
+              "rich-media"
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "rich-media"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Unprocessable/description",
+          "text": "active content"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-16",
+      "title": "an XFA form is active content",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "features": [
+              "xfa"
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "xfa"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Unprocessable/description",
+          "text": "active content"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-17",
+      "title": "an embedded file is an unsupported feature",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "features": [
+              "embedded-file"
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "embedded-file"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Unprocessable/description",
+          "text": "unsupported features"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-18",
+      "title": "PDF bytes declared as application/json are an unsupported media type",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1
+          },
+          "contentType": "application/json"
+        }
+      },
+      "defect": {
+        "kind": "media-type"
+      },
+      "expect": {
+        "status": 415,
+        "code": "unsupported_media_type"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/UnsupportedMediaType/description",
+          "text": "unsupported_media_type"
+        },
+        {
+          "pointer": "#/paths/~1v1~1envelopes~1{envelope_id}~1document/put/requestBody/content/application~1pdf/schema/contentMediaType",
+          "value": "application/pdf"
+        }
+      ]
+    },
+    {
+      "id": "EC-PDF-19",
+      "title": "PDF bytes declared as application/octet-stream are an unsupported media type",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1
+          },
+          "contentType": "application/octet-stream"
+        }
+      },
+      "defect": {
+        "kind": "media-type"
+      },
+      "expect": {
+        "status": 415,
+        "code": "unsupported_media_type"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/UnsupportedMediaType/description",
+          "text": "unsupported_media_type"
+        },
+        {
+          "pointer": "#/paths/~1v1~1envelopes~1{envelope_id}~1document/put/requestBody/content/application~1pdf/schema/contentMediaType",
+          "value": "application/pdf"
+        }
+      ]
+    }
+  ]
+}
