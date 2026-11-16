@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Versioned, append-only migrations (T003). PINNED_MIGRATIONS embeds the
-// SHA-256 of every migration file T003 created. Later tasks may only append
+// SHA-256 of every migration file T003 created (0008 and 0009 were appended
+// by T003's A-008 and A-010 fix rounds). Later tasks may only append
 // new numbered files; editing, renaming or removing a pinned file fails here.
 
 import assert from 'node:assert/strict';
@@ -23,6 +24,7 @@ const PINNED_MIGRATIONS = Object.freeze([
   { version: 6, name: '0006-audit-retention.sql', sha256: '1f7ad14b709cb88be3db0616d7e1ce5d6c4c693b34dfb6f1f9f6007ae51ee0e0' },
   { version: 7, name: '0007-outbox-webhooks-consumers.sql', sha256: '1f2d4c513318285ca5384f98eb691e42caa946e22649f6dc02ec521fac9b02ed' },
   { version: 8, name: '0008-disposal-record-kind.sql', sha256: '4af3cab3c3e48f0eaf8238848bf1f420dabc1723d7d69b6d2febc00e2db1130a' },
+  { version: 9, name: '0009-blob-ref-indexes.sql', sha256: 'fe6255721a5d15a5fc983f086ea221aa1ea7ff2893010eb5cc018ca44b3b0118' },
 ]);
 
 const scratch = makeScratch();
