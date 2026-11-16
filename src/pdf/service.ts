@@ -55,7 +55,7 @@ import { fileURLToPath } from 'node:url';
 
 import { REJECT_REASONS, type RejectReason } from './errors.ts';
 import { isDict, isRef, type PdfDict, type PdfValue } from './lexer.ts';
-import { MAX_DOCUMENT_PAGES, resolveParserLimits, resolveServiceLimits, type ParserLimits, type ServiceLimits } from './limits.ts';
+import { DEFAULT_PARSER_LIMITS, MAX_DOCUMENT_PAGES, resolveParserLimits, resolveServiceLimits, type ParserLimits, type ServiceLimits } from './limits.ts';
 import type { PageReport, ParseReport } from './parser.ts';
 import { classifyValue, createFindings } from './policy.ts';
 import {
@@ -295,21 +295,21 @@ function validIsolation(value: unknown): value is Isolation {
   );
 }
 
-const MAX_JSON_DEPTH = 96;
-const MAX_JSON_NODES = 200_000;
-const MAX_NAME_LENGTH = 1024;
-const MAX_HEX_LENGTH = 131_072;
-
-/** Convert a reported JSON value (parser.ts toJson form) back to a PDF value, or null if malformed. */
-function fromJson(value: unknown, budget: { nodes: number }, size: number, depth = 0): PdfValue | undefined {
-  budget.nodes += 1;
-  if (budget.nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) return undefined;
+/**
+ * Convert a reported JSON value (parser.ts toJson form) back to a PDF value, or undefined if
+ * it is not one. The bounds are the parser's own, so an honest report always converts
+ * (LBR2-1): nesting up to the parser's maxDepth; names, strings and arrays of any length
+ * (the report as a whole is capped by maxReportBytes); references with any object number
+ * of at least 1, because a reference to an object outside the file is legal and means null.
+ */
+function fromJson(value: unknown, maxDepth: number, depth = 0): PdfValue | undefined {
+  if (depth > maxDepth) return undefined;
   if (value === null || typeof value === 'boolean') return value;
   if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
   if (Array.isArray(value)) {
     const items: PdfValue[] = [];
     for (const item of value) {
-      const converted = fromJson(item, budget, size, depth + 1);
+      const converted = fromJson(item, maxDepth, depth + 1);
       if (converted === undefined) return undefined;
       items.push(converted);
     }
@@ -318,22 +318,21 @@ function fromJson(value: unknown, budget: { nodes: number }, size: number, depth
   if (!isObject(value)) return undefined;
   const keys = Object.keys(value);
   if (keys.length !== 1) return undefined;
-  if (typeof value.name === 'string') return value.name.length <= MAX_NAME_LENGTH ? { t: 'name', v: value.name } : undefined;
+  if (typeof value.name === 'string') return { t: 'name', v: value.name };
   if (typeof value.hex === 'string') {
     const hex = value.hex;
-    return hex.length <= MAX_HEX_LENGTH && hex.length % 2 === 0 && /^[0-9a-f]*$/.test(hex) ? { t: 'str', v: Buffer.from(hex, 'hex') } : undefined;
+    return hex.length % 2 === 0 && /^[0-9a-f]*$/.test(hex) ? { t: 'str', v: Buffer.from(hex, 'hex') } : undefined;
   }
   if (value.ref !== undefined) {
     const ref = value.ref;
-    return Array.isArray(ref) && ref.length === 2 && isCount(ref[0]) && ref[0] < size && isCount(ref[1]) && ref[1] <= 65535
+    return Array.isArray(ref) && ref.length === 2 && isCount(ref[0]) && ref[0] >= 1 && isCount(ref[1]) && ref[1] <= 65535
       ? { t: 'ref', num: ref[0], gen: ref[1] }
       : undefined;
   }
   if (isObject(value.dict)) {
     const map = new Map<string, PdfValue>();
     for (const [key, inner] of Object.entries(value.dict)) {
-      if (key.length > MAX_NAME_LENGTH) return undefined;
-      const converted = fromJson(inner, budget, size, depth + 1);
+      const converted = fromJson(inner, maxDepth, depth + 1);
       if (converted === undefined) return undefined;
       map.set(key, converted);
     }
@@ -342,26 +341,31 @@ function fromJson(value: unknown, budget: { nodes: number }, size: number, depth
   return undefined;
 }
 
+/** A reference that may point outside the file (legal; it means null). */
+function isAnyRefPair(value: unknown): value is [number, number] {
+  return Array.isArray(value) && value.length === 2 && isCount(value[0]) && value[0] >= 1 && isCount(value[1]) && value[1] <= 65535;
+}
+
 function validTrailer(value: unknown, size: number): value is ParseReport['trailer'] {
   if (!isObject(value) || !hasExactly(value, ['root', 'info', 'id'])) return false;
   if (!isRefPair(value.root, size)) return false;
-  if (value.info !== null && !isRefPair(value.info, size)) return false;
+  if (value.info !== null && !isAnyRefPair(value.info)) return false;
   if (value.id === null) return true;
-  return Array.isArray(value.id) && value.id.length === 2 && value.id.every((part) => typeof part === 'string' && part.length <= 512 && part.length % 2 === 0 && /^[0-9a-f]*$/.test(part));
+  return Array.isArray(value.id) && value.id.length === 2 && value.id.every((part) => typeof part === 'string' && part.length % 2 === 0 && /^[0-9a-f]*$/.test(part));
 }
 
 /** Shape, bounds, references and policy of the reported objects map (LBR-4); returns the catalog. */
-function validObjects(report: Record<string, unknown>, pages: PageReport[], size: number): PdfDict | null {
+function validObjects(report: Record<string, unknown>, pages: PageReport[], size: number, maxDepth: number): PdfDict | null {
   const objects = report.objects;
   if (!isObject(objects)) return null;
   const entries = Object.entries(objects);
   if (entries.length > 3 + 2 * pages.length) return null;
   const converted = new Map<number, { gen: number; value: PdfValue }>();
-  const budget = { nodes: 0 };
   for (const [key, entry] of entries) {
-    if (!/^[1-9]\d{0,9}$/.test(key) || Number(key) >= size) return null;
+    // Any object number the cross-reference covers (every entry is below /Size).
+    if (!/^[1-9]\d*$/.test(key) || !Number.isSafeInteger(Number(key)) || Number(key) >= size) return null;
     if (!isObject(entry) || !hasExactly(entry, ['gen', 'value']) || !isCount(entry.gen) || entry.gen > 65535) return null;
-    const value = fromJson(entry.value, budget, size);
+    const value = fromJson(entry.value, maxDepth);
     if (value === undefined) return null;
     converted.set(Number(key), { gen: entry.gen, value });
   }
@@ -411,7 +415,7 @@ function validFeatures(features: string[], xref: Record<string, unknown>, stats:
  * Validate the child's result against the input it was given. Returns null for anything
  * that is not exactly a well-formed rejection or a consistent report.
  */
-export function validateChildResult(value: unknown, inputBytes: number, maxPages: number): ChildResult | null {
+export function validateChildResult(value: unknown, inputBytes: number, maxPages: number, maxDepth: number = DEFAULT_PARSER_LIMITS.maxDepth): ChildResult | null {
   if (!isObject(value)) return null;
   if (value.ok === false) {
     const { reason, detail, detections } = value;
@@ -438,7 +442,7 @@ export function validateChildResult(value: unknown, inputBytes: number, maxPages
   if (!isObject(report.stats) || !hasExactly(report.stats, STATS_KEYS) || !Object.values(report.stats).every((n) => isCount(n))) return null;
   if (!isStringList(report.features, 64, 64)) return null;
   if (!validIsolation(report.isolation)) return null;
-  const catalog = validObjects(report, pages as PageReport[], size);
+  const catalog = validObjects(report, pages as PageReport[], size, maxDepth);
   if (catalog === null || !validFeatures(report.features, xref, report.stats, catalog)) return null;
   return { ok: true, report: report as unknown as ParseReport & { isolation: Isolation } };
 }
@@ -540,7 +544,7 @@ async function runParse(input: Uint8Array | AsyncIterable<Uint8Array | string>, 
       } catch {
         return finish(failure('the parse child returned no valid result', label));
       }
-      const result = validateChildResult(parsed, bytes.length, parser.maxPages);
+      const result = validateChildResult(parsed, bytes.length, parser.maxPages, parser.maxDepth);
       if (result === null) return finish(failure('the parse child returned an invalid report', label));
       if (!result.ok) return finish(reject(result.reason, result.detail, label, result.detections));
       return finish({ ok: true, status: 200, report: { ...result.report, digest, network_sandbox: label }, network_sandbox: label });

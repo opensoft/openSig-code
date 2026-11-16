@@ -43,6 +43,27 @@ export function classicPdf(bodies, { trailer = '', root = 1 } = {}) {
   return Buffer.concat(chunks);
 }
 
+/**
+ * Classic cross-reference document with explicit object numbers: `objects` is a list of
+ * [num, body] pairs, each given its own one-entry subsection; /Size is the largest number
+ * plus one and `root` names the catalog.
+ */
+export function numberedPdf(objects, { root, trailer = '' }) {
+  const chunks = [bytes('%PDF-1.7\n'), BINARY_COMMENT];
+  let length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const lines = ['xref\n0 1\n0000000000 65535 f \n'];
+  for (const [num, body] of objects) {
+    lines.push(`${num} 1\n${String(length).padStart(10, '0')} 00000 n \n`);
+    const object = Buffer.concat([bytes(`${num} 0 obj\n`), bytes(body), bytes('\nendobj\n')]);
+    chunks.push(object);
+    length += object.length;
+  }
+  const size = Math.max(...objects.map(([num]) => num)) + 1;
+  chunks.push(bytes(lines.join('')));
+  chunks.push(bytes(`trailer\n<< /Size ${size} /Root ${root} 0 R${trailer ? ` ${trailer}` : ''} >>\nstartxref\n${length}\n%%EOF\n`));
+  return Buffer.concat(chunks);
+}
+
 /** PNG "Up" predictor encoding (filter type 2 on every row). */
 function pngUp(data, columns) {
   const rows = data.length / columns;
@@ -64,9 +85,11 @@ function pngUp(data, columns) {
  * array per object stream. `objstmTail` appends bytes to each object stream's decoded data
  * (used for inflation tests); `objstmExtra` appends dictionary entries to each object stream.
  * Object streams (unless compress is false) and the xref stream are FlateDecode; the xref
- * stream uses a PNG Up predictor.
+ * stream uses a PNG Up predictor. `gens` maps an uncompressed object number to the generation
+ * written in its object header and cross-reference row (the row's generation field widens to
+ * three bytes when one exceeds 65535).
  */
-export function xrefStreamPdf(bodies, { packed = [], objstmTail = () => '', compress = true, objstmExtra = '' } = {}) {
+export function xrefStreamPdf(bodies, { packed = [], objstmTail = () => '', compress = true, objstmExtra = '', gens = {} } = {}) {
   const packedSet = new Set(packed.flat());
   const all = bodies.map((body, index) => ({ num: index + 1, body }));
   const streams = [];
@@ -95,26 +118,29 @@ export function xrefStreamPdf(bodies, { packed = [], objstmTail = () => '', comp
 
   const chunks = [bytes('%PDF-1.7\n'), BINARY_COMMENT];
   let length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const rows = Buffer.alloc(size * 7);
+  const genWidth = Object.values(gens).some((gen) => gen > 0xffff) ? 3 : 2;
+  const width = 5 + genWidth;
+  const rows = Buffer.alloc(size * width);
   const put = (num, type, f1, f2) => {
-    rows[num * 7] = type;
-    rows.writeUInt32BE(f1, num * 7 + 1);
-    rows.writeUInt16BE(f2, num * 7 + 5);
+    rows[num * width] = type;
+    rows.writeUInt32BE(f1, num * width + 1);
+    rows.writeUIntBE(f2, num * width + 5, genWidth);
   };
   put(0, 0, 0, 0xffff);
   for (const { num, body } of all) {
     if (packedSet.has(num)) continue;
-    put(num, 1, length, 0);
-    const object = Buffer.concat([bytes(`${num} 0 obj\n`), bytes(body), bytes('\nendobj\n')]);
+    const gen = gens[num] ?? 0;
+    put(num, 1, length, gen);
+    const object = Buffer.concat([bytes(`${num} ${gen} obj\n`), bytes(body), bytes('\nendobj\n')]);
     chunks.push(object);
     length += object.length;
   }
   for (const { num, group } of streams) group.forEach((member, index) => put(member, 2, num, index));
   put(xrefNum, 1, length, 0);
-  const encoded = deflateSync(pngUp(rows, 7));
+  const encoded = deflateSync(pngUp(rows, width));
   chunks.push(
     bytes(`${xrefNum} 0 obj\n`),
-    streamObject(`/Type /XRef /Size ${size} /W [1 4 2] /Root 1 0 R /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 >>`, encoded),
+    streamObject(`/Type /XRef /Size ${size} /W [1 4 ${genWidth}] /Root 1 0 R /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns ${width} >>`, encoded),
     bytes('\nendobj\n'),
     bytes(`startxref\n${length}\n%%EOF\n`),
   );

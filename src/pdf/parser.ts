@@ -383,9 +383,15 @@ class DocumentParser {
         const type = w0 === 0 ? 1 : field(at, w0);
         const f1 = field(at + w0, w1);
         const f2 = field(at + w0 + w1, w2);
-        if (type === 1) this.addLocal(section, first + k, { type: 1, offset: f1, gen: f2 });
-        else if (type === 2) this.addLocal(section, first + k, { type: 2, stream: f1, index: f2 });
-        else this.addLocal(section, first + k, { type: 0 });
+        if (type === 1) {
+          // Generation numbers are at most 65535 (as in classic tables); the parent relies on it.
+          if (f2 > 65535) throw malformed(`cross-reference stream entry for object ${first + k} has a generation above 65535`);
+          this.addLocal(section, first + k, { type: 1, offset: f1, gen: f2 });
+        } else if (type === 2) {
+          this.addLocal(section, first + k, { type: 2, stream: f1, index: f2 });
+        } else {
+          this.addLocal(section, first + k, { type: 0 });
+        }
       }
     }
     return { trailer: dict, section };

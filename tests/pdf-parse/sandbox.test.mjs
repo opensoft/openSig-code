@@ -11,16 +11,21 @@
 //   Checked for each launcher (bwrap, util-linux) the host provides.
 // PL-19: no caller-supplied option can downgrade or relabel the sandbox, and the probe
 //   confirms isolation instead of trusting an exit status.
+// PL-23 (re-check LBR2-3): /dev in the sandbox root holds only a read-only, nodev /dev/null;
+//   nothing in /dev can be created, there is no /dev/shm and no device node can be opened,
+//   under each launcher the host provides.
 //
 // The no-launcher branch is exercised for real: a child driver (sandbox-driver.mjs) runs the
 // unmodified service inside an outer user and mount namespace in which the bwrap binary is
-// masked with /dev/null and user.max_user_namespaces is 0, so no launcher can run. Nothing on
-// the host is changed. All listeners are parent-side and loopback or private paths.
+// masked with /dev/null and user.max_user_namespaces is 0, so no launcher can run (on a host
+// that cannot create that namespace, no launcher can run there either, and the driver runs
+// directly). Nothing on the host is changed. All listeners are parent-side and loopback or
+// private paths.
 
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createSocket } from 'node:dgram';
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -37,6 +42,8 @@ const ENFORCED = 'netns+fs-enforced (local)';
 const DRIVER = join(REPO, 'tests', 'pdf-parse', 'sandbox-driver.mjs');
 const OS_CONNECT_FAILURE = /^error:(?:ENETUNREACH|ECONNREFUSED|EHOSTUNREACH|EADDRNOTAVAIL|EACCES|EPERM|ENOENT)$/;
 const PATH_FAILURE = /^error:(?:ENOENT|ECONNREFUSED|EACCES|EPERM)$/;
+const LAUNCHER_NAME = /(?:^|\/)(?:bwrap|unshare|chroot|setpriv)(?:$|\s)/;
+const REFUSAL = { ok: false, status: 500, code: 'internal', reason: 'sandbox-unavailable', label: 'unavailable' };
 
 const scripts = mkdtempSync(join(tmpdir(), 'opensig-pl18-scripts-'));
 const sockets = mkdtempSync(join(tmpdir(), 'opensig-pl18-sockets-'));
@@ -153,19 +160,29 @@ function assertIsolated(result, label) {
   assert.match(result.abstract, OS_CONNECT_FAILURE, `${label}: abstract AF_UNIX (got ${result.abstract})`);
 }
 
-/** A command prefix that runs its argument where no sandbox launcher can run, or null. */
+let prefix;
+
+/**
+ * A command prefix that runs its argument where no sandbox launcher can run, or null when
+ * this host cannot build one (no user namespaces: then no launcher can run here either, and
+ * every driver run asserts that its plan found none). Each candidate is tried once.
+ */
 function noLauncherPrefix() {
+  if (prefix !== undefined) return prefix;
+  const candidates = [];
   const unshare = ['/usr/bin/unshare', '/bin/unshare'].find((path) => existsSync(path));
   const mount = ['/usr/bin/mount', '/bin/mount'].find((path) => existsSync(path));
   if (unshare && mount) {
     const script =
       'echo 0 > /proc/sys/user/max_user_namespaces || exit 90; ' +
       'for t in /usr/bin/bwrap /bin/bwrap; do if [ -e "$t" ]; then "$0" --bind /dev/null "$t" || exit 91; fi; done; exec "$@"';
-    return [unshare, '--user', '--map-root-user', '--mount', '--', '/bin/sh', '-c', script, mount];
+    candidates.push([unshare, '--user', '--map-root-user', '--mount', '--', '/bin/sh', '-c', script, mount]);
   }
   const bwrap = ['/usr/bin/bwrap', '/bin/bwrap'].find((path) => existsSync(path));
-  if (bwrap) return [bwrap, '--dev-bind', '/', '/', '--ro-bind', '/dev/null', bwrap, '--'];
-  return null;
+  if (bwrap) candidates.push([bwrap, '--dev-bind', '/', '/', '--ro-bind', '/dev/null', bwrap, '--']);
+  const works = (candidate) => spawnSync(candidate[0], [...candidate.slice(1), '/bin/true'], { env: {}, timeout: 30_000 }).status === 0;
+  prefix = candidates.find(works) ?? null;
+  return prefix;
 }
 
 /** Run the driver with exactly `env`, optionally where no launcher can run. */
@@ -173,10 +190,10 @@ function drive(env, { restricted }) {
   let file = process.execPath;
   let args = [DRIVER];
   if (restricted) {
-    const prefix = noLauncherPrefix();
-    if (prefix !== null) {
-      file = prefix[0];
-      args = [...prefix.slice(1), process.execPath, DRIVER];
+    const outer = noLauncherPrefix();
+    if (outer !== null) {
+      file = outer[0];
+      args = [...outer.slice(1), process.execPath, DRIVER];
     }
   }
   const run = spawnSync(file, args, { env, cwd: REPO, encoding: 'utf8', timeout: 120_000 });
@@ -206,6 +223,40 @@ process.stdout.write(JSON.stringify({ ok: false, reason: 'malformed', detail: 'c
 function noGateClaim(outcome) {
   const text = JSON.stringify(outcome);
   assert.ok(!text.includes('parser-network-sandbox') && !/pass(?:ed)?/i.test(text), 'the outcome never claims the production gate');
+}
+
+/** The unsandboxed command: the worker directly under the RLIMIT_CPU shell, no launcher anywhere. */
+function assertNoLauncher(command, entry, label) {
+  assert.notEqual(command, null, `${label}: an unsandboxed child command exists`);
+  assert.equal(command.file, '/bin/sh', `${label}: the RLIMIT_CPU shell, not a launcher`);
+  assert.equal(command.args[4], process.execPath, `${label}: node runs directly under the shell`);
+  assert.ok(!command.args.some((arg) => LAUNCHER_NAME.test(arg)), `${label}: no launcher in the unsandboxed command`);
+  assert.ok(command.args.includes('--permission') && command.args.includes(entry), `${label}: the permission-model worker entry`);
+}
+
+/** A driver run in which no launcher is usable and the opt-in is absent or not exactly "1". */
+function assertRefusedRun(result, label) {
+  assert.equal(result.plan.available, false, `${label}: the restricted child has no usable launcher`);
+  assert.deepEqual(result.plan, { mode: 'refused', label: 'unavailable', available: false, launcher: null }, label);
+  assert.equal(result.command, null, `${label}: serviceCommand() builds no child command`);
+  assert.deepEqual(result.outcome, REFUSAL, label);
+  assert.equal(Object.hasOwn(result.full, 'report'), false, `${label}: the refusal carries no report`);
+  noGateClaim(result.full);
+  // Fail-closed happens before the input is read: an oversized body gets the refusal, not a
+  // 413, and a streamed oversized body is never pulled from.
+  assert.deepEqual(result.oversized, REFUSAL, `${label}: oversized body refused before it is read`);
+  assert.deepEqual(result.oversized_stream, { ...REFUSAL, pulled: 0 }, `${label}: oversized stream never read`);
+}
+
+/** A driver run under the explicit development opt-in with no usable launcher. */
+function assertDevelopmentRun(result, label) {
+  assert.deepEqual(result.plan, { mode: 'unsandboxed', label: 'unavailable', available: false, launcher: null }, label);
+  assert.equal(result.worker_entry, service.WORKER_ENTRY, `${label}: the driver ran the service's own worker entry`);
+  assertNoLauncher(result.command, result.worker_entry, label);
+  assert.deepEqual(result.outcome, { ok: true, status: 200, label: 'unavailable', report_label: 'unavailable' }, label);
+  noGateClaim(result.full);
+  // Only when a child may run is the body read: the oversized body is the ordinary 413.
+  assert.deepEqual([result.oversized.status, result.oversized.reason, result.oversized.label], [413, 'size-limit', 'unavailable'], label);
 }
 
 test('[PL-18] host IPC is unreachable from the parse sandbox: pathname, abstract, TCP and UDP connects all fail', async (t) => {
@@ -305,6 +356,7 @@ test('[PL-13] the parse child cannot reach the network from its sandbox and stil
       assert.equal(command.file, '/bin/sh');
       assert.equal(command.args[4], launched.file, 'the launcher runs under the RLIMIT_CPU shell');
       assert.ok(command.args.includes('--permission') && command.args.includes(process.execPath));
+      assert.ok(command.args.includes(realpathSync(service.WORKER_ENTRY)), 'the sandboxed command runs the real worker entry');
       const parsed = await service.parsePdf(fixtureBytes('agreement-multipage.pdf'));
       assert.equal(parsed.ok, true, parsed.ok ? '' : `${parsed.reason} ${parsed.detail}`);
       assert.equal(parsed.network_sandbox, ENFORCED);
@@ -313,14 +365,14 @@ test('[PL-13] the parse child cannot reach the network from its sandbox and stil
       noGateClaim(parsed);
     } else {
       t.diagnostic('host branch: unavailable (no usable sandbox launcher on this host)');
+      assert.equal(plan.network_sandbox, 'unavailable');
+      assert.notEqual(plan.mode, 'sandboxed');
     }
 
     // The no-launcher branch, exercised for real in a child where no launcher can run.
-    const refused = drive({}, { restricted: true });
-    assert.deepEqual(refused.plan, { mode: 'refused', label: 'unavailable', available: false, launcher: null });
-    assert.deepEqual(refused.outcome, { ok: false, status: 500, code: 'internal', reason: 'sandbox-unavailable', label: 'unavailable' });
+    assertRefusedRun(drive({}, { restricted: true }), 'no launcher, no opt-in');
     const development = drive({ [FLAG]: '1' }, { restricted: true });
-    assert.deepEqual(development.outcome, { ok: true, status: 200, label: 'unavailable', report_label: 'unavailable' });
+    assertDevelopmentRun(development, 'no launcher, explicit opt-in');
     t.diagnostic('no-launcher branch: fail-closed and the explicit development label both asserted');
   } finally {
     await host.close();
@@ -342,28 +394,41 @@ test('[PL-15] unsandboxed parsing needs OPENSIG_PARSER_ALLOW_UNSANDBOXED=1 and n
     'flag "yes"': { [FLAG]: 'yes' },
     'flag " 1"': { [FLAG]: ' 1' },
     'flag "01"': { [FLAG]: '01' },
+    'flag "1\\n"': { [FLAG]: '1\n' },
     'flag empty': { [FLAG]: '' },
     'similar names': { OPENSIG_PARSER_ALLOW_UNSANDBOX: '1', OPENSIG_ALLOW_UNSANDBOXED: '1' },
   };
-  for (const [name, env] of Object.entries(refusedEnvs)) {
-    const result = drive(env, { restricted: true });
-    assert.equal(result.plan.available, false, `${name}: the restricted child has no usable launcher`);
-    assert.equal(result.plan.mode, 'refused', name);
-    assert.deepEqual(result.outcome, { ok: false, status: 500, code: 'internal', reason: 'sandbox-unavailable', label: 'unavailable' }, name);
-  }
+  for (const [name, env] of Object.entries(refusedEnvs)) assertRefusedRun(drive(env, { restricted: true }), name);
 
   // The explicit opt-in, with no usable launcher: unsandboxed, labelled unavailable.
   const optIn = drive({ [FLAG]: '1', OPENSIG_ENV: 'production', NODE_ENV: 'production' }, { restricted: true });
-  assert.deepEqual(optIn.plan, { mode: 'unsandboxed', label: 'unavailable', available: false, launcher: null });
-  assert.deepEqual(optIn.outcome, { ok: true, status: 200, label: 'unavailable', report_label: 'unavailable' });
+  assertDevelopmentRun(optIn, 'explicit opt-in with production names set');
+
+  // serviceCommand() itself: a refused plan has no child command; an unsandboxed plan runs
+  // WORKER_ENTRY under the shell with no launcher; the host's own plan matches its mode.
+  const limits = [DEFAULT_PARSER_LIMITS, DEFAULT_SERVICE_LIMITS];
+  const noProbe = { available: false, launcher: null, tools: {} };
+  assert.equal(service.serviceCommand({ mode: 'refused', network_sandbox: 'unavailable', probe: noProbe }, ...limits), null, 'refused: no child command');
+  assertNoLauncher(service.serviceCommand({ mode: 'unsandboxed', network_sandbox: 'unavailable', probe: noProbe }, ...limits), service.WORKER_ENTRY, 'unsandboxed plan');
+  const hostPlan = await service.parseServicePlan();
+  const hostCommand = service.serviceCommand(hostPlan, ...limits);
 
   // The opt-in never downgrades a host where a launcher works.
   const host = drive({ [FLAG]: '1' }, { restricted: false });
-  const hostPlan = await service.parseServicePlan();
+  noGateClaim(host.full);
   if (hostPlan.probe.available) {
     assert.deepEqual([host.plan.mode, host.plan.label, host.outcome.report_label], ['sandboxed', ENFORCED, ENFORCED]);
+    const launcher = hostPlan.probe.tools[hostPlan.probe.launcher === 'bwrap' ? 'bwrap' : 'unshare'];
+    for (const command of [host.command, hostCommand]) {
+      assert.equal(command.file, '/bin/sh');
+      assert.equal(command.args[4], launcher, 'the opt-in does not remove the launcher');
+      assert.ok(command.args.includes(host.worker_entry_real), 'the sandboxed command runs the real worker entry');
+    }
   } else {
     assert.deepEqual([host.plan.mode, host.plan.label], ['unsandboxed', 'unavailable']);
+    assertNoLauncher(host.command, host.worker_entry, 'host without a launcher, opt-in set');
+    if (hostPlan.mode === 'unsandboxed') assertNoLauncher(hostCommand, service.WORKER_ENTRY, 'this process, opt-in set');
+    else assert.equal(hostCommand, null, 'this process, no opt-in: no child command');
   }
 });
 
@@ -424,4 +489,55 @@ test('[PL-19] no caller-supplied option can downgrade or relabel the sandbox, an
   }
   // The launcher binaries come from a fixed table of absolute paths.
   for (const paths of Object.values(sandbox.TOOL_PATHS)) for (const path of paths) assert.match(path, /^\/(?:usr\/)?s?bin\/[a-z]+$/);
+});
+
+test('[PL-23] /dev in the parse sandbox holds only a read-only, nodev /dev/null: not writable, no /dev/shm, under each launcher', async (t) => {
+  const file = join(scripts, `dev-${Date.now()}.mjs`);
+  writeFileSync(
+    file,
+    `import * as fs from 'node:fs';
+const attempt = (action) => { try { action(); return 'ok'; } catch (error) { return error.code; } };
+const result = {
+  entries: attempt(() => fs.readdirSync('/dev')) === 'ok' ? fs.readdirSync('/dev').sort() : null,
+  create: attempt(() => fs.writeFileSync('/dev/opensig-pl23', 'x')),
+  mkdir: attempt(() => fs.mkdirSync('/dev/opensig-pl23-dir')),
+  shm: attempt(() => fs.statSync('/dev/shm')),
+  shm_create: attempt(() => fs.writeFileSync('/dev/shm/opensig-pl23', 'x')),
+  null_write: attempt(() => fs.writeFileSync('/dev/null', 'x')),
+  null_read: attempt(() => fs.readFileSync('/dev/null')),
+};
+process.stdout.write(JSON.stringify(result) + '\\n');
+`,
+    { mode: 0o600 },
+  );
+  const hostPlan = await service.parseServicePlan();
+  if (!hostPlan.probe.available) {
+    t.diagnostic('no sandbox launcher on this host: nothing runs, the service refuses');
+    assert.notEqual(hostPlan.mode, 'sandboxed');
+    return;
+  }
+  let checked = 0;
+  for (const kind of ['bwrap', 'util-linux']) {
+    const kindPlan = await service.createParseServiceForTests({ launchers: [kind] }).plan();
+    if (kindPlan.mode !== 'sandboxed') {
+      t.diagnostic(`launcher ${kind}: unavailable here`);
+      continue;
+    }
+    const command = service.sandboxedCommand(kindPlan.probe, process.execPath, [file], [file]);
+    const dev = await runJson(command.file, command.args);
+    t.diagnostic(`launcher ${kind}: ${JSON.stringify(dev)}`);
+    assert.deepEqual(dev.entries, ['null'], `${kind}: /dev holds only null`);
+    assert.equal(dev.create, 'EROFS', `${kind}: no file can be created in /dev`);
+    assert.equal(dev.mkdir, 'EROFS', `${kind}: no directory can be created in /dev`);
+    assert.equal(dev.shm, 'ENOENT', `${kind}: there is no /dev/shm`);
+    assert.equal(dev.shm_create, 'ENOENT', `${kind}: nothing can be written under /dev/shm`);
+    assert.match(dev.null_write, /^(?:EROFS|EACCES|EPERM)$/, `${kind}: /dev/null cannot be opened for writing`);
+    assert.match(dev.null_read, /^(?:EACCES|EPERM)$/, `${kind}: /dev/null is nodev, so no device node can be opened`);
+    checked += 1;
+  }
+  assert.ok(checked >= 1, 'at least the launcher the host plan chose was checked');
+  // The worker itself still parses inside that root.
+  const parsed = await service.parsePdf(classicPdf(basicObjects()));
+  assert.equal(parsed.ok, true, parsed.ok ? '' : `${parsed.reason} ${parsed.detail}`);
+  assert.equal(parsed.network_sandbox, ENFORCED);
 });

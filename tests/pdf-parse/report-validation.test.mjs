@@ -7,6 +7,10 @@
 // counts, sizes, rotations, boxes, isolation flags, byte counts, trailers, page references
 // and objects; every such report is a fail-closed 500 service-failure. An honest copy of a
 // real report passes, which shows the lying children run through the same path.
+//
+// PL-22 (re-check LBR2-1): the parent's bounds are the parser's own, so an honest child's
+// report of any document the parser accepts is accepted, and a document the parser refuses
+// is a 422, never a 500 service failure.
 
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -15,6 +19,7 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 
 import * as service from '../../src/pdf/service.ts';
+import { basicObjects, classicPdf, numberedPdf, xrefStreamPdf } from './pdf-builder.mjs';
 import { fixtureBytes, sha256 } from './support.mjs';
 
 const dir = mkdtempSync(join(tmpdir(), 'opensig-pl17-'));
@@ -196,4 +201,98 @@ test('[PL-20] the parent shape-checks and bounds the reported objects, trailer a
   const outcome = await viaChild(input, JSON.stringify({ ok: true, report: forged }));
   assert.deepEqual([outcome.ok, outcome.status, outcome.reason], [false, 500, 'service-failure']);
   assert.match(outcome.detail, /invalid report/);
+});
+
+test('[PL-22] documents the parser accepts are never refused by the parent, and parser refusals stay 422', async () => {
+  const nested = (levels) => `${'['.repeat(levels)}${']'.repeat(levels)}`;
+  const big = 12_345_678_901;
+  const name = 'N'.repeat(1500);
+  // [document, parse options, check on the accepted report]
+  const legal = {
+    'reference to an object beyond /Size (legal; it means null)': [
+      classicPdf(basicObjects({ page: '/Foo 99 0 R' })),
+      {},
+      (r) => assert.deepEqual(r.objects[String(r.pages[0].ref[0])].value.dict.Foo, { ref: [99, 0] }),
+    ],
+    'trailer /Info beyond /Size': [classicPdf(basicObjects(), { trailer: '/Info 99 0 R' }), {}, (r) => assert.deepEqual(r.trailer.info, [99, 0])],
+    '/ID of 300 bytes per part': [
+      classicPdf(basicObjects(), { trailer: `/ID [<${'ab'.repeat(300)}> <${'cd'.repeat(300)}>]` }),
+      {},
+      (r) => assert.deepEqual(r.trailer.id, ['ab'.repeat(300), 'cd'.repeat(300)]),
+    ],
+    'name key of 1500 characters': [
+      classicPdf(basicObjects({ page: `/${name} 1` })),
+      {},
+      (r) => assert.equal(r.objects[String(r.pages[0].ref[0])].value.dict[name], 1),
+    ],
+    'name value of 1500 characters': [
+      classicPdf(basicObjects({ page: `/Foo /${name}` })),
+      {},
+      (r) => assert.deepEqual(r.objects[String(r.pages[0].ref[0])].value.dict.Foo, { name }),
+    ],
+    'string of 70000 bytes': [
+      classicPdf(basicObjects({ page: `/Foo <${'ab'.repeat(70_000)}>` })),
+      {},
+      (r) => assert.equal(r.objects[String(r.pages[0].ref[0])].value.dict.Foo.hex.length, 140_000),
+    ],
+    'array of 200001 numbers': [
+      classicPdf(basicObjects({ page: `/Foo [${'0 '.repeat(200_001)}]` })),
+      {},
+      (r) => assert.equal(r.objects[String(r.pages[0].ref[0])].value.dict.Foo.length, 200_001),
+    ],
+    'nesting at the default depth limit': [classicPdf(basicObjects({ page: `/Foo ${nested(63)}` })), {}, (r) => assert.equal(r.stats.max_depth, 64)],
+    'nesting of 199 under a configured maxDepth of 200': [
+      classicPdf(basicObjects({ page: `/Foo ${nested(199)}` })),
+      { limits: { maxDepth: 200 } },
+      (r) => assert.equal(r.stats.max_depth, 200),
+    ],
+    'page object number of eleven digits': [
+      numberedPdf(
+        [
+          [1, '<< /Type /Catalog /Pages 2 0 R >>'],
+          [2, `<< /Type /Pages /Kids [${big} 0 R] /Count 1 /MediaBox [0 0 612 792] >>`],
+          [big, '<< /Type /Page /Parent 2 0 R >>'],
+        ],
+        { root: 1 },
+      ),
+      {},
+      (r) => assert.deepEqual(r.pages[0].ref, [big, 0]),
+    ],
+    'cross-reference stream with a non-zero generation': [
+      xrefStreamPdf([...basicObjects({ page: '/Annots 4 7 R' }), '[]'], { gens: { 4: 7 } }),
+      {},
+      (r) => assert.equal(r.objects['4'].gen, 7),
+    ],
+  };
+  const refused = {
+    'nesting one beyond the default depth limit': [classicPdf(basicObjects({ page: `/Foo ${nested(64)}` })), {}, 'limit-exceeded'],
+    'cross-reference stream generation above 65535': [
+      xrefStreamPdf([...basicObjects({ page: '/Annots 4 0 R' }), '[]'], { gens: { 4: 70_000 } }),
+      {},
+      'malformed',
+    ],
+  };
+  const run = (table) => Promise.all(Object.values(table).map(([input, options]) => service.parsePdf(input, options)));
+  const [accepted, rejected] = await Promise.all([run(legal), run(refused)]);
+  Object.entries(legal).forEach(([label, [input, , check]], index) => {
+    const outcome = accepted[index];
+    assert.equal(outcome.ok, true, `${label}: ${outcome.ok ? '' : `${outcome.status} ${outcome.reason} ${outcome.detail}`}`);
+    assert.equal(outcome.status, 200, label);
+    assert.equal(outcome.report.digest, sha256(input), label);
+    check(outcome.report);
+  });
+  Object.entries(refused).forEach(([label, [, , reason]], index) => {
+    const outcome = rejected[index];
+    assert.deepEqual([outcome.ok, outcome.status, outcome.reason], [false, 422, reason], `${label}: ${outcome.detail}`);
+  });
+
+  // The reported nesting bound follows the configured parser limit, not a fixed one.
+  const deepInput = classicPdf(basicObjects({ page: `/Foo ${nested(150)}` }));
+  const deep = await service.parsePdf(deepInput, { limits: { maxDepth: 200 } });
+  assert.equal(deep.ok, true, deep.ok ? '' : deep.detail);
+  const report = clone(deep.report);
+  delete report.digest;
+  delete report.network_sandbox;
+  assert.notEqual(service.validateChildResult({ ok: true, report }, deepInput.length, 50, 200), null);
+  assert.equal(service.validateChildResult({ ok: true, report }, deepInput.length, 50, 64), null);
 });

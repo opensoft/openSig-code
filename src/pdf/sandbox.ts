@@ -9,7 +9,8 @@
 //
 // - bubblewrap (preferred):
 //     bwrap --unshare-all --die-with-parent --new-session --cap-drop ALL --clearenv
-//           --ro-bind <src> <dest>... --dev /dev --remount-ro / --chdir / -- <node> ...
+//           --ro-bind <src> <dest>... --ro-bind /dev/null /dev/null --remount-ro /
+//           --chdir / -- <node> ...
 // - the util-linux composition:
 //     unshare --user --map-root-user --net --mount --ipc --uts --pid --fork --kill-child
 //             -- /bin/sh -c <setup> ...
@@ -19,8 +20,10 @@
 //
 // The root holds only: the library directories the runtime needs (bound read-only), the
 // Node binary, the worker's source files (each bound as a file, so nothing created later in
-// the source directory appears) and, for util-linux, the setpriv binary; plus a minimal
-// /dev. There is no /proc, /run, /tmp, /var, /etc or home directory.
+// the source directory appears) and, for util-linux, the setpriv binary; plus /dev holding
+// only a read-only, nodev bind of /dev/null. Because of nodev that node exists but cannot be
+// opened (the worker opens no device: its stdio are pipes). Nothing in the root is writable:
+// there is no tmpfs /dev or /dev/shm, and no /proc, /run, /tmp, /var, /etc or home directory.
 //
 // What this does and does not give the worker:
 // - IP connects (TCP, UDP) fail: the network namespace has only a down loopback interface.
@@ -29,7 +32,8 @@
 //   not exist in the root, so they cannot be connected to or written. A socket placed inside
 //   one of the bound library directories would be reachable; the binds therefore never
 //   include the worker's directory or any writable location.
-// - No capabilities, no writable file system, no view of host processes.
+// - No capabilities, no writable file system (including /dev), no usable device node, no
+//   view of host processes.
 //
 // The probe launches a check inside each candidate launcher with the same root and
 // confirms isolation from inside (read-only root, host paths absent, no non-loopback
@@ -143,6 +147,7 @@ const UTIL_LINUX_SETUP = [
   'done',
   'shift',
   'mkdir -p "$root/dev"; : > "$root/dev/null"; "$mount" --bind /dev/null "$root/dev/null"',
+  '"$mount" -o remount,bind,ro,nosuid,nodev "$root/dev/null"',
   '"$mount" -o remount,bind,ro "$root"',
   'exec "$chroot" "$root" "$setpriv" --no-new-privs --inh-caps=-all --ambient-caps=-all --bounding-set=-all \\',
   '  --securebits=+noroot,+noroot_locked,+no_setuid_fixup,+no_setuid_fixup_locked,+keep_caps_locked -- "$@"',
@@ -183,8 +188,9 @@ export function launcherCommand(probe: SandboxProbe, binds: readonly Bind[], fil
         'ALL',
         '--clearenv',
         ...binds.flatMap((bind) => ['--ro-bind', bind.source, bind.target]),
-        '--dev',
-        '/dev',
+        '--ro-bind',
+        '/dev/null',
+        '/dev/null',
         '--remount-ro',
         '/',
         '--chdir',
