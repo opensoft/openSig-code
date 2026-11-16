@@ -5,7 +5,10 @@
 // envelope version through the repository's single CAS path, and, when the
 // caller passes an Idempotency-Key, records its result in the same
 // transaction, so a retry with the same request replays the original status
-// and bytes and makes no second mutation.
+// and bytes and makes no second mutation. A record keeps at most 256 KiB of
+// response: a larger body fails the mutation (500 internal) and is never
+// truncated. A record older than 24 hours is no longer a replay: it is
+// deleted and the request runs as a new one (data-model.md § IdempotencyRecord).
 //
 // Version semantics (data-model.md § Transitions and races, item 1): create
 // inserts draft at version 1; each successful operation that changes the
@@ -48,10 +51,14 @@ import {
 } from '../../storage/repositories/envelopes.ts';
 import {
   IDEMPOTENCY_KEY_PATTERN,
+  IdempotencyBodyTooLarge,
+  MAX_IDEMPOTENCY_BODY_BYTES,
+  deleteIdempotencyRecord,
   findIdempotencyRecord,
   idempotencyRequestDigest,
   insertIdempotencyRecord,
-  storedResponseBody,
+  isIdempotencyRecordExpired,
+  recordedResponse,
 } from '../../storage/repositories/idempotency.ts';
 import { EnvelopeError, invalid } from './errors.ts';
 import { buildFieldManifest, FIELD_MANIFEST_SCHEMA, recipientsDigest } from './manifest.ts';
@@ -126,6 +133,11 @@ export interface EnvelopeServiceOptions {
    * throw rolls the whole mutation back.
    */
   readonly onChange?: (change: EnvelopeChange, store: TenantStore) => void;
+  /**
+   * The largest response body an idempotency record keeps, in bytes. It can
+   * only lower the 256 KiB bound (MAX_IDEMPOTENCY_BODY_BYTES), never raise it.
+   */
+  readonly idempotencyBodyLimit?: number;
 }
 
 export interface OperatorRequest {
@@ -178,13 +190,19 @@ export class EnvelopeService {
   readonly #clock: () => Date;
   readonly #newId: () => string;
   readonly #onChange: ((change: EnvelopeChange, store: TenantStore) => void) | undefined;
+  readonly #bodyLimit: number;
 
   constructor(options: EnvelopeServiceOptions) {
     if (typeof options?.clock !== 'function') throw new TypeError('the envelope service needs an injected clock');
+    const bodyLimit = options.idempotencyBodyLimit ?? MAX_IDEMPOTENCY_BODY_BYTES;
+    if (!Number.isSafeInteger(bodyLimit) || bodyLimit < 2 || bodyLimit > MAX_IDEMPOTENCY_BODY_BYTES) {
+      throw new TypeError(`the idempotency body limit must be an integer in 2..${MAX_IDEMPOTENCY_BODY_BYTES}`);
+    }
     this.#db = options.db;
     this.#clock = options.clock;
     this.#newId = options.newId ?? defaultId;
     this.#onChange = options.onChange;
+    this.#bodyLimit = bodyLimit;
     Object.freeze(this);
   }
 
@@ -272,28 +290,44 @@ export class EnvelopeService {
       const store = this.#db.forTenant(request.tenantId);
       if (idempotency !== undefined && digest !== undefined) {
         const existing = findIdempotencyRecord(store, route, actor.ref, idempotency.key);
-        if (existing !== undefined) {
+        if (existing !== undefined && isIdempotencyRecordExpired(existing, now)) {
+          // Past its 24 hours (purged or not), a record is no longer a replay.
+          deleteIdempotencyRecord(store, existing);
+        } else if (existing !== undefined) {
           if (existing.requestDigest !== digest || existing.principal.kind !== actor.kind) {
             throw new EnvelopeError('idempotency_conflict', 'the Idempotency-Key was used with a different request');
           }
-          return { kind: 'replay', status: existing.responseStatus, bytes: storedResponseBody(existing) };
+          const response = recordedResponse(existing);
+          // Envelope responses carry no one-time secret, so their records always keep the body.
+          if (response.kind !== 'body') throw new EnvelopeError('internal', 'the idempotency record holds no response body');
+          return { kind: 'replay', status: existing.responseStatus, bytes: response.bytes };
         }
       }
       const outcome = run(store, now);
       if (outcome.kind === 'refused') return outcome;
-      const bytes =
-        idempotency !== undefined && digest !== undefined
-          ? insertIdempotencyRecord(store, {
-              route,
-              principal: actor,
-              key: idempotency.key,
-              requestDigest: digest,
-              responseStatus: outcome.status,
-              responseBody: outcome.body,
-              resourceId: outcome.resourceId,
-              createdAt: now.toISOString(),
-            })
-          : canonicalBytes(outcome.body);
+      if (idempotency === undefined || digest === undefined) return { kind: 'done', status: outcome.status, bytes: canonicalBytes(outcome.body) };
+      let bytes: Buffer | null;
+      try {
+        bytes = insertIdempotencyRecord(
+          store,
+          {
+            route,
+            principal: actor,
+            key: idempotency.key,
+            requestDigest: digest,
+            responseStatus: outcome.status,
+            response: { kind: 'body', body: outcome.body },
+            resourceId: outcome.resourceId,
+            createdAt: now.toISOString(),
+          },
+          this.#bodyLimit,
+        );
+      } catch (error) {
+        // Thrown inside the transaction: the whole mutation rolls back; the body is never truncated.
+        if (error instanceof IdempotencyBodyTooLarge) throw new EnvelopeError('internal', 'the response exceeds the idempotency record limit');
+        throw error;
+      }
+      if (bytes === null) throw new EnvelopeError('internal', 'the idempotency record kept no response body');
       return { kind: 'done', status: outcome.status, bytes };
     });
     if (settled.kind === 'refused') throw settled.error;
@@ -448,8 +482,9 @@ export class EnvelopeService {
 
   /**
    * sendEnvelope: prepared -> sent, recipient 1 invited, version + 1. A
-   * service-created envelope needs a valid SendConfirmation, which this send
-   * consumes; any reference presented is checked and consumed the same way.
+   * service-created envelope, or any send by a service principal, needs a
+   * valid SendConfirmation, which this send consumes; any reference presented
+   * is checked and consumed the same way.
    */
   send(request: OperatorRequest, envelopeId: string, input: unknown): MutationResult {
     return this.#mutate(request, ROUTES.send, envelopeId, (store, now) => {
@@ -462,7 +497,7 @@ export class EnvelopeService {
       this.#expectVersion(envelope, checked.expectedVersion);
       const aggregate = this.#aggregate(store, envelopeId);
       const iso = now.toISOString();
-      if (confirmationRequired(envelope.createdBy) && checked.authorizationReference === undefined) {
+      if (confirmationRequired(envelope.createdBy, request.actor) && checked.authorizationReference === undefined) {
         throw new EnvelopeError('confirmation_required', 'a human operator must confirm this send');
       }
       if (checked.authorizationReference !== undefined) {

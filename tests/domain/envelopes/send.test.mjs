@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Send rules (T007): a service-created envelope is sent only with a
-// single-use, digest-bound, unexpired SendConfirmation made by a human
-// operator (contract § Sending and human confirmation).
+// Send rules (T007): a service-created envelope, and any envelope a service
+// principal sends, is sent only with a single-use, digest-bound, unexpired
+// SendConfirmation made by a human operator (contract § Sending and human
+// confirmation; tasks.md § T007 decisions, A-010: ST-14).
 
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
-import { confirmationProblems } from '../../../src/domain/envelopes/index.ts';
+import { confirmationProblems, confirmationRequired } from '../../../src/domain/envelopes/index.ts';
 import { consumeSendConfirmation, getSendConfirmation, insertSendConfirmation } from '../../../src/storage/repositories/envelopes.ts';
 import {
   BASE_TIME,
@@ -105,7 +106,7 @@ test('[ST-07] a service-created envelope needs a human confirmation of the exact
   }
 });
 
-test('[ST-07] a confirmation is refused once expired, when bound to another version or digest set, and can never come from a service principal; human-created envelopes need none', () => {
+test('[ST-07] a confirmation is refused once expired, when bound to another version or digest set, and can never come from a service principal; a human operator sending a human-created envelope needs none', () => {
   const ctx = setup(scratch);
   try {
     const stale = preparedEnvelope(ctx, { creator: SERVICE });
@@ -168,8 +169,84 @@ test('[ST-07] a confirmation is refused once expired, when bound to another vers
     const human = preparedEnvelope(ctx, { creator: HUMAN });
     assert.deepEqual(human.send_confirmation, { required: false, authorization_reference: null });
     assert.equal(ctx.service.send(req(ctx.tenant, HUMAN), human.id, { expected_version: human.version }).body.state, 'sent');
+    // A-010 (ST-14): a service principal sending it still needs a human confirmation.
     const humanForService = preparedEnvelope(ctx, { creator: HUMAN });
-    assert.equal(ctx.service.send(req(ctx.tenant, SERVICE), humanForService.id, { expected_version: humanForService.version }).body.state, 'sent');
+    rejectsWith(() => ctx.service.send(req(ctx.tenant, SERVICE), humanForService.id, { expected_version: humanForService.version }), 'confirmation_required', 409);
+    assert.equal(ctx.service.read(req(ctx.tenant), humanForService.id).state, 'prepared');
+  } finally {
+    ctx.db.close();
+  }
+});
+
+test('[ST-14] a service principal sending a human-created envelope gets 409 confirmation_required without a valid human SendConfirmation, and with one the envelope is sent', () => {
+  const ctx = setup(scratch);
+  try {
+    assert.deepEqual(
+      [
+        confirmationRequired(HUMAN, HUMAN),
+        confirmationRequired(HUMAN, SERVICE),
+        confirmationRequired(SERVICE, HUMAN),
+        confirmationRequired(SERVICE, SERVICE),
+        confirmationRequired(SERVICE),
+        confirmationRequired(HUMAN),
+      ],
+      [false, true, true, true, true, false],
+      'required when the envelope is service-created or the sender is a service',
+    );
+
+    const prepared = preparedEnvelope(ctx, { creator: HUMAN });
+    assert.deepEqual(prepared.created_by, HUMAN);
+    assert.deepEqual(prepared.send_confirmation, { required: false, authorization_reference: null }, 'the contract field keeps the creator rule (A-010)');
+    const unchanged = () => {
+      const now = ctx.service.read(req(ctx.tenant), prepared.id);
+      assert.equal(now.state, 'prepared');
+      assert.equal(now.version, prepared.version, 'a refused send leaves the version');
+      assert.deepEqual(now.recipients.map((r) => r.status), prepared.recipients.map((r) => r.status), 'and invites nobody');
+    };
+    const sendsBefore = ctx.changes.filter((change) => change.operation === 'send').length;
+    const send = { expected_version: prepared.version };
+    rejectsWith(() => ctx.service.send(req(ctx.tenant, SERVICE), prepared.id, send), 'confirmation_required', 409);
+    unchanged();
+    const key = 'service-send-key-00001';
+    rejectsWith(() => ctx.service.send(req(ctx.tenant, SERVICE, { key, request: send }), prepared.id, send), 'confirmation_required', 409);
+    assert.equal(ctx.db.transaction(() => ctx.db.forTenant(ctx.tenant).count('idempotency_records', { key })), 0, 'the refusal recorded nothing');
+
+    rejectsWith(
+      () => ctx.service.send(req(ctx.tenant, SERVICE), prepared.id, { ...send, authorization_reference: sid('unknown-ref') }),
+      'confirmation_invalid',
+      409,
+    );
+    const other = preparedEnvelope(ctx, { creator: HUMAN });
+    const otherRef = ctx.service.confirmSend(req(ctx.tenant, HUMAN), other.id, confirmInput(ctx.service.preview(req(ctx.tenant), other.id))).body.authorization_reference;
+    rejectsWith(() => ctx.service.send(req(ctx.tenant, SERVICE), prepared.id, { ...send, authorization_reference: otherRef }), 'confirmation_invalid', 409);
+    assert.equal(storedConfirmation(ctx, otherRef).consumedAt, null, 'a confirmation of another envelope is not consumed');
+    unchanged();
+    assert.equal(ctx.changes.filter((change) => change.operation === 'send').length, sendsBefore, 'no send happened');
+
+    const confirmation = ctx.service.confirmSend(req(ctx.tenant, HUMAN), prepared.id, confirmInput(ctx.service.preview(req(ctx.tenant, SERVICE), prepared.id))).body;
+    assert.deepEqual(confirmation.confirmed_by, HUMAN);
+    const sent = ctx.service.send(req(ctx.tenant, SERVICE, { key, request: { ...send, authorization_reference: confirmation.authorization_reference } }), prepared.id, {
+      ...send,
+      authorization_reference: confirmation.authorization_reference,
+    });
+    assert.equal(sent.status, 200);
+    assert.equal(sent.replayed, false, 'the refused attempt under the same key recorded nothing');
+    assert.equal(sent.body.state, 'sent');
+    assert.equal(sent.body.version, prepared.version + 1);
+    assert.deepEqual(sent.body.recipients.map((r) => [r.status, r.invited_at]), [['invited', ctx.time.now.toISOString()]]);
+    assert.equal(storedConfirmation(ctx, confirmation.authorization_reference).consumedAt, ctx.time.now.toISOString(), 'the send consumed the confirmation');
+    const sendChanges = ctx.changes.filter((change) => change.operation === 'send');
+    assert.equal(sendChanges.length, sendsBefore + 1);
+    assert.deepEqual(sendChanges.at(-1).actor, SERVICE, 'the service principal is the sender');
+
+    // Single use: the consumed confirmation authorizes no further service send.
+    const again = preparedEnvelope(ctx, { creator: HUMAN });
+    rejectsWith(
+      () => ctx.service.send(req(ctx.tenant, SERVICE), again.id, { expected_version: again.version, authorization_reference: confirmation.authorization_reference }),
+      'confirmation_invalid',
+      409,
+    );
+    assert.equal(ctx.service.read(req(ctx.tenant), again.id).state, 'prepared');
   } finally {
     ctx.db.close();
   }

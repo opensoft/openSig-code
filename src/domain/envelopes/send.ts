@@ -1,24 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Send rules (contract § Sending and human confirmation; data-model.md
-// § Entities, SendConfirmation). An envelope created by a service principal
-// is sent only with a SendConfirmation that:
+// § Entities, SendConfirmation; tasks.md § T007 decisions, A-010). An
+// envelope created by a service principal, and any envelope a service
+// principal sends, is sent only with a SendConfirmation that:
 // - a human operator of the tenant made (never a service principal);
 // - names this envelope, its current version and its current document,
 //   manifest and recipients digests;
 // - is unconsumed and unexpired (24 hours, or the envelope's expiry if
 //   earlier);
 // - is consumed by the send that uses it (single use).
-// A human-created envelope needs no confirmation (send_confirmation.required
-// is true exactly when created_by.kind is service).
+// A human operator sending a human-created envelope needs no confirmation.
+// The view field send_confirmation.required keeps the contract's creator
+// rule (true exactly when created_by.kind is service); the service-sender
+// rule is decided per send, from the sender.
 
 import type { SendConfirmationRecord } from '../../storage/repositories/envelopes.ts';
 import type { Actor } from './validation.ts';
 
 export const CONFIRMATION_TTL_MS = 24 * 60 * 60 * 1000;
 
-export function confirmationRequired(createdBy: Actor): boolean {
-  return createdBy.kind === 'service';
+/** True when the send needs a human SendConfirmation: the envelope is service-created or the sender is a service. */
+export function confirmationRequired(createdBy: Actor, sender?: Actor): boolean {
+  return createdBy.kind === 'service' || sender?.kind === 'service';
 }
 
 /** A confirmation expires 24 hours after it is made or at the envelope's expiry, whichever is first. */
