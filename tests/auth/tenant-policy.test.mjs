@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// T005 auth AU-11 and AU-12 (A-008 P11): the tenant's allowed_roles, owned by the
-// canonical tenants table, are enforced through an injected TenantPolicy. The policies
+// T005 auth AU-11, AU-12 (A-008 P11) and AU-13 (A-009 LBR-6): the tenant's allowed_roles,
+// owned by the canonical tenants table, are enforced through an injected TenantPolicy. The policies
 // here are plain test objects standing in for the storage-backed policy that the T031
 // follow-up wires; the auth module defines no tenant table of its own.
 //
 // AU-11: a role outside the tenant's allowed_roles grants nothing, so operations that need
 // it are denied. AU-12: an unknown tenant (no policy), a malformed policy value or a
-// failing policy fails closed with 401.
+// failing policy fails closed with 401. AU-13 (A-009 LBR-6): the authenticator and its
+// `policy` are frozen and fixed at construction.
 
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
@@ -121,4 +122,42 @@ test('[AU-12] an unknown tenant, a malformed policy or a failing policy fails cl
   // Without a policy the authenticator says so, for the server wiring to refuse (SEC-07).
   assert.equal(authenticatorWith(undefined).policy, 'not-configured');
   assert.equal(authenticatorWith(policyOf({})).policy, 'enforced');
+});
+
+test('[AU-13] the authenticator and its policy are frozen and cannot be reassigned after construction', () => {
+  const policy = policyOf({ [ALPHA.id]: ['tenant_admin'] });
+  const enforced = authenticatorWith(policy);
+  const unconfigured = authenticatorWith(undefined);
+  for (const authenticator of [enforced, unconfigured]) {
+    assert.ok(Object.isFrozen(authenticator), 'the authenticator object is frozen');
+    const descriptor = Object.getOwnPropertyDescriptor(authenticator, 'policy');
+    assert.equal(descriptor.writable, false);
+    assert.equal(descriptor.configurable, false);
+    // Module code is strict, so every attempt throws and changes nothing.
+    const other = authenticator.policy === 'enforced' ? 'not-configured' : 'enforced';
+    assert.throws(() => {
+      authenticator.policy = other;
+    }, TypeError);
+    assert.throws(() => Object.defineProperty(authenticator, 'policy', { value: other }), TypeError);
+    assert.throws(() => delete authenticator.policy, TypeError);
+    assert.throws(() => {
+      authenticator.authenticate = () => ({ ok: true });
+    }, TypeError);
+    assert.throws(() => {
+      authenticator.verifyToken = () => ({ ok: true });
+    }, TypeError);
+  }
+  assert.equal(enforced.policy, 'enforced');
+  assert.equal(unconfigured.policy, 'not-configured');
+
+  // Swapping the injected object's lookup after construction does not change enforcement.
+  policy.allowedRoles = () => ['sender', 'tenant_admin', 'service'];
+  const sender = verify(enforced, alphaToken('sender'));
+  assert.equal(sender.ok, true, sender.reason);
+  assert.deepEqual(sender.principal.roles, [], 'sender is still outside the alpha allowed_roles');
+  assert.equal(auth.authorize('createEnvelope', sender.principal).status, 403);
+
+  // The unconfigured authenticator cannot be given a policy afterwards either.
+  assert.throws(() => Object.defineProperty(unconfigured, 'tenantPolicy', { value: policy }), TypeError);
+  assert.equal(Object.keys(unconfigured).includes('tenantPolicy'), false);
 });

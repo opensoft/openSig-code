@@ -28,6 +28,7 @@
 //   `tenant-policy`.
 // Without a policy the authenticator reports `policy: 'not-configured'`; the server wiring
 // (T031 follow-up, SEC-07) supplies the storage-backed policy and refuses to start without it.
+// The authenticator is frozen and its policy is fixed at construction (A-009 LBR-6).
 
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
@@ -186,10 +187,15 @@ function applyPolicy(principal: OperatorPrincipal, policy: TenantPolicy | undefi
 }
 
 export function createOperatorAuthenticator(config: OperatorAuthConfig, options: OperatorAuthenticatorOptions = {}): OperatorAuthenticator {
-  const tenantPolicy = options.tenantPolicy;
-  if (tenantPolicy !== undefined && (typeof tenantPolicy !== 'object' || tenantPolicy === null || typeof tenantPolicy.allowedRoles !== 'function')) {
+  const injected = options.tenantPolicy;
+  if (injected !== undefined && (typeof injected !== 'object' || injected === null || typeof injected.allowedRoles !== 'function')) {
     throw new TypeError('tenantPolicy must provide allowedRoles(tenantId)');
   }
+  // A-009 LBR-6: the policy is fixed at construction. The lookup function is captured now,
+  // so reassigning the injected object's method later changes nothing, and the returned
+  // authenticator (including `policy`) is frozen.
+  const tenantPolicy: TenantPolicy | undefined =
+    injected === undefined ? undefined : Object.freeze({ allowedRoles: injected.allowedRoles.bind(injected) });
   const verifyToken = (token: string, nowSeconds: number = Date.now() / 1000): AuthenticationResult => {
     let decoded: DecodedToken;
     try {
@@ -209,8 +215,8 @@ export function createOperatorAuthenticator(config: OperatorAuthConfig, options:
     return unauthenticated(reason, true);
   };
 
-  return {
-    policy: tenantPolicy === undefined ? 'not-configured' : 'enforced',
+  return Object.freeze({
+    policy: tenantPolicy === undefined ? ('not-configured' as const) : ('enforced' as const),
     verifyToken,
     authenticate(headers: HeaderBag, nowSeconds?: number): AuthenticationResult {
       let header = headers.authorization;
@@ -223,5 +229,5 @@ export function createOperatorAuthenticator(config: OperatorAuthConfig, options:
       if (match === null || match[1] === undefined) return unauthenticated('authorization-scheme', true);
       return verifyToken(match[1], nowSeconds);
     },
-  };
+  });
 }
