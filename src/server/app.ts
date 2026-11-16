@@ -17,6 +17,17 @@
 // Errors are uniform contract Error bodies. An unexpected exception is a 500; the log
 // records only its class name and first stack-frame location, never its message. Every
 // request is logged once, without query string, headers or body.
+//
+// Connections (A-009 LBR-2, SEC-08; RFC 9112 section 9.6): requests on one connection are
+// handled one at a time, in order. Once a response with `Connection: close` is decided (an
+// error with an unread body, a body timeout, or a request that asked for close), the HTTP
+// parser is detached from the socket, so no later byte is parsed as a request, and any
+// pipelined request already parsed is never dispatched: it gets no handler, no response and
+// no `request` log line (`pipelined_request_refused` instead).
+//
+// Body timing (A-010 LBR4-1, SEC-10): when the per-request body timer (src/server/body.ts)
+// fires, the server answers 408 with `Connection: close` at once, whatever the handler is
+// doing; the handler's later result is ignored.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
@@ -88,12 +99,30 @@ function exceptionSummary(error: unknown): { error_name: string; error_location:
 const LINGER_MS = 2_000;
 const LINGER_BYTES = 64 * 1024 * 1024;
 
+const detached = new WeakSet<Socket>();
+
+/**
+ * Detach the HTTP parser from `socket` (SEC-08): every later byte goes to `onData` only, so
+ * nothing more is parsed as a request. Node feeds its parser straight from the handle until a
+ * `data` listener is added; adding ours first moves the input to `data` events, and removing
+ * the listeners that were there before (the parser's) leaves ours as the only reader.
+ */
+function stopParsing(socket: Socket, onData: (chunk: Buffer) => void): void {
+  if (detached.has(socket)) return;
+  detached.add(socket);
+  const parserInput = socket.listeners('data') as Array<(chunk: Buffer) => void>;
+  socket.on('data', onData);
+  for (const listener of parserInput) socket.removeListener('data', listener);
+  socket.resume();
+}
+
 /**
  * Lingering close (RFC 9112 section 9.6) after an error response to a request whose body
  * was not read. Closing a socket with unread input makes the kernel reset the connection,
  * which can destroy the response before the client reads it. So the response is followed by
- * a half-close, and the remaining input is discarded (never buffered or parsed) until the
- * client closes, for at most LINGER_MS or LINGER_BYTES; then the socket is destroyed.
+ * a half-close, and the remaining input is discarded (never buffered or parsed: the parser is
+ * detached) until the client closes, for at most LINGER_MS or LINGER_BYTES; then the socket
+ * is destroyed.
  */
 function lingerAfterError(req: IncomingMessage): void {
   const socket = req.socket as Socket & { destroySoon?: () => void };
@@ -109,11 +138,27 @@ function lingerAfterError(req: IncomingMessage): void {
   };
   socket.once('end', close);
   socket.once('close', () => clearTimeout(timer));
-  req.on('data', (chunk: Buffer) => {
+  stopParsing(socket, (chunk: Buffer) => {
     discarded += chunk.length;
     if (discarded > LINGER_BYTES) close();
   });
-  req.resume();
+}
+
+/** Whether the request itself ends the connection (`Connection: close`, or HTTP/1.0 without keep-alive). */
+function requestsClose(req: IncomingMessage): boolean {
+  const tokens = String(req.headers.connection ?? '')
+    .toLowerCase()
+    .split(',')
+    .map((token) => token.trim());
+  if (tokens.includes('close')) return true;
+  return req.httpVersion === '1.0' && !tokens.includes('keep-alive');
+}
+
+interface Connection {
+  /** A response with Connection: close was decided; nothing more is dispatched. */
+  closing: boolean;
+  /** Settles when the request being handled on this connection is done. */
+  tail: Promise<void>;
 }
 
 function hasBody(req: IncomingMessage): boolean {
@@ -125,6 +170,7 @@ export function createApp(options: AppOptions): App {
   const routes = options.routes.filter((route) => surface === 'public' || operationScheme(route.operationId) === 'operator').map(compile);
   const locals = new Map<string, unknown>();
   const logger = options.logger;
+  const connections = new WeakMap<Socket, Connection>();
 
   const match = (method: string, path: string): { route: RouteDefinition; params: Record<string, string> } | null => {
     for (const compiled of routes) {
@@ -149,7 +195,7 @@ export function createApp(options: AppOptions): App {
     res.end(body ?? undefined);
   };
 
-  const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const handle = async (req: IncomingMessage, res: ServerResponse, connection: Connection): Promise<void> => {
     const correlationId = newCorrelationId();
     const started = performance.now();
     const bodyState: BodyState = createBodyState();
@@ -158,7 +204,33 @@ export function createApp(options: AppOptions): App {
     let operation: OperationId | null = null;
     let status = 500;
     let errorCode: string | null = null;
+    let settled = false;
     res.setHeader('x-correlation-id', correlationId);
+    const timing = { idleMs: options.config.limits.bodyIdleMs, graceMs: options.config.limits.bodyRateGraceMs, minBytesPerSecond: options.config.limits.bodyMinBytesPerSecond };
+
+    /** Answer with an error (once); an unread body or a body timeout also closes the connection. */
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      const httpError = error instanceof HttpError ? error : new HttpError(500, 'internal');
+      status = httpError.status;
+      errorCode = httpError.code;
+      if (!(error instanceof HttpError)) logger.error('handler_exception', { correlation_id: correlationId, operation, ...exceptionSummary(error) });
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      const unread = (hasBody(req) && !bodyState.consumed) || bodyState.timedOut;
+      const headers: Record<string, string> = { ...httpError.headers };
+      if (unread) {
+        headers.connection = 'close';
+        connection.closing = true;
+        lingerAfterError(req);
+      }
+      const body = Buffer.from(JSON.stringify(errorBody(httpError.code, correlationId, httpError.details)));
+      send(res, httpError.status, 'none', headers, body, 'application/json; charset=utf-8');
+    };
+    bodyState.onTimeout = fail;
 
     try {
       if (path === null) throw new HttpError(404, 'not_found');
@@ -176,14 +248,15 @@ export function createApp(options: AppOptions): App {
         logger: logger.child({ correlation_id: correlationId }),
         config: options.config,
         locals,
-        json: () => readJsonBody(req, options.config.limits.jsonBytes, bodyState),
-        pdf: () => pdfBody(req, options.config.limits.pdfBytes, bodyState),
+        json: () => readJsonBody(req, options.config.limits.jsonBytes, bodyState, timing),
+        pdf: () => pdfBody(req, options.config.limits.pdfBytes, bodyState, timing),
       });
 
       if (found === null) {
         if (surface === 'public' && lookupMethod === 'GET' && options.staticHandler) {
           const served = await options.staticHandler(context(null, {}));
-          if (served !== null) {
+          if (served !== null && !settled) {
+            settled = true;
             status = served.status;
             return respond(res, served, null);
           }
@@ -223,24 +296,13 @@ export function createApp(options: AppOptions): App {
       let result: HandlerResult | null = null;
       if (route.handler !== null) result = await route.handler(ctx);
       else if (operation === 'openReviewShell' && options.staticHandler) result = await options.staticHandler(ctx);
+      if (settled) return;
       if (result === null) throw new HttpError(501, 'internal');
+      settled = true;
       status = result.status;
       respond(res, result, operation);
     } catch (error) {
-      const httpError = error instanceof HttpError ? error : new HttpError(500, 'internal');
-      status = httpError.status;
-      errorCode = httpError.code;
-      if (!(error instanceof HttpError)) logger.error('handler_exception', { correlation_id: correlationId, operation, ...exceptionSummary(error) });
-      if (res.headersSent) {
-        res.destroy();
-      } else {
-        const unread = hasBody(req) && !bodyState.consumed;
-        const headers: Record<string, string> = { ...httpError.headers };
-        if (unread) headers.connection = 'close';
-        const body = Buffer.from(JSON.stringify(errorBody(httpError.code, correlationId, httpError.details)));
-        if (unread) lingerAfterError(req);
-        send(res, httpError.status, 'none', headers, body, 'application/json; charset=utf-8');
-      }
+      fail(error);
     } finally {
       const fields: Record<string, unknown> = {
         correlation_id: correlationId,
@@ -274,8 +336,35 @@ export function createApp(options: AppOptions): App {
   return {
     locals,
     handle(req: IncomingMessage, res: ServerResponse): void {
-      handle(req, res).catch(() => {
-        if (!res.headersSent) res.destroy();
+      const socket = req.socket;
+      let connection = connections.get(socket);
+      if (connection === undefined) {
+        connection = { closing: false, tail: Promise.resolve() };
+        connections.set(socket, connection);
+      }
+      const current = connection;
+      const previous = current.tail;
+      let done: () => void = () => {};
+      current.tail = new Promise<void>((resolveTail) => {
+        done = resolveTail;
+      });
+      void previous.then(async () => {
+        try {
+          if (current.closing) {
+            // SEC-08: a Connection: close response was decided before this pipelined request.
+            logger.warn('pipelined_request_refused', { method: req.method ?? 'GET', path: pathOf(req.url) ?? '(invalid)' });
+            return;
+          }
+          await handle(req, res, current);
+          if (!current.closing && requestsClose(req)) {
+            current.closing = true;
+            stopParsing(socket, () => {});
+          }
+        } catch {
+          if (!res.headersSent) res.destroy();
+        } finally {
+          done();
+        }
       });
     },
   };

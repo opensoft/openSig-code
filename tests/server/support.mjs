@@ -2,7 +2,9 @@
 //
 // Test support for the server tests (T031). Keys are generated at runtime (private keys in
 // memory only); the operator auth configuration and JWKS go to a 0600 file in a mkdtemp
-// directory removed by cleanup(). Servers bind 127.0.0.1 with an OS-chosen port.
+// directory removed by cleanup(). Servers bind 127.0.0.1 with an OS-chosen port. The tenants
+// table the server checks the configuration against (SEC-07) is a migrated SQLite database
+// created in a mkdtemp directory at test runtime with the synthetic alpha tenant.
 
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -12,6 +14,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createOperatorAuthenticator, loadOperatorAuthConfig } from '../../src/api/auth/index.ts';
+import { openDatabase } from '../../src/storage/db/index.ts';
 import { ROUTES } from '../../src/api/routes.ts';
 import { createApp } from '../../src/server/app.ts';
 import { loadServerConfig } from '../../src/server/config.ts';
@@ -50,10 +53,47 @@ export const authInput = () => ({
   ],
 });
 
-/** Write the operator auth configuration to a 0600 file and return its path. */
-export function authFile() {
+/** Write the operator auth configuration (default: authInput()) to a 0600 file and return its path. */
+export function authFile(input = authInput()) {
   const path = join(tempDir('auth'), 'operator-auth.json');
-  writeFileSync(path, JSON.stringify(authInput()), { mode: 0o600 });
+  writeFileSync(path, JSON.stringify(input), { mode: 0o600 });
+  return path;
+}
+
+/** The tenants row that agrees with authInput() for the alpha tenant. */
+export function alphaTenantRow(allowedRoles = ['sender', 'tenant_admin', 'service']) {
+  const tenant = authInput().tenants[0];
+  const now = new Date(Date.UTC(2026, 10, 16, 12, 0, 0)).toISOString();
+  return {
+    oidc_issuer: tenant.issuer,
+    oidc_audience: tenant.audience,
+    role_claim: tenant.claims.roles,
+    role_map_json: JSON.stringify(tenant.roleMap),
+    principal_kind_claim: tenant.claims.principalKind,
+    principal_kind_map_json: JSON.stringify(tenant.kindMap),
+    allowed_roles_json: JSON.stringify(allowedRoles),
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+/**
+ * Create a migrated database whose tenants table holds `rows` (tenant id to row; default:
+ * the alpha tenant agreeing with authInput()) and return its path.
+ */
+export function tenantDatabase(rows = { [ALPHA.id]: alphaTenantRow() }, { migrate = true } = {}) {
+  const path = join(tempDir('db'), 'opensig.db');
+  const db = openDatabase({ path });
+  try {
+    if (migrate) {
+      db.migrate();
+      db.transaction(() => {
+        for (const [tenantId, row] of Object.entries(rows)) db.forTenant(tenantId).insert('tenants', row);
+      });
+    }
+  } finally {
+    db.close();
+  }
   return path;
 }
 

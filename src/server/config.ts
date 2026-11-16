@@ -13,16 +13,32 @@
 //                                isolated Hermes relay (operator routes only, mode 0600).
 //   OPENSIG_OPERATOR_AUTH_FILE   JSON file with the operator OIDC configuration (T005);
 //                                without it every operator request is 401.
+//   OPENSIG_DATABASE             absolute path of the existing, migrated SQLite database
+//                                whose tenants table owns each tenant's allowed roles
+//                                (A-008 P11); default <OPENSIG_DATA_DIR>/opensig.db. Needed
+//                                whenever OPENSIG_OPERATOR_AUTH_FILE is set (src/server/tenants.ts).
 //   OPENSIG_ENV, OPENSIG_MAIL_TRANSPORT, OPENSIG_SPOOL_DIR, OPENSIG_DATA_DIR
 //                                passed through to handlers (set by the dev launcher).
 //
 // Errors name the variable, never its value.
 
-import { isAbsolute } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
 export const JSON_BODY_LIMIT = 256 * 1024;
 export const PDF_BODY_LIMIT = 10 * 1024 * 1024;
 export const DEFAULT_PORT = 8443;
+/**
+ * Request body timing (A-010 LBR4-1, SEC-10), enforced per request by src/server/body.ts:
+ * - idle: at most BODY_IDLE_TIMEOUT_MS while waiting for the next body bytes;
+ * - minimum rate: once the time spent waiting for body bytes passes BODY_RATE_GRACE_MS, the
+ *   body must have arrived at an average of at least BODY_MIN_BYTES_PER_SECOND over that
+ *   time (a 10 MiB upload therefore has at most 640 s).
+ * Either is answered with 408 and a connection close.
+ */
+export const BODY_IDLE_TIMEOUT_MS = 10_000;
+export const BODY_RATE_GRACE_MS = 10_000;
+export const BODY_MIN_BYTES_PER_SECOND = 16 * 1024;
+export const DATABASE_FILE = 'opensig.db';
 
 export interface ServerConfig {
   readonly host: string;
@@ -35,7 +51,15 @@ export interface ServerConfig {
   readonly mailTransport: string | null;
   readonly spoolDir: string | null;
   readonly dataDir: string | null;
-  readonly limits: { readonly jsonBytes: number; readonly pdfBytes: number };
+  /** The SQLite database holding the tenants table, or null when none is configured. */
+  readonly database: string | null;
+  readonly limits: {
+    readonly jsonBytes: number;
+    readonly pdfBytes: number;
+    readonly bodyIdleMs: number;
+    readonly bodyRateGraceMs: number;
+    readonly bodyMinBytesPerSecond: number;
+  };
 }
 
 export class ServerConfigError extends Error {
@@ -76,6 +100,9 @@ export function loadServerConfig(env: Readonly<Record<string, string | undefined
   if (relaySocket !== null && (!isAbsolute(relaySocket) || relaySocket.length > 100)) {
     throw new ServerConfigError('OPENSIG_RELAY_SOCKET must be an absolute path of at most 100 characters');
   }
+  const dataDir = value(env, 'OPENSIG_DATA_DIR');
+  const database = value(env, 'OPENSIG_DATABASE') ?? (dataDir !== null && isAbsolute(dataDir) ? join(dataDir, DATABASE_FILE) : null);
+  if (database !== null && !isAbsolute(database)) throw new ServerConfigError('OPENSIG_DATABASE must be an absolute path');
   return Object.freeze({
     host,
     port,
@@ -85,8 +112,15 @@ export function loadServerConfig(env: Readonly<Record<string, string | undefined
     environment: value(env, 'OPENSIG_ENV') ?? 'development',
     mailTransport: value(env, 'OPENSIG_MAIL_TRANSPORT'),
     spoolDir: value(env, 'OPENSIG_SPOOL_DIR'),
-    dataDir: value(env, 'OPENSIG_DATA_DIR'),
-    limits: Object.freeze({ jsonBytes: JSON_BODY_LIMIT, pdfBytes: PDF_BODY_LIMIT }),
+    dataDir,
+    database,
+    limits: Object.freeze({
+      jsonBytes: JSON_BODY_LIMIT,
+      pdfBytes: PDF_BODY_LIMIT,
+      bodyIdleMs: BODY_IDLE_TIMEOUT_MS,
+      bodyRateGraceMs: BODY_RATE_GRACE_MS,
+      bodyMinBytesPerSecond: BODY_MIN_BYTES_PER_SECOND,
+    }),
   });
 }
 

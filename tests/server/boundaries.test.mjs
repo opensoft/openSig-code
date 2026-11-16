@@ -12,7 +12,7 @@ import { after, test } from 'node:test';
 
 import { loadServerConfig } from '../../src/server/config.ts';
 import { startServer } from '../../src/server/main.ts';
-import { authFile, bearer, cleanup, ENVELOPE_ID, REPO, send, serveApp, tempDir } from './support.mjs';
+import { authFile, bearer, cleanup, ENVELOPE_ID, REPO, send, serveApp, tempDir, tenantDatabase } from './support.mjs';
 
 after(cleanup);
 
@@ -76,7 +76,10 @@ test('[SEC-05] the server binds loopback by default and refuses other addresses 
 test('[SEC-05] the relay socket is mode 0600 and serves operator routes only', async () => {
   const dir = tempDir('relay');
   const socketPath = join(dir, 'opensig.sock');
-  const running = await startServer({ OPENSIG_PORT: '0', OPENSIG_RELAY_SOCKET: socketPath, OPENSIG_OPERATOR_AUTH_FILE: authFile() }, { logSink: () => {} });
+  const running = await startServer(
+    { OPENSIG_PORT: '0', OPENSIG_RELAY_SOCKET: socketPath, OPENSIG_OPERATOR_AUTH_FILE: authFile(), OPENSIG_DATABASE: tenantDatabase() },
+    { logSink: () => {} },
+  );
   try {
     const stat = lstatSync(socketPath);
     assert.ok(stat.isSocket());
@@ -103,7 +106,7 @@ test('[SEC-05] the relay socket is mode 0600 and serves operator routes only', a
 test('[SEC-05] node src/server/main.ts starts on loopback, logs its address and stops on SIGTERM', async () => {
   const child = spawn(process.execPath, [join(REPO, 'src', 'server', 'main.ts')], {
     cwd: REPO,
-    env: { PATH: process.env.PATH ?? '', OPENSIG_PORT: '0', OPENSIG_OPERATOR_AUTH_FILE: authFile() },
+    env: { PATH: process.env.PATH ?? '', OPENSIG_PORT: '0', OPENSIG_OPERATOR_AUTH_FILE: authFile(), OPENSIG_DATABASE: tenantDatabase() },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';

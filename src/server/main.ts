@@ -10,7 +10,12 @@
 //   for the isolated Hermes relay. That listener serves operator routes only, so recipient
 //   and anonymous routes (approval, sessions, the review shell) are unreachable through it.
 // - Operator authentication uses the T005 configuration in OPENSIG_OPERATOR_AUTH_FILE;
-//   without it every operator request is 401 (fail closed).
+//   without it every operator request is 401 (fail closed). With it, the tenant role policy
+//   comes from the tenants table in OPENSIG_DATABASE (src/server/tenants.ts, SEC-07), and
+//   the server refuses to start when the database is missing or disagrees with the file.
+// - Startup logs the authenticator's policy state (`operator_auth`, and `operator_policy` on
+//   the `listening` line; SEC-09): enforced or not configured, the policy source and the
+//   tenant ids. Never a key, token, secret or the file contents.
 // - The review shell and static assets come from src/server/static.ts (T035) when that
 //   module exists. It must export createStaticHandler({ config }) returning a
 //   StaticHandler (src/server/types.ts).
@@ -24,6 +29,7 @@ import { fileURLToPath } from 'node:url';
 
 import { loadOperatorAuthConfig } from '../api/auth/config.ts';
 import { createOperatorAuthenticator, type OperatorAuthenticator } from '../api/auth/operator.ts';
+import { openTenantPolicy, type TenantPolicySource } from './tenants.ts';
 import { ROUTES } from '../api/routes.ts';
 import { createApp } from './app.ts';
 import { loadServerConfig, loopbackOrigin, ServerConfigError, type ServerConfig } from './config.ts';
@@ -63,10 +69,16 @@ function closeServer(server: Server): Promise<void> {
   });
 }
 
-function loadAuthenticator(config: ServerConfig, logger: Logger): OperatorAuthenticator | null {
+interface OperatorAuth {
+  readonly authenticator: OperatorAuthenticator | null;
+  readonly tenants: TenantPolicySource | null;
+}
+
+function loadAuthenticator(config: ServerConfig, logger: Logger): OperatorAuth {
   if (config.operatorAuthFile === null) {
     logger.warn('operator_auth_not_configured', { effect: 'every operator request is 401' });
-    return null;
+    logger.info('operator_auth', { configured: false, policy: 'not-configured' });
+    return { authenticator: null, tenants: null };
   }
   let parsed: unknown;
   try {
@@ -74,7 +86,11 @@ function loadAuthenticator(config: ServerConfig, logger: Logger): OperatorAuthen
   } catch {
     throw new ServerConfigError('OPENSIG_OPERATOR_AUTH_FILE is not a readable JSON file');
   }
-  return createOperatorAuthenticator(loadOperatorAuthConfig(parsed));
+  const authConfig = loadOperatorAuthConfig(parsed);
+  const tenants = openTenantPolicy(config.database, authConfig);
+  const authenticator = createOperatorAuthenticator(authConfig, { tenantPolicy: tenants.policy });
+  logger.info('operator_auth', { configured: true, policy: authenticator.policy, policy_source: 'tenants-table', tenants: tenants.tenantIds });
+  return { authenticator, tenants };
 }
 
 async function loadStaticHandler(config: ServerConfig): Promise<StaticHandler | null> {
@@ -99,7 +115,16 @@ function prepareSocketPath(path: string): void {
 export async function startServer(env: Readonly<Record<string, string | undefined>> = process.env, options: { logSink?: LogSink } = {}): Promise<RunningServer> {
   const config = loadServerConfig(env);
   const logger = createLogger(options.logSink);
-  const authenticator = loadAuthenticator(config, logger);
+  const { authenticator, tenants } = loadAuthenticator(config, logger);
+  try {
+    return await listenAll(config, logger, authenticator, tenants);
+  } catch (error) {
+    tenants?.close();
+    throw error;
+  }
+}
+
+async function listenAll(config: ServerConfig, logger: Logger, authenticator: OperatorAuthenticator | null, tenants: TenantPolicySource | null): Promise<RunningServer> {
   const staticHandler = await loadStaticHandler(config);
   const allowedOrigins = new Set<string>(config.allowedOrigins ?? []);
 
@@ -130,6 +155,7 @@ export async function startServer(env: Readonly<Record<string, string | undefine
     port: address.port,
     relay_socket: config.relaySocket !== null,
     operator_auth: authenticator !== null,
+    operator_policy: authenticator === null ? 'not-configured' : authenticator.policy,
     static_shell: staticHandler !== null,
     environment: config.environment,
   });
@@ -152,6 +178,7 @@ export async function startServer(env: Readonly<Record<string, string | undefine
           // already removed
         }
       }
+      tenants?.close();
       logger.info('closed', {});
     },
   };
