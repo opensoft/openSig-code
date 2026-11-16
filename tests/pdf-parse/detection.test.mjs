@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// T033 parser-limits PL-06, PL-07 and PL-16: detection of existing digital signatures and
-// of active content (JavaScript, Launch actions, embedded files, RichMedia; and, A-008 P08,
-// XFA forms, 3D artwork with /OnInstantiate, Screen annotations and Rendition actions),
+// T033 parser-limits PL-06, PL-07, PL-16 and PL-21: detection of existing digital
+// signatures and of active content (JavaScript, Launch actions, embedded files, RichMedia;
+// A-008 P08: XFA forms, 3D artwork with /OnInstantiate, Screen annotations and Rendition
+// actions; A-009 LBR-5: SubmitForm, ImportData, GoToR, GoToE, Movie, Sound, and any open or
+// additional action other than same-document navigation),
 // including detections hidden in object streams or behind #xx-escaped names. JBIG2 and
 // JPX image filters are reported as features. All variants are generated at test runtime.
 
@@ -195,5 +197,51 @@ test('[PL-16] XFA forms, 3D artwork with /OnInstantiate, Screen annotations and 
   ]) {
     const outcome = await parsePdf(bytes);
     assert.equal(outcome.ok, true, outcome.ok ? '' : `${outcome.reason} ${outcome.detail}`);
+  }
+});
+
+test('[PL-21] SubmitForm, ImportData, GoToR, GoToE, Movie, Sound and non-navigation open or additional actions are rejected; plain URI links stay allowed', async () => {
+  const annot = (body) => classicPdf([...basicObjects({ page: '/Annots [4 0 R]' }), `<< /Type /Annot /Rect [0 0 10 10] ${body} >>`]);
+  await expectRejection(
+    {
+      'SubmitForm widget action': { bytes: annot('/Subtype /Widget /A << /S /SubmitForm /F << /FS /URL /F (https://submit.example.test/) >> >>'), detections: ['submit-form'] },
+      'escaped /Subm#69tForm action name': { bytes: annot('/Subtype /Widget /A << /S /Subm#69tForm >>'), detections: ['submit-form'] },
+      'ImportData open action': { bytes: classicPdf(basicObjects({ catalog: '/OpenAction << /S /ImportData /F (data.fdf) >>' })), detections: ['import-data'] },
+      'GoToR open action': { bytes: classicPdf(basicObjects({ catalog: '/OpenAction << /S /GoToR /F (other.pdf) /D [0 /Fit] >>' })), detections: ['remote-goto'] },
+      'GoToE link action': { bytes: annot('/Subtype /Link /A << /S /GoToE /T << /R /C /N (synthetic) >> >>'), detections: ['embedded-goto'] },
+      'Movie annotation': { bytes: annot('/Subtype /Movie /Movie << /F (m.example.test) >>'), detections: ['movie'] },
+      'Movie action': { bytes: annot('/Subtype /Link /A << /S /Movie /T (synthetic) >>'), detections: ['movie'] },
+      'Sound annotation': { bytes: annot('/Subtype /Sound'), detections: ['sound'] },
+      'Sound action in a GoTo chain': { bytes: classicPdf(basicObjects({ catalog: '/OpenAction << /S /GoTo /D [3 0 R /Fit] /Next << /S /Sound >> >>' })), detections: ['sound'] },
+      'Named open action': { bytes: classicPdf(basicObjects({ catalog: '/OpenAction << /S /Named /N /Print >>' })), detections: ['open-action'] },
+      'URI open action': { bytes: classicPdf(basicObjects({ catalog: '/OpenAction << /S /URI /URI (https://www.example.test/) >>' })), detections: ['open-action'] },
+      'indirect Hide open action': { bytes: classicPdf([...basicObjects({ catalog: '/OpenAction 4 0 R' }), '<< /S /Hide /T (field) >>']), detections: ['open-action'] },
+      'open action that is a name': { bytes: classicPdf(basicObjects({ catalog: '/OpenAction /Synthetic' })), detections: ['open-action'] },
+      'page additional action Named': { bytes: classicPdf(basicObjects({ page: '/AA << /O << /S /Named /N /NextPage >> >>' })), detections: ['additional-action'] },
+      'catalog additional action ResetForm': { bytes: classicPdf(basicObjects({ catalog: '/AA << /WC << /S /ResetForm >> >>' })), detections: ['additional-action'] },
+      'GoTo additional action whose /Next is a URI': {
+        bytes: classicPdf(basicObjects({ page: '/AA << /O << /S /GoTo /D [3 0 R /Fit] /Next [<< /S /GoTo /D [3 0 R /Fit] >> << /S /URI /URI (https://www.example.test/) >>] >> >>' })),
+        detections: ['additional-action'],
+      },
+      'annotation additional action in an object stream': {
+        bytes: xrefStreamPdf([...basicObjects({ page: '/Annots [4 0 R]' }), '<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /AA << /E << /S /SetOCGState /State [] >> >> >>'], { packed: [[1, 2, 3, 4]] }),
+        detections: ['additional-action'],
+      },
+      'additional actions that are not a dictionary': { bytes: classicPdf(basicObjects({ page: '/AA /Synthetic' })), detections: ['additional-action'] },
+    },
+    'active-content',
+  );
+
+  // Allowed: plain URI links and same-document navigation.
+  for (const [name, bytes] of Object.entries({
+    'plain URI link annotation': annot('/Subtype /Link /A << /S /URI /URI (https://www.example.test/) >>'),
+    'open action destination array': classicPdf(basicObjects({ catalog: '/OpenAction [3 0 R /Fit]' })),
+    'GoTo open action': classicPdf(basicObjects({ catalog: '/OpenAction << /S /GoTo /D [3 0 R /Fit] >>' })),
+    'GoTo chain': classicPdf(basicObjects({ catalog: '/OpenAction << /S /GoTo /D [3 0 R /Fit] /Next << /S /GoTo /D [3 0 R /XYZ 0 0 0] >> >>' })),
+    'indirect GoTo open action': classicPdf([...basicObjects({ catalog: '/OpenAction 4 0 R' }), '<< /S /GoTo /D [3 0 R /Fit] >>']),
+    'page GoTo additional action': classicPdf(basicObjects({ page: '/AA << /O << /S /GoTo /D [3 0 R /Fit] >> >>' })),
+  })) {
+    const outcome = await parsePdf(bytes);
+    assert.equal(outcome.ok, true, `${name}: ${outcome.ok ? '' : `${outcome.reason} ${outcome.detail}`}`);
   }
 });

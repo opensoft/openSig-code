@@ -15,10 +15,10 @@
 //   depth-checked, at most maxPages leaves.
 //
 // Rejections, in precedence order after structural validity: encryption (trailer
-// /Encrypt), an existing digital signature (signature dictionaries, signed /FT /Sig fields,
-// /DocMDP or /UR3 permissions), active content (JavaScript, Launch actions, embedded files,
-// RichMedia, XFA forms, 3D artwork and its /OnInstantiate scripts, Screen annotations and
-// Rendition actions), then, page by page, an effective /CropBox that differs from the
+// /Encrypt), an existing digital signature, active content (the policy in policy.ts:
+// JavaScript, Launch, embedded files, RichMedia, XFA, 3D, Screen, Rendition, SubmitForm,
+// ImportData, GoToR, GoToE, Movie, Sound, and any /OpenAction or /AA action other than
+// same-document navigation), then, page by page, an effective /CropBox that differs from the
 // /MediaBox (unsupported-feature `cropbox_differs`, A-008 S2: field rectangles are
 // normalized to the displayed page, so a cropped page would mis-map them) and more than
 // maxPages pages. The effective crop box is the inherited /CropBox intersected with the
@@ -43,6 +43,7 @@ import {
   type PdfValue,
 } from './lexer.ts';
 import type { ParserLimits } from './limits.ts';
+import { classifyValue, createFindings } from './policy.ts';
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -152,10 +153,19 @@ class DocumentParser {
     if (!isRef(rootRef)) throw malformed('trailer has no /Root reference');
 
     this.parseObjects();
+    const findings = createFindings();
+    const policyResolve = (value: PdfValue | undefined): PdfValue | undefined => {
+      if (!isRef(value)) return value;
+      const target = this.objects.get(value.num);
+      return target !== undefined && target.gen === value.gen ? target.value : undefined;
+    };
     for (const obj of this.objects.values()) {
-      this.scanValue(obj.value);
+      classifyValue(obj.value, policyResolve, findings);
       if (obj.stream !== null && isDict(obj.value)) this.scanFilters(obj.value);
     }
+    this.signatures = findings.signatures;
+    for (const kind of findings.active) this.active.add(kind);
+    for (const feature of findings.features) this.features.add(feature);
     if (this.signatures > 0) {
       throw new ParseFailure('already-signed', 'existing digital signature or signature permissions', ['signature']);
     }
@@ -514,35 +524,6 @@ class DocumentParser {
   }
 
   // --- detections -------------------------------------------------------------------------
-
-  scanValue(value: PdfValue): void {
-    if (Array.isArray(value)) {
-      for (const item of value) this.scanValue(item);
-      return;
-    }
-    if (!isDict(value)) return;
-    const map = value.map;
-    const type = nameOf(value, 'Type');
-    const subtype = nameOf(value, 'Subtype');
-    const action = nameOf(value, 'S');
-    if (type === 'Sig' || type === 'DocTimeStamp' || (map.has('ByteRange') && map.has('Contents')) || map.has('DocMDP') || map.has('UR3')) {
-      this.signatures += 1;
-    }
-    if (nameOf(value, 'FT') === 'Sig') {
-      const signed = map.get('V');
-      if (signed !== undefined && signed !== null) this.signatures += 1;
-      else this.features.add('unsigned-signature-field');
-    }
-    if (map.has('JS') || action === 'JavaScript' || map.has('JavaScript')) this.active.add('javascript');
-    if (action === 'Launch') this.active.add('launch');
-    if (type === 'EmbeddedFile' || map.has('EmbeddedFiles') || map.has('EF')) this.active.add('embedded-file');
-    if (subtype === 'RichMedia' || map.has('RichMediaContent') || map.has('RichMediaSettings')) this.active.add('rich-media');
-    if (map.has('XFA')) this.active.add('xfa');
-    if (subtype === '3D' || type === '3D' || map.has('3DD') || map.has('OnInstantiate')) this.active.add('3d');
-    if (subtype === 'Screen') this.active.add('screen');
-    if (action === 'Rendition' || type === 'Rendition') this.active.add('rendition');
-    for (const inner of map.values()) this.scanValue(inner);
-  }
 
   scanFilters(dict: PdfDict): void {
     for (const filter of streamFilterNames(dict)) {

@@ -1,74 +1,93 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Isolated PDF parse service (T033). Upload validation (T007/T034) and composition (T036)
-// call parsePdf(); the parser itself runs only in a child process:
+// call parsePdf(); the parser itself runs only in a sandboxed child process:
 //
 // - Input: a byte array or an async iterable of chunks (for example a request stream). The
 //   10 MiB streaming cap is enforced while reading: the first chunk that would exceed it
 //   ends the read (the iterator is closed, so a stream is destroyed) and the outcome is
-//   413 payload_too_large before the body is read in full or a child is started.
-// - Child: /bin/sh sets RLIMIT_CPU (`ulimit -t`, a kernel backstop) and execs the pinned
-//   Node with --max-old-space-size, --permission with read access to src/pdf/ only (no
+//   413 payload_too_large before the body is read in full or a child is started. The
+//   child receives the bytes over its stdin pipe.
+// - Child: /bin/sh sets RLIMIT_CPU (`ulimit -t`, a kernel backstop inherited through the
+//   launcher) and execs the sandbox launcher (sandbox.ts), which runs the pinned Node with
+//   --max-old-space-size, --permission with read access to the worker sources only (no
 //   fs-write, child-process, worker, addon or WASI grant) and
 //   --disallow-code-generation-from-strings, under an empty environment.
-// - Limits: the parent polls /proc/<pid>/stat and kills the child when its CPU time or
-//   resident memory exceeds the limit, and kills it at the wall-clock limit. A V8 heap
-//   exhaustion is detected from the child's exit. Every kill is a 422 resource-limit
-//   rejection; the child is always gone when parsePdf() settles.
-// - Output: one JSON line, bounded by maxReportBytes, validated before it is returned.
-//
-// - Network (A-008 rework): the worker runs inside a new user and network namespace,
-//   launched with util-linux unshare (`--user --net`, mapping `--map-current-user` where
-//   supported, otherwise `--map-root-user`; no host privilege and no privileged host
-//   change). The service probes this once per process. The namespace has only a down
-//   loopback interface, so any connect from the parser fails at the OS level.
-// - Without the capability the service fails closed (500 internal, reason
-//   sandbox-unavailable) and starts no child. The one exception is the explicit
-//   development opt-in OPENSIG_PARSER_ALLOW_UNSANDBOXED=1, honoured only while namespaces
-//   are unavailable; OPENSIG_ENV and NODE_ENV are never consulted. The opt-in cannot
-//   downgrade a host where the sandbox works.
-// - Every outcome carries `network_sandbox`: `netns-enforced (local)` or `unavailable`.
+// - Sandbox (A-009 LBR-1): user, network, mount, IPC, UTS and PID namespaces, a minimal
+//   read-only root (library directories, the Node binary and the worker's files only),
+//   no capabilities. IP connects fail (only a down loopback exists), host abstract sockets
+//   are unreachable (other network namespace) and host pathname sockets do not exist in
+//   the root. See sandbox.ts for exactly what is and is not provided.
+// - Limits: the parent polls /proc for the launcher and every process below it, and kills
+//   the tree when its CPU time or resident memory exceeds the limit, or at the wall-clock
+//   limit. A V8 heap exhaustion is detected from the child's exit. Every kill is a 422
+//   resource-limit rejection; the child is always gone when parsePdf() settles.
+// - Fail closed: without a launcher whose isolation the probe confirms, parsePdf() returns
+//   500 internal, reason sandbox-unavailable, and starts no child. The one exception is the
+//   explicit development opt-in OPENSIG_PARSER_ALLOW_UNSANDBOXED=1, read from the process
+//   environment only and honoured only when no launcher is usable on the host;
+//   OPENSIG_ENV and NODE_ENV are never consulted.
+// - No caller-supplied option can choose the launcher, the environment or the worker
+//   (LBR-3): parsePdf() accepts `limits` and `service` only and refuses anything else.
+//   createParseServiceForTests() exists for the tests; its options can only narrow the
+//   launchers (a narrowed set that is unusable refuses) or replace the worker inside the
+//   same sandbox, and never downgrade or relabel it.
+// - Every outcome carries `network_sandbox`: `netns+fs-enforced (local)` or `unavailable`.
 //   That is the locally observed capability; it never claims the production gate
 //   `parser-network-sandbox` passed (that gate needs deployment-environment evidence).
-// - The parent never trusts the child: a report must be well formed, have 1..maxPages
-//   pages numbered in order with finite positive sizes, a rotate of 0/90/180/270, boxes
-//   that match the stated geometry (crop box equal to media box), the isolation flags the
-//   permission model guarantees, and a byte count equal to the input length. Anything else
-//   is a fail-closed 500 service-failure.
+// - The parent never trusts the child (P09, LBR-4): a report must be well formed, with
+//   1..maxPages pages numbered in order, finite positive sizes matching the boxes, a rotate
+//   of 0/90/180/270, crop box equal to media box, the isolation flags the permission model
+//   guarantees, a byte count equal to the input length, a bounded trailer and objects map
+//   whose references are consistent, and reported objects that pass the active-content
+//   policy (policy.ts). Anything else is a fail-closed 500 service-failure.
 // - The PL-12 import boundary (src/pdf/ imports no net, http, https, dns, tls, dgram or
-//   http2 module) stays as defence in depth; it is not the network isolation.
+//   http2 module) stays as defence in depth; it is not the isolation.
 //
 // Linux only (the pinned runtime is linux-x64).
 
 import { Buffer } from 'node:buffer';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join, sep } from 'node:path';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { REJECT_REASONS, type RejectReason } from './errors.ts';
+import { isDict, isRef, type PdfDict, type PdfValue } from './lexer.ts';
 import { MAX_DOCUMENT_PAGES, resolveParserLimits, resolveServiceLimits, type ParserLimits, type ServiceLimits } from './limits.ts';
 import type { PageReport, ParseReport } from './parser.ts';
+import { classifyValue, createFindings } from './policy.ts';
+import {
+  descendants,
+  LAUNCHER_KINDS,
+  launcherCommand,
+  probeSandbox,
+  rootBinds,
+  sourceFiles,
+  type LauncherKind,
+  type SandboxProbe,
+} from './sandbox.ts';
 
 export type { PageReport, ParseReport } from './parser.ts';
+export type { LauncherKind, SandboxProbe } from './sandbox.ts';
 
 export const WORKER_ENTRY = join(dirname(fileURLToPath(import.meta.url)), 'worker.ts');
 const SHELL = '/bin/sh';
 const POLL_MS = 10;
+const RESCAN_MS = 50;
 const CLOCK_TICKS_PER_SECOND = 100;
 const PAGE_BYTES = 4096;
 const MAX_STDERR_BYTES = 64 * 1024;
+/** Exit statuses a launcher reports for a child killed by SIGKILL or SIGXCPU. */
+const KILLED_EXIT_CODES = new Set([128 + 9, 128 + 24]);
 
-/** The locally observed network capability of the parse child. */
-export type NetworkSandboxLabel = 'netns-enforced (local)' | 'unavailable';
-export const NETNS_ENFORCED: NetworkSandboxLabel = 'netns-enforced (local)';
+/** The locally observed isolation of the parse child. */
+export type NetworkSandboxLabel = 'netns+fs-enforced (local)' | 'unavailable';
+export const SANDBOX_ENFORCED: NetworkSandboxLabel = 'netns+fs-enforced (local)';
 export const SANDBOX_UNAVAILABLE: NetworkSandboxLabel = 'unavailable';
-/** The only switch that permits an unsandboxed child, and only while namespaces are unavailable. */
+/** The only switch that permits an unsandboxed child, and only when no launcher is usable. */
 export const UNSANDBOXED_FLAG = 'OPENSIG_PARSER_ALLOW_UNSANDBOXED';
-/** util-linux unshare locations probed, in order (absolute paths; PATH is never searched). */
-export const UNSHARE_CANDIDATES: readonly string[] = Object.freeze(['/usr/bin/unshare', '/bin/unshare']);
-const PROBE_TIMEOUT_MS = 5_000;
 
 export interface Isolation {
   permission_model: boolean;
@@ -83,7 +102,7 @@ export interface ServiceReport extends ParseReport {
   digest: string;
   /** Permission state the child observed, and the names (never values) of its environment variables. */
   isolation: Isolation;
-  /** Locally observed network capability (never a claim about the production gate). */
+  /** Locally observed isolation (never a claim about the production gate). */
   network_sandbox: NetworkSandboxLabel;
 }
 
@@ -99,13 +118,6 @@ export type ParseOutcome =
       network_sandbox: NetworkSandboxLabel;
     };
 
-/** Result of probing for unprivileged user + network namespaces. */
-export interface SandboxProbe {
-  readonly available: boolean;
-  readonly unshare: string | null;
-  readonly mapping: 'current-user' | 'root-user' | null;
-}
-
 /** How the service runs the child on this host. */
 export interface ServicePlan {
   readonly mode: 'sandboxed' | 'unsandboxed' | 'refused';
@@ -113,20 +125,12 @@ export interface ServicePlan {
   readonly probe: SandboxProbe;
 }
 
-export interface ServiceRuntime {
-  /** Environment for the opt-in flag (default process.env). Only UNSANDBOXED_FLAG is read. */
-  readonly env?: Readonly<Record<string, string | undefined>>;
-  /** unshare binaries to probe (default UNSHARE_CANDIDATES). */
-  readonly unshareCandidates?: readonly string[];
-}
-
 export interface ParseOptions {
   limits?: Partial<ParserLimits>;
   service?: Partial<ServiceLimits>;
-  runtime?: ServiceRuntime;
-  /** Tests only: an alternative child entry module. Production callers never set it. */
-  workerEntry?: string;
 }
+
+const PARSE_OPTION_KEYS = new Set(['limits', 'service']);
 
 function reject(reason: RejectReason, detail: string, label: NetworkSandboxLabel, detections: string[] = []): ParseOutcome {
   if (reason === 'size-limit') return { ok: false, status: 413, code: 'payload_too_large', reason, detail, detections, network_sandbox: label };
@@ -137,65 +141,24 @@ function failure(detail: string, label: NetworkSandboxLabel): ParseOutcome {
   return { ok: false, status: 500, code: 'internal', reason: 'service-failure', detail, detections: [], network_sandbox: label };
 }
 
-// --- network sandbox ---------------------------------------------------------------------
-
-function runQuietly(file: string, args: string[]): Promise<boolean> {
-  return new Promise((resolveRun) => {
-    let child;
-    try {
-      child = spawn(file, args, { env: {}, stdio: 'ignore', timeout: PROBE_TIMEOUT_MS });
-    } catch {
-      resolveRun(false);
-      return;
-    }
-    child.on('error', () => resolveRun(false));
-    child.on('close', (code) => resolveRun(code === 0));
-  });
-}
-
-const probes = new Map<string, Promise<SandboxProbe>>();
+// --- plan --------------------------------------------------------------------------------
 
 /**
- * Probe once per candidate list: can this process create a user + network namespace with
- * unshare, mapping the current user (preferred) or root?
+ * Decide how the child runs, probing only `kinds`. The development opt-in is honoured
+ * only when the full launcher set is unusable on this host, so narrowing `kinds` can
+ * refuse but never downgrade.
  */
-export function probeNetworkSandbox(candidates: readonly string[] = UNSHARE_CANDIDATES): Promise<SandboxProbe> {
-  const key = candidates.join('\0');
-  let probe = probes.get(key);
-  if (probe === undefined) {
-    probe = (async () => {
-      for (const unshare of candidates) {
-        if (!unshare.startsWith('/') || !existsSync(unshare)) continue;
-        for (const mapping of ['current-user', 'root-user'] as const) {
-          const flag = mapping === 'current-user' ? '--map-current-user' : '--map-root-user';
-          if (await runQuietly(unshare, ['--user', '--net', flag, '--', SHELL, '-c', 'exit 0'])) {
-            return Object.freeze({ available: true, unshare, mapping });
-          }
-        }
-      }
-      return Object.freeze({ available: false, unshare: null, mapping: null });
-    })();
-    probes.set(key, probe);
-  }
-  return probe;
-}
-
-/** The sandbox launcher: `file args...` run inside a new user and network namespace. */
-export function sandboxedCommand(probe: SandboxProbe, file: string, args: readonly string[]): { file: string; args: string[] } {
-  if (!probe.available || probe.unshare === null || probe.mapping === null) throw new Error('the network namespace sandbox is unavailable');
-  return {
-    file: probe.unshare,
-    args: ['--user', '--net', probe.mapping === 'current-user' ? '--map-current-user' : '--map-root-user', '--', file, ...args],
-  };
-}
-
-/** Decide how the child runs. OPENSIG_ENV and NODE_ENV are deliberately not consulted. */
-export async function parseServicePlan(runtime: ServiceRuntime = {}): Promise<ServicePlan> {
-  const probe = await probeNetworkSandbox(runtime.unshareCandidates ?? UNSHARE_CANDIDATES);
-  if (probe.available) return Object.freeze({ mode: 'sandboxed', network_sandbox: NETNS_ENFORCED, probe });
-  const env = runtime.env ?? process.env;
-  const mode = env[UNSANDBOXED_FLAG] === '1' ? 'unsandboxed' : 'refused';
+async function planFor(kinds: readonly LauncherKind[]): Promise<ServicePlan> {
+  const probe = await probeSandbox(kinds);
+  if (probe.available) return Object.freeze({ mode: 'sandboxed', network_sandbox: SANDBOX_ENFORCED, probe });
+  const host = kinds.length === LAUNCHER_KINDS.length && kinds.every((kind, index) => kind === LAUNCHER_KINDS[index]) ? probe : await probeSandbox(LAUNCHER_KINDS);
+  const mode = !host.available && process.env[UNSANDBOXED_FLAG] === '1' ? 'unsandboxed' : 'refused';
   return Object.freeze({ mode, network_sandbox: SANDBOX_UNAVAILABLE, probe });
+}
+
+/** The production plan for this host (probed once per process). */
+export function parseServicePlan(): Promise<ServicePlan> {
+  return planFor(LAUNCHER_KINDS);
 }
 
 // --- child command -------------------------------------------------------------------------
@@ -222,12 +185,28 @@ export function workerCommand(parser: ParserLimits, service: ServiceLimits, entr
   };
 }
 
-/** The exact command parsePdf() runs under `plan` (null when the plan refuses). */
+/** The read-only files a worker entry needs: the worker sources, or a single test entry. */
+function workerFiles(entry: string): string[] {
+  return entry === WORKER_ENTRY ? sourceFiles(dirname(WORKER_ENTRY)) : [entry];
+}
+
+/** The exact command the service runs under `plan` (null when the plan refuses). */
 export function serviceCommand(plan: ServicePlan, parser: ParserLimits, service: ServiceLimits, entry: string = WORKER_ENTRY): { file: string; args: string[] } | null {
-  const base = workerCommand(parser, service, entry);
-  if (plan.mode === 'sandboxed') return sandboxedCommand(plan.probe, base.file, base.args);
-  if (plan.mode === 'unsandboxed') return base;
-  return null;
+  if (plan.mode === 'refused') return null;
+  if (plan.mode === 'unsandboxed') return workerCommand(parser, service, entry);
+  const real = realpathSync(entry);
+  const base = workerCommand(parser, service, real);
+  const [node, ...nodeArgs] = base.args.slice(4);
+  const wrapped = launcherCommand(plan.probe, rootBinds(workerFiles(entry).map((file) => (file === entry ? real : file))), node as string, nodeArgs);
+  return { file: SHELL, args: [...base.args.slice(0, 4), wrapped.file, ...wrapped.args] };
+}
+
+/**
+ * The service's sandbox launcher for an arbitrary command (used by the isolation tests):
+ * the same launcher and root as the worker, plus `extraFiles` bound read-only.
+ */
+export function sandboxedCommand(probe: SandboxProbe, file: string, args: readonly string[], extraFiles: readonly string[] = []): { file: string; args: string[] } {
+  return launcherCommand(probe, rootBinds([], extraFiles), file, args);
 }
 
 async function collect(input: Uint8Array | AsyncIterable<Uint8Array | string>, maxBytes: number): Promise<Buffer | { tooLarge: number }> {
@@ -273,6 +252,14 @@ const isPositive = (value: unknown): value is number => typeof value === 'number
 const isShortString = (value: unknown, max: number): value is string => typeof value === 'string' && value.length <= max;
 const isStringList = (value: unknown, maxItems: number, maxLength: number): value is string[] =>
   Array.isArray(value) && value.length <= maxItems && value.every((item) => isShortString(item, maxLength));
+const hasExactly = (record: Record<string, unknown>, keys: readonly string[]): boolean => {
+  const own = Object.keys(record);
+  return own.length === keys.length && keys.every((key) => Object.hasOwn(record, key));
+};
+
+function isRefPair(value: unknown, size: number): value is [number, number] {
+  return Array.isArray(value) && value.length === 2 && isCount(value[0]) && value[0] >= 1 && value[0] < size && isCount(value[1]) && value[1] <= 65535;
+}
 
 function isBox(value: unknown): value is [number, number, number, number] {
   return (
@@ -284,8 +271,8 @@ function isBox(value: unknown): value is [number, number, number, number] {
   );
 }
 
-function validPage(value: unknown, index: number): value is PageReport {
-  if (!isObject(value)) return false;
+function validPage(value: unknown, index: number, size: number): value is PageReport {
+  if (!isObject(value) || !hasExactly(value, ['number', 'width', 'height', 'rotate', 'media_box', 'crop_box', 'ref'])) return false;
   const { number, width, height, rotate, media_box: media, crop_box: crop, ref } = value;
   if (number !== index + 1 || !isPositive(width) || !isPositive(height)) return false;
   if (rotate !== 0 && rotate !== 90 && rotate !== 180 && rotate !== 270) return false;
@@ -294,7 +281,7 @@ function validPage(value: unknown, index: number): value is PageReport {
   const boxHeight = crop[3] - crop[1];
   const [shownWidth, shownHeight] = rotate % 180 === 0 ? [boxWidth, boxHeight] : [boxHeight, boxWidth];
   if (width !== shownWidth || height !== shownHeight) return false;
-  return Array.isArray(ref) && ref.length === 2 && isCount(ref[0]) && ref[0] >= 1 && isCount(ref[1]) && ref[1] <= 65535;
+  return isRefPair(ref, size);
 }
 
 function validIsolation(value: unknown): value is Isolation {
@@ -305,6 +292,118 @@ function validIsolation(value: unknown): value is Isolation {
     value.child_process === false &&
     value.worker === false &&
     isStringList(value.environment, 16, 64)
+  );
+}
+
+const MAX_JSON_DEPTH = 96;
+const MAX_JSON_NODES = 200_000;
+const MAX_NAME_LENGTH = 1024;
+const MAX_HEX_LENGTH = 131_072;
+
+/** Convert a reported JSON value (parser.ts toJson form) back to a PDF value, or null if malformed. */
+function fromJson(value: unknown, budget: { nodes: number }, size: number, depth = 0): PdfValue | undefined {
+  budget.nodes += 1;
+  if (budget.nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) return undefined;
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (Array.isArray(value)) {
+    const items: PdfValue[] = [];
+    for (const item of value) {
+      const converted = fromJson(item, budget, size, depth + 1);
+      if (converted === undefined) return undefined;
+      items.push(converted);
+    }
+    return items;
+  }
+  if (!isObject(value)) return undefined;
+  const keys = Object.keys(value);
+  if (keys.length !== 1) return undefined;
+  if (typeof value.name === 'string') return value.name.length <= MAX_NAME_LENGTH ? { t: 'name', v: value.name } : undefined;
+  if (typeof value.hex === 'string') {
+    const hex = value.hex;
+    return hex.length <= MAX_HEX_LENGTH && hex.length % 2 === 0 && /^[0-9a-f]*$/.test(hex) ? { t: 'str', v: Buffer.from(hex, 'hex') } : undefined;
+  }
+  if (value.ref !== undefined) {
+    const ref = value.ref;
+    return Array.isArray(ref) && ref.length === 2 && isCount(ref[0]) && ref[0] < size && isCount(ref[1]) && ref[1] <= 65535
+      ? { t: 'ref', num: ref[0], gen: ref[1] }
+      : undefined;
+  }
+  if (isObject(value.dict)) {
+    const map = new Map<string, PdfValue>();
+    for (const [key, inner] of Object.entries(value.dict)) {
+      if (key.length > MAX_NAME_LENGTH) return undefined;
+      const converted = fromJson(inner, budget, size, depth + 1);
+      if (converted === undefined) return undefined;
+      map.set(key, converted);
+    }
+    return { t: 'dict', map };
+  }
+  return undefined;
+}
+
+function validTrailer(value: unknown, size: number): value is ParseReport['trailer'] {
+  if (!isObject(value) || !hasExactly(value, ['root', 'info', 'id'])) return false;
+  if (!isRefPair(value.root, size)) return false;
+  if (value.info !== null && !isRefPair(value.info, size)) return false;
+  if (value.id === null) return true;
+  return Array.isArray(value.id) && value.id.length === 2 && value.id.every((part) => typeof part === 'string' && part.length <= 512 && part.length % 2 === 0 && /^[0-9a-f]*$/.test(part));
+}
+
+/** Shape, bounds, references and policy of the reported objects map (LBR-4); returns the catalog. */
+function validObjects(report: Record<string, unknown>, pages: PageReport[], size: number): PdfDict | null {
+  const objects = report.objects;
+  if (!isObject(objects)) return null;
+  const entries = Object.entries(objects);
+  if (entries.length > 3 + 2 * pages.length) return null;
+  const converted = new Map<number, { gen: number; value: PdfValue }>();
+  const budget = { nodes: 0 };
+  for (const [key, entry] of entries) {
+    if (!/^[1-9]\d{0,9}$/.test(key) || Number(key) >= size) return null;
+    if (!isObject(entry) || !hasExactly(entry, ['gen', 'value']) || !isCount(entry.gen) || entry.gen > 65535) return null;
+    const value = fromJson(entry.value, budget, size);
+    if (value === undefined) return null;
+    converted.set(Number(key), { gen: entry.gen, value });
+  }
+  const dictAt = (ref: [number, number], type: string): PdfDict | null => {
+    const found = converted.get(ref[0]);
+    if (found === undefined || found.gen !== ref[1] || !isDict(found.value)) return null;
+    const typeValue = found.value.map.get('Type');
+    return typeValue !== undefined && typeValue !== null && !Array.isArray(typeValue) && typeof typeValue === 'object' && typeValue.t === 'name' && typeValue.v === type
+      ? found.value
+      : null;
+  };
+  const trailer = report.trailer as ParseReport['trailer'];
+  const catalog = dictAt(trailer.root, 'Catalog');
+  if (catalog === null) return null;
+  const seen = new Set<number>();
+  for (const page of pages) {
+    if (seen.has(page.ref[0]) || dictAt(page.ref, 'Page') === null) return null;
+    seen.add(page.ref[0]);
+  }
+  // The reported objects must pass the same active-content and signature policy.
+  const findings = createFindings();
+  const resolve = (value: PdfValue | undefined): PdfValue | undefined => {
+    if (!isRef(value)) return value;
+    const found = converted.get(value.num);
+    return found !== undefined && found.gen === value.gen ? found.value : undefined;
+  };
+  for (const { value } of converted.values()) classifyValue(value, resolve, findings);
+  return findings.active.size === 0 && findings.signatures === 0 ? catalog : null;
+}
+
+const KNOWN_FEATURES = new Set(['acroform', 'incremental-updates', 'hybrid-xref', 'object-streams', 'xref-stream', 'jbig2', 'jpx', 'unsigned-signature-field']);
+const STATS_KEYS = ['objects', 'xref_entries', 'object_streams', 'max_depth', 'inflated_bytes'];
+
+/** Known feature names only, and those the report itself determines must agree with it. */
+function validFeatures(features: string[], xref: Record<string, unknown>, stats: Record<string, unknown>, catalog: PdfDict): boolean {
+  if (new Set(features).size !== features.length || !features.every((feature) => KNOWN_FEATURES.has(feature))) return false;
+  const acroform = catalog.map.get('AcroForm');
+  return (
+    features.includes('acroform') === (acroform !== undefined && acroform !== null) &&
+    features.includes('incremental-updates') === (xref.sections as number) > 1 &&
+    features.includes('hybrid-xref') === xref.hybrid &&
+    features.includes('object-streams') === (stats.object_streams as number) > 0
   );
 }
 
@@ -323,38 +422,47 @@ export function validateChildResult(value: unknown, inputBytes: number, maxPages
   }
   if (value.ok !== true || !isObject(value.report)) return null;
   const report = value.report;
+  if (!hasExactly(report, ['schema', 'header_version', 'bytes', 'pages', 'xref', 'trailer', 'objects', 'features', 'stats', 'isolation'])) return null;
   if (report.schema !== 'opensig.pdf.parse-report.v1') return null;
   if (report.bytes !== inputBytes) return null;
   if (typeof report.header_version !== 'string' || !/^(?:1\.[0-7]|2\.0)$/.test(report.header_version)) return null;
+  const xref = report.xref;
+  if (!isObject(xref) || !hasExactly(xref, ['kind', 'sections', 'startxref', 'size', 'hybrid'])) return null;
+  if ((xref.kind !== 'table' && xref.kind !== 'stream') || !isCount(xref.sections) || !isCount(xref.startxref) || !isCount(xref.size) || xref.size < 2) return null;
+  if (typeof xref.hybrid !== 'boolean') return null;
+  const size = xref.size;
   const pages = report.pages;
   const ceiling = Math.min(maxPages, MAX_DOCUMENT_PAGES);
-  if (!Array.isArray(pages) || pages.length < 1 || pages.length > ceiling || !pages.every((page, index) => validPage(page, index))) return null;
-  const xref = report.xref;
-  if (!isObject(xref) || (xref.kind !== 'table' && xref.kind !== 'stream') || !isCount(xref.sections) || !isCount(xref.startxref) || !isCount(xref.size)) return null;
-  if (typeof xref.hybrid !== 'boolean') return null;
-  if (!isObject(report.trailer) || !isObject(report.objects) || !isObject(report.stats)) return null;
-  if (!Object.values(report.stats).every((n) => isCount(n))) return null;
+  if (!Array.isArray(pages) || pages.length < 1 || pages.length > ceiling || !pages.every((page, index) => validPage(page, index, size))) return null;
+  if (!validTrailer(report.trailer, size)) return null;
+  if (!isObject(report.stats) || !hasExactly(report.stats, STATS_KEYS) || !Object.values(report.stats).every((n) => isCount(n))) return null;
   if (!isStringList(report.features, 64, 64)) return null;
   if (!validIsolation(report.isolation)) return null;
+  const catalog = validObjects(report, pages as PageReport[], size);
+  if (catalog === null || !validFeatures(report.features, xref, report.stats, catalog)) return null;
   return { ok: true, report: report as unknown as ParseReport & { isolation: Isolation } };
 }
 
 // --- parse -----------------------------------------------------------------------------------
 
-/** Parse a PDF in the isolated child. Resolves with an outcome; never rejects for document content. */
-export async function parsePdf(input: Uint8Array | AsyncIterable<Uint8Array | string>, options: ParseOptions = {}): Promise<ParseOutcome> {
+interface Runner {
+  readonly kinds: readonly LauncherKind[];
+  readonly entry: string;
+}
+
+async function runParse(input: Uint8Array | AsyncIterable<Uint8Array | string>, options: ParseOptions, runner: Runner): Promise<ParseOutcome> {
   const parser = resolveParserLimits(options.limits);
   const service = resolveServiceLimits(options.service);
-  const plan = await parseServicePlan(options.runtime);
+  const plan = await planFor(runner.kinds);
   const label = plan.network_sandbox;
-  const command = serviceCommand(plan, parser, service, options.workerEntry ?? WORKER_ENTRY);
+  const command = serviceCommand(plan, parser, service, runner.entry);
   if (command === null) {
     return {
       ok: false,
       status: 500,
       code: 'internal',
       reason: 'sandbox-unavailable',
-      detail: `the network namespace sandbox is unavailable and ${UNSANDBOXED_FLAG}=1 is not set`,
+      detail: `no sandbox launcher is usable and ${UNSANDBOXED_FLAG}=1 is not set`,
       detections: [],
       network_sandbox: label,
     };
@@ -372,6 +480,8 @@ export async function parsePdf(input: Uint8Array | AsyncIterable<Uint8Array | st
     let stdoutBytes = 0;
     let stderr = '';
     let settled = false;
+    let tree: number[] = [];
+    let scanned = 0;
 
     const kill = (reason: NonNullable<typeof killedFor>): void => {
       if (killedFor === null) killedFor = reason;
@@ -379,10 +489,21 @@ export async function parsePdf(input: Uint8Array | AsyncIterable<Uint8Array | st
     };
     const poller = setInterval(() => {
       if (child.pid === undefined) return;
-      const now = sample(child.pid);
-      if (now === null) return;
-      if (now.cpuMs > service.cpuMs) kill('cpu');
-      else if (now.rssBytes > service.rssBytes) kill('memory');
+      const now = Date.now();
+      if (now - scanned >= RESCAN_MS) {
+        tree = [child.pid, ...descendants(child.pid)];
+        scanned = now;
+      }
+      let cpuMs = 0;
+      let rssBytes = 0;
+      for (const pid of tree) {
+        const usage = sample(pid);
+        if (usage === null) continue;
+        cpuMs += usage.cpuMs;
+        rssBytes += usage.rssBytes;
+      }
+      if (cpuMs > service.cpuMs) kill('cpu');
+      else if (rssBytes > service.rssBytes) kill('memory');
     }, POLL_MS);
     const wall = setTimeout(() => kill('wall-time'), service.wallMs);
 
@@ -411,7 +532,7 @@ export async function parsePdf(input: Uint8Array | AsyncIterable<Uint8Array | st
       if (killedFor === 'report-size') return finish(reject('limit-exceeded', 'report-size', label));
       if (killedFor !== null) return finish(reject('resource-limit', killedFor, label));
       if (/heap out of memory|Reached heap limit|Allocation failed/i.test(stderr)) return finish(reject('resource-limit', 'memory', label));
-      if (signal === 'SIGKILL' || signal === 'SIGXCPU') return finish(reject('resource-limit', 'cpu', label));
+      if (signal === 'SIGKILL' || signal === 'SIGXCPU' || (code !== null && KILLED_EXIT_CODES.has(code))) return finish(reject('resource-limit', 'cpu', label));
       if (code !== 0) return finish(failure(`the parse child exited with ${signal ?? `status ${code}`}`, label));
       let parsed: unknown;
       try {
@@ -426,5 +547,57 @@ export async function parsePdf(input: Uint8Array | AsyncIterable<Uint8Array | st
     });
 
     child.stdin.end(bytes);
+  });
+}
+
+function checkOptions(options: unknown): ParseOptions {
+  if (options === undefined) return {};
+  if (!isObject(options)) throw new TypeError('parse options must be an object');
+  for (const key of Object.keys(options)) if (!PARSE_OPTION_KEYS.has(key)) throw new TypeError(`unknown parse option: ${key.slice(0, 40)}`);
+  return options as ParseOptions;
+}
+
+const PRODUCTION: Runner = Object.freeze({ kinds: LAUNCHER_KINDS, entry: WORKER_ENTRY });
+
+/**
+ * Parse a PDF in the sandboxed child. Options are `limits` and `service` only; anything
+ * else is a TypeError. Resolves with an outcome; never rejects for document content.
+ */
+export function parsePdf(input: Uint8Array | AsyncIterable<Uint8Array | string>, options?: ParseOptions): Promise<ParseOutcome> {
+  let checked: ParseOptions;
+  try {
+    checked = checkOptions(options);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return runParse(input, checked, PRODUCTION);
+}
+
+export interface TestServiceOptions {
+  /** A replacement worker entry (absolute path to a regular file), run in the same sandbox. */
+  readonly workerEntry?: string;
+  /** Probe only these launchers (narrowing only: an unusable set refuses). */
+  readonly launchers?: readonly LauncherKind[];
+}
+
+export interface TestParseService {
+  plan(): Promise<ServicePlan>;
+  parse(input: Uint8Array | AsyncIterable<Uint8Array | string>, options?: ParseOptions): Promise<ParseOutcome>;
+}
+
+/**
+ * Tests only (PL-13, PL-17, PL-18): the production launch with a replacement worker or a
+ * narrowed launcher set. It cannot select an unsandboxed child, change the label, or read
+ * the opt-in from anywhere but the process environment. Production callers use parsePdf().
+ */
+export function createParseServiceForTests(options: TestServiceOptions = {}): TestParseService {
+  const entry = options.workerEntry ?? WORKER_ENTRY;
+  if (!isAbsolute(entry) || !lstatSync(entry).isFile()) throw new TypeError('workerEntry must be an absolute path to a regular file');
+  const kinds = options.launchers ?? LAUNCHER_KINDS;
+  if (!Array.isArray(kinds) || !kinds.every((kind) => LAUNCHER_KINDS.includes(kind))) throw new TypeError('launchers must be a subset of bwrap and util-linux');
+  const runner: Runner = Object.freeze({ kinds: LAUNCHER_KINDS.filter((kind) => kinds.includes(kind)), entry });
+  return Object.freeze({
+    plan: () => planFor(runner.kinds),
+    parse: async (input: Uint8Array | AsyncIterable<Uint8Array | string>, parseOptions?: ParseOptions) => runParse(input, checkOptions(parseOptions), runner),
   });
 }

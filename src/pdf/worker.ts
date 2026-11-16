@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Isolated parse child (T033). Started only by src/pdf/service.ts as
+// Isolated parse child (T033). Started only by src/pdf/service.ts, through the sandbox
+// launcher (src/pdf/sandbox.ts), as
 //
 //   node --max-old-space-size=<MiB> --permission --allow-fs-read=<src/pdf/>
 //        --disallow-code-generation-from-strings src/pdf/worker.ts '<parser limits JSON>'
@@ -10,11 +11,14 @@
 // It refuses to parse unless the Node permission model is active with no fs-write,
 // child-process or worker grant.
 //
-// Network: the service launches this process inside a new user and network namespace
-// (util-linux unshare --user --net), where every connect fails at the OS level; see
-// src/pdf/service.ts. The permission model itself has no network scope. The PL-12 import
-// boundary (this module's closure imports only node:buffer and node:zlib) is defence in
-// depth, not the network isolation. The parent validates everything this process reports.
+// Isolation (A-009 LBR-1): the launcher gives this process its own user, network, mount,
+// IPC, UTS and PID namespaces, a read-only root holding only the runtime libraries, the
+// Node binary and this directory's source files, and no capabilities. IP and abstract-socket
+// connects reach nothing (only a down loopback exists in its network namespace) and host
+// pathname sockets are absent from its root; sandbox.ts states the limits of that claim.
+// The permission model itself has no network scope. The PL-12 import boundary (this
+// module's closure imports only node:buffer and node:zlib) is defence in depth, not the
+// isolation. The parent validates everything this process reports.
 
 import { Buffer } from 'node:buffer';
 
