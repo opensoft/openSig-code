@@ -11,11 +11,20 @@
 //   older than the last exported head, and a different digest at that seq as
 //   a divergence. The ledger must exist: a missing ledger is refused unless
 //   the explicit firstRestore option says nothing was exported yet;
+// - the directory is a published backup: a staging directory
+//   (`.staging-*`) or a directory without its manifest is refused, and
+//   while a pending committed staging exists, verify and restore report
+//   committed-pending-publication and change nothing;
 // - every blob in the backup verifies against its digest, and every blob a
 //   database row still requires is present.
 // Only then are the blobs copied into the (new or empty) target blob root and
 // the staged database renamed into place, last. A refused restore leaves the
-// target as it was.
+// target as it was. A first restore (firstRestore, ledger missing) takes the
+// ledger lock first and, as its last step, after the database is renamed
+// into place, writes every restored head in one replace; if that write fails
+// before its commit point the restored database and blobs are removed again,
+// so the restore is all or nothing. Any other restore never writes the
+// ledger.
 
 import { lstatSync, mkdtempSync, readdirSync, readFileSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -24,13 +33,14 @@ import { randomBytes } from 'node:crypto';
 
 import { parseJson } from '../../domain/canonical/index.ts';
 import { verifyChain, type ChainProblem } from '../audit/verify.ts';
-import { openBlobStore, type FileBlobStore } from '../blobs/file-store.ts';
+import { DEFAULT_MAX_BLOB_BYTES, MAX_BLOB_BYTES_LIMIT, openBlobStore, type FileBlobStore } from '../blobs/file-store.ts';
 import { parseBlobRef } from '../blobs/refs.ts';
 import { openDatabase, type Database } from '../db/connection.ts';
 import { StorageError, StorageUsageError } from '../db/errors.ts';
 import { BACKUP_SCHEMA, BLOBS_DIRECTORY, DATABASE_FILE, MANIFEST_FILE, requiredBlobRefs, type BackupManifest } from './backup.ts';
 import { checkAbsolute, copyPrivateFile, fileDigest, prepareEmptyDirectory, removeQuietly, syncDirectory } from './files.ts';
-import { readLedger, type Ledger } from './ledger.ts';
+import { isStagingDirectory } from './backup.ts';
+import { ledgerDigest, LedgerSession, readLedger, refuseWhilePending, type HeadUpdate, type Ledger, type LedgerIo } from './ledger.ts';
 
 export class RestoreRefusedError extends StorageError {
   readonly reasons: readonly string[];
@@ -68,6 +78,10 @@ export interface RestoreOptions extends VerifyBackupOptions {
   readonly databasePath: string;
   /** Target blob root; must be new or empty. */
   readonly blobRoot: string;
+  /** Clock for the exported_at of heads written by a first restore (default: now). */
+  readonly clock?: () => Date;
+  /** Internal seam for failure injection in tests; never exposed by the CLI. */
+  readonly io?: Partial<LedgerIo>;
 }
 
 function readManifest(backupDir: string, reasons: string[]): BackupManifest | undefined {
@@ -95,7 +109,13 @@ function readManifest(backupDir: string, reasons: string[]): BackupManifest | un
     reasons.push('manifest does not have the expected shape');
     return undefined;
   }
-  return manifest;
+  // Backups made before the limit was recorded used the blob store's default.
+  const limit = (value as Record<string, unknown>)['blob_max_bytes'] ?? DEFAULT_MAX_BLOB_BYTES;
+  if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1 || limit > MAX_BLOB_BYTES_LIMIT) {
+    reasons.push('manifest blob size limit is malformed');
+    return undefined;
+  }
+  return { ...manifest, blob_max_bytes: limit };
 }
 
 function describeProblem(tenantId: string, problem: ChainProblem, ledger: Ledger): string {
@@ -112,6 +132,8 @@ function describeProblem(tenantId: string, problem: ChainProblem, ledger: Ledger
 interface Inspection {
   readonly report: RestoreReport;
   readonly blobs: FileBlobStore;
+  /** The manifest's blob size limit, used for the restored blob store too. */
+  readonly blobLimit: number;
 }
 
 /** Run every check against a staged copy of the backup database. */
@@ -129,7 +151,7 @@ function inspect(db: Database, backupDir: string, manifest: BackupManifest, ledg
   const manifestTenants = manifest.tenants.map((tenant) => tenant.tenant_id).sort();
   if (dbTenants.join(',') !== manifestTenants.join(',')) reasons.push('the tenants in the database differ from the manifest');
 
-  const blobs = openBlobStore({ root: join(backupDir, BLOBS_DIRECTORY) });
+  const blobs = openBlobStore({ root: join(backupDir, BLOBS_DIRECTORY), maxBytes: manifest.blob_max_bytes });
   const tenants: RestoredTenant[] = [];
   for (const tenantId of [...new Set([...dbTenants, ...Object.keys(ledger)])].sort()) {
     const recorded = ledger[tenantId];
@@ -153,7 +175,7 @@ function inspect(db: Database, backupDir: string, manifest: BackupManifest, ledg
     }
     tenants.push({ tenant_id: tenantId, head: chain.head, events: chain.events, blobs: digests.length });
   }
-  return { report: { schema_version: schemaVersion, tenants }, blobs };
+  return { report: { schema_version: schemaVersion, tenants }, blobs, blobLimit: manifest.blob_max_bytes };
 }
 
 /**
@@ -162,15 +184,9 @@ function inspect(db: Database, backupDir: string, manifest: BackupManifest, ledg
  * RestoreRefusedError (after closing and removing the staging copy) on any
  * problem.
  */
-function stageAndInspect(
-  backupDir: string,
-  ledgerPath: string,
-  firstRestore: boolean,
-  staging: string,
-): { readonly db: Database; readonly inspection: Inspection } {
+function stageAndInspect(backupDir: string, ledger: Ledger, staging: string): { readonly db: Database; readonly inspection: Inspection } {
   const reasons: string[] = [];
   const manifest = readManifest(backupDir, reasons);
-  const ledger = readLedger(ledgerPath, { allowMissing: firstRestore });
   if (manifest === undefined) throw new RestoreRefusedError(reasons);
   const databaseFile = join(backupDir, DATABASE_FILE);
   let digest;
@@ -200,18 +216,35 @@ function removeStaging(staging: string): void {
   for (const suffix of ['', '-wal', '-shm', '-journal']) removeQuietly(`${staging}${suffix}`);
 }
 
+function refuseStaging(backupDir: string): void {
+  if (isStagingDirectory(backupDir)) throw new RestoreRefusedError(['a staging directory is not a published backup']);
+}
+
+/**
+ * Full verification of a backup directory against a given ledger, staging
+ * directories included (internal: --complete-staged re-verifies the staged
+ * backup with it). Returns the report and the manifest heads.
+ */
+export function inspectBackupDirectory(backupDir: string, ledger: Ledger): { readonly report: RestoreReport; readonly manifest: BackupManifest } {
+  const scratch = mkdtempSync(join(tmpdir(), 'opensig-restore-check-'));
+  try {
+    const { db, inspection } = stageAndInspect(backupDir, ledger, join(scratch, DATABASE_FILE));
+    db.close();
+    const manifest = parseJson(readFileSync(join(backupDir, MANIFEST_FILE), 'utf8')) as unknown as BackupManifest;
+    return { report: inspection.report, manifest };
+  } finally {
+    removeQuietly(scratch);
+  }
+}
+
 /** Verify a backup without restoring it. */
 export function verifyBackup(options: VerifyBackupOptions): RestoreReport {
   const backupDir = checkAbsolute(options?.backupDir, 'backup directory');
   const ledgerPath = checkAbsolute(options.ledgerPath, 'ledger path');
-  const scratch = mkdtempSync(join(tmpdir(), 'opensig-restore-check-'));
-  try {
-    const { db, inspection } = stageAndInspect(backupDir, ledgerPath, options.firstRestore === true, join(scratch, DATABASE_FILE));
-    db.close();
-    return inspection.report;
-  } finally {
-    removeQuietly(scratch);
-  }
+  refuseWhilePending(ledgerPath);
+  refuseStaging(backupDir);
+  const ledger = readLedger(ledgerPath, { allowMissing: options.firstRestore === true });
+  return inspectBackupDirectory(backupDir, ledger).report;
 }
 
 /** Verify a backup, then restore it into a new database path and a new or empty blob root. */
@@ -227,31 +260,78 @@ export function restoreBackup(options: RestoreOptions): RestoreReport {
   if (blobRootState !== undefined && (!blobRootState.isDirectory() || readdirSync(blobRoot).length > 0)) {
     throw new StorageUsageError('the target blob root must be new or empty');
   }
-  const staging = join(dirname(databasePath), `.${randomBytes(12).toString('hex')}.restoring`);
-  const { db, inspection } = stageAndInspect(backupDir, ledgerPath, options.firstRestore === true, staging);
-  let createdRoot = false;
+  refuseWhilePending(ledgerPath);
+  refuseStaging(backupDir);
+  const clock = options.clock ?? (() => new Date());
+  // A first restore of a system without a ledger writes the restored heads,
+  // under the lock, all or nothing. Every other restore only reads it.
+  const session = options.firstRestore === true && ledgerDigest(ledgerPath) === null ? LedgerSession.open(ledgerPath, { allowMissing: true }) : undefined;
   try {
-    createdRoot = prepareEmptyDirectory(blobRoot);
-    const target = openBlobStore({ root: blobRoot });
-    for (const tenant of inspection.report.tenants) {
-      for (const digest of inspection.blobs.list(tenant.tenant_id)) {
-        target.put(tenant.tenant_id, inspection.blobs.read(tenant.tenant_id, digest), { expectedDigest: digest });
+    const writeHeads = session !== undefined && !session.existed;
+    const ledger = session === undefined ? readLedger(ledgerPath, { allowMissing: options.firstRestore === true }) : session.document.tenants;
+    const staging = join(dirname(databasePath), `.${randomBytes(12).toString('hex')}.restoring`);
+    const { db, inspection } = stageAndInspect(backupDir, ledger, staging);
+    let createdRoot = false;
+    let placed = false;
+    let unsynced: { readonly digest: string; readonly cause: unknown } | undefined;
+    try {
+      createdRoot = prepareEmptyDirectory(blobRoot);
+      const target = openBlobStore({ root: blobRoot, maxBytes: inspection.blobLimit });
+      for (const tenant of inspection.report.tenants) {
+        for (const digest of inspection.blobs.list(tenant.tenant_id)) {
+          target.put(tenant.tenant_id, inspection.blobs.read(tenant.tenant_id, digest), { expectedDigest: digest });
+        }
       }
-    }
-    db.close();
-    for (const suffix of ['-wal', '-shm']) {
-      if (lstatSync(`${staging}${suffix}`, { throwIfNoEntry: false }) !== undefined) {
-        throw new StorageError('restore_failed', 'the staged database left journal files behind');
+      let next;
+      if (writeHeads && session !== undefined) {
+        const heads = new Map<string, HeadUpdate>();
+        for (const tenant of inspection.report.tenants) {
+          if (tenant.head === null) continue;
+          const store = db.forTenant(tenant.tenant_id);
+          heads.set(tenant.tenant_id, {
+            head: tenant.head,
+            digestAt: (seq) => {
+              const event = store.get('audit_events', { seq });
+              return event === undefined ? undefined : String(event['event_digest']);
+            },
+          });
+        }
+        next = session.plan({ heads, source: 'first-restore', clock });
       }
+      db.close();
+      for (const suffix of ['-wal', '-shm']) {
+        if (lstatSync(`${staging}${suffix}`, { throwIfNoEntry: false }) !== undefined) {
+          throw new StorageError('restore_failed', 'the staged database left journal files behind');
+        }
+      }
+      renameSync(staging, databasePath);
+      placed = true;
+      syncDirectory(dirname(databasePath));
+      if (next !== undefined && session !== undefined) {
+        // The ledger write is the last step, the only one that is not undone:
+        // commit() throws only before its commit point (the ledger is then
+        // byte-identical, here still missing), and the catch below removes
+        // the restored database and blobs again.
+        const result = session.commit(next, { io: options.io });
+        if (!result.durable) unsynced = { digest: result.digest, cause: result.cause };
+      }
+    } catch (error) {
+      db.close();
+      removeStaging(staging);
+      if (placed) removeStaging(databasePath);
+      if (createdRoot) removeQuietly(blobRoot);
+      else if (lstatSync(blobRoot, { throwIfNoEntry: false }) !== undefined) for (const name of readdirSync(blobRoot)) removeQuietly(join(blobRoot, name));
+      throw error;
     }
-    renameSync(staging, databasePath);
-    syncDirectory(dirname(databasePath));
+    if (unsynced !== undefined) {
+      throw new StorageError(
+        'ledger_commit_unsynced',
+        `the database was restored and its heads were written to the ledger (digest ${unsynced.digest}), but the ledger directory fsync failed`,
+        { cause: unsynced.cause },
+      );
+    }
     return inspection.report;
-  } catch (error) {
-    db.close();
-    removeStaging(staging);
-    if (createdRoot) removeQuietly(blobRoot);
-    else if (lstatSync(blobRoot, { throwIfNoEntry: false }) !== undefined) for (const name of readdirSync(blobRoot)) removeQuietly(join(blobRoot, name));
-    throw error;
+  } finally {
+    session?.release();
   }
 }

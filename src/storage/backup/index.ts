@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Backup and restore (T030).
+// Backup and restore (T030). The exported-head ledger is written only through
+// ledger.ts (LedgerSession and recordExportedHead).
 
 export {
   BACKUP_SCHEMA,
   BackupError,
   BLOBS_DIRECTORY,
+  checkBlobLimit,
   createBackup,
   DATABASE_FILE,
+  finalDirectoryOf,
+  isStagingDirectory,
   MANIFEST_FILE,
   requiredBlobRefs,
   type BackupManifest,
@@ -15,15 +19,46 @@ export {
   type CreateBackupOptions,
 } from './backup.ts';
 export {
+  breakLedgerLock,
   LEDGER_SCHEMA,
+  ledgerDigest,
   LedgerError,
+  LedgerLockedError,
+  LedgerSession,
+  lockPathOf,
+  LOCK_SCHEMA,
+  pendingPublication,
+  PendingPublicationError,
+  publishingPathOf,
   readLedger,
+  readLedgerDocument,
+  readLedgerLock,
   recordExportedHead,
+  withLedgerSession,
+  type CommitResult,
   type ExportedHead,
+  type HeadUpdate,
   type Ledger,
+  type LedgerDocument,
+  type LedgerIo,
+  type LockRecord,
+  type PublishingRecord,
   type ReadLedgerOptions,
   type RecordOptions,
+  type RetiredTenant,
+  type SessionOptions,
 } from './ledger.ts';
+export {
+  completeStaged,
+  discardStaged,
+  RecoveryRefusedError,
+  retireTenant,
+  type CompletedStaged,
+  type Discarded,
+  type DiscardOptions,
+  type RecoveryOptions,
+  type RetireTenantOptions,
+} from './recovery.ts';
 export {
   restoreBackup,
   RestoreRefusedError,

@@ -248,20 +248,20 @@ test('[OR-06] scripts/backup.mjs creates, verifies and restores, and exits 1 on 
     const outDir = join(scratch.dir(), 'cli-backup');
     const created = cli('create', '--db', system.path, '--blobs', system.blobRoot, '--out', outDir, '--ledger', system.ledgerPath, '--first-backup');
     assert.equal(created.status, 0, created.stderr);
-    assert.match(created.stdout, /^backup: PASS created tenants=1 blobs=3 schema=\d+\n$/);
+    assert.match(created.stdout, /^backup: published directory=\S+ tenants=1 blobs=3 schema=\d+\n$/);
     const verified = cli('verify', '--from', outDir, '--ledger', system.ledgerPath);
     assert.equal(verified.status, 0, verified.stderr);
-    assert.match(verified.stdout, /^backup: PASS verified tenants=1 events=4 blobs=3 schema=\d+\n$/);
+    assert.match(verified.stdout, /^backup: verified tenants=1 events=4 blobs=3 schema=\d+\n$/);
     const restoredTarget = target();
     const restored = cli('restore', '--from', outDir, '--ledger', system.ledgerPath, '--db', restoredTarget.databasePath, '--blobs', restoredTarget.blobRoot);
     assert.equal(restored.status, 0, restored.stderr);
-    assert.match(restored.stdout, /^backup: PASS restored tenants=1 events=4 blobs=3/);
+    assert.match(restored.stdout, /^backup: restored tenants=1 events=4 blobs=3/);
 
     const corrupt = copyBackup(outDir);
     unlinkSync(join(corrupt, 'blobs', 'tenants', system.tenant, 'sha256', system.envelope.evidence.digest));
     const refused = cli('verify', '--from', corrupt, '--ledger', system.ledgerPath);
     assert.equal(refused.status, 1);
-    assert.match(refused.stdout, /^backup: REFUSED 1 reason\(s\): tenant .* required blob .* is missing\n$/);
+    assert.match(refused.stdout, /^backup: refused 1 reason\(s\): tenant .* required blob .* is missing\n$/);
 
     for (const args of [
       [],
@@ -473,7 +473,7 @@ test('[OR-09] backup checks each chain against the exported head: rolled-back or
     recordExportedHead(cut.ledgerPath, vanished, { seq: 4, digest: hex('vanished-4') }, { clock, source: 'backup', digestAt: (seq) => chain.get(seq) });
     const withVanished = ledgerBytes(cut);
     rollBack(cut, cut.tenant, 3, 2);
-    await assert.rejects(backupOf(cut), (error) => error instanceof BackupError && new RegExp(`tenant ${vanished}: the database has no audit chain`).test(error.message));
+    await assert.rejects(backupOf(cut), (error) => error instanceof BackupError && new RegExp(`tenant ${vanished}: the ledger has an exported head \\(seq 4\\) but the database has no such tenant`).test(error.message));
     assert.deepEqual(ledgerBytes(cut), withVanished);
   } finally {
     cut.db.close();
@@ -523,7 +523,7 @@ test('[OR-10] the ledger moves only along one chain, and restore refuses forked 
     assert.equal(existsSync(refusedTarget.databasePath), false, 'nothing restored');
     const cliRefused = cli('verify', '--from', forked.outDir, '--ledger', system.ledgerPath);
     assert.equal(cliRefused.status, 1);
-    assert.match(cliRefused.stdout, /^backup: REFUSED .*diverges from the last exported head at seq 7/);
+    assert.match(cliRefused.stdout, /^backup: refused .*diverges from the last exported head at seq 7/);
     assert.deepEqual(ledgerBytes(system), advanced);
 
     // The backup taken before the fork is older than the advanced head.
@@ -564,7 +564,7 @@ test('[OR-11] a missing ledger fails closed: backup, verify and restore need the
     assert.equal(existsSync(refusedTarget.blobRoot), false);
     const cliRefused = cli('verify', '--from', older.outDir, '--ledger', system.ledgerPath);
     assert.equal(cliRefused.status, 1);
-    assert.match(cliRefused.stdout, /^backup: FAIL ledger_invalid: the exported-head ledger is missing/);
+    assert.match(cliRefused.stdout, /^backup: refused ledger_invalid: the exported-head ledger is missing/);
     // Nor can a backup recreate the ledger without the explicit option.
     await assert.rejects(backupOf(system, { firstBackup: false }), missing);
     assert.equal(existsSync(system.ledgerPath), false);
@@ -573,12 +573,12 @@ test('[OR-11] a missing ledger fails closed: backup, verify and restore need the
     assert.equal(verifyBackup({ backupDir: older.outDir, ledgerPath: system.ledgerPath, firstRestore: true }).tenants[0].head.seq, 3);
     const cliFirst = cli('verify', '--from', older.outDir, '--ledger', system.ledgerPath, '--first-restore');
     assert.equal(cliFirst.status, 0, cliFirst.stderr);
-    assert.match(cliFirst.stdout, /^backup: PASS verified tenants=1 events=3 /);
+    assert.match(cliFirst.stdout, /^backup: verified tenants=1 events=3 /);
     const restoredTarget = target();
     const restored = cli('restore', '--from', older.outDir, '--ledger', system.ledgerPath, '--db', restoredTarget.databasePath, '--blobs', restoredTarget.blobRoot, '--first-restore');
     assert.equal(restored.status, 0, restored.stderr);
     assert.equal(existsSync(restoredTarget.databasePath), true);
-    assert.equal(existsSync(system.ledgerPath), false, 'restore never writes the ledger');
+    assert.equal(readLedger(system.ledgerPath)[system.tenant].seq, 3, 'the first restore wrote the restored heads (A-009 D3, OR-24)');
   } finally {
     system.db.close();
   }

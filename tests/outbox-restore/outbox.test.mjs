@@ -4,7 +4,8 @@
 // change it announces; OR-02 every delivery attempt, including a redelivery
 // after a crash before acknowledgement, carries the same event_id and bytes;
 // OR-05 retries are bounded (backoff cap, attempts, horizon, non-retryable);
-// OR-14 reclaiming an expired claim is held to the same bounds.
+// OR-14 reclaiming an expired claim is held to the same bounds; OR-25 a late
+// settle after an abandon on reclaim changes nothing.
 
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
@@ -258,10 +259,10 @@ test('[OR-14] reclaiming an expired claim enforces maxAttempts and the retry hor
     assert.deepEqual(restarted.abandoned(tenant).map((event) => event.event_id), [single.eventId]);
     state.now += 3_600_000;
     assert.deepEqual(await restarted.dispatch(tenant), { delivered: [], retrying: [], abandoned: [] }, 'an abandoned event stays abandoned');
-    // The original attempt finishing late may still record its delivery.
+    // The original attempt finishing late changes nothing (OR-25).
     release({ ok: true });
-    assert.deepEqual((await pending).delivered, [single.eventId]);
-    assert.equal(row(single.eventId).attempts, 1);
+    assert.deepEqual((await pending).abandoned, [single.eventId]);
+    assert.deepEqual([row(single.eventId).attempts, row(single.eventId).acknowledged_at, row(single.eventId).last_error_code], [1, null, ATTEMPTS_EXHAUSTED]);
 
     // The horizon: a retry is claimed just inside it, the dispatcher dies, and
     // the claim expires after the horizon has passed.
@@ -294,6 +295,76 @@ test('[OR-14] reclaiming an expired claim enforces maxAttempts and the retry hor
     const second = new OutboxDispatcher({ db, clock, maxAttempts: 3, deliver: async (attempt) => (retried.push(attempt.attempt), { ok: true }) });
     assert.deepEqual((await second.dispatch(tenant)).delivered, [ok.eventId]);
     assert.deepEqual(retried, [2]);
+  } finally {
+    db.close();
+  }
+});
+
+test('[OR-25] a late settle after an abandon on reclaim changes nothing: attempts_exhausted and retry_horizon_passed stay recorded, nothing is acknowledged or rescheduled', async () => {
+  const { db } = environment(scratch);
+  try {
+    const { state, clock } = controllableClock();
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    const setup = () => {
+      const tenant = sid('tenant');
+      createTenant(db, tenant);
+      const store = db.forTenant(tenant);
+      const { eventId } = voidEnvelope(db, tenant, addEnvelope(db, tenant), clock);
+      return { tenant, eventId, row: () => ({ ...store.get('outbox_events', { event_id: eventId }) }) };
+    };
+    /** Crash-reclaim cycles: every dispatcher dies with its delivery in flight. */
+    async function crashCycles(tenant, cycles, options) {
+      const inFlight = [];
+      for (let cycle = 0; cycle < cycles; cycle += 1) {
+        const dispatcher = new OutboxDispatcher({ db, clock, ...options, deliver: (attempt) => new Promise((resolve) => inFlight.push({ attempt: attempt.attempt, resolve })) });
+        const pending = dispatcher.dispatch(tenant);
+        await settle();
+        if (inFlight.length > 0 && inFlight.at(-1).pending === undefined) inFlight.at(-1).pending = pending;
+        state.now += 60_001;
+      }
+      return inFlight;
+    }
+    const noDelivery = (options) => new OutboxDispatcher({ db, clock, ...options, deliver: async () => assert.fail('deliver() after the event was abandoned') });
+
+    // maxAttempts 3: three attempts hang, the reclaim abandons the event.
+    const failing = setup();
+    const failingHung = await crashCycles(failing.tenant, 3, { maxAttempts: 3 });
+    assert.deepEqual(failingHung.map((hung) => hung.attempt), [1, 2, 3]);
+    assert.deepEqual(await noDelivery({ maxAttempts: 3 }).dispatch(failing.tenant), { delivered: [], retrying: [], abandoned: [failing.eventId] });
+    const exhausted = failing.row();
+    assert.deepEqual([exhausted.attempts, exhausted.next_attempt_at, exhausted.acknowledged_at, exhausted.last_error_code], [3, null, null, ATTEMPTS_EXHAUSTED]);
+    // Every hung attempt now fails late, retryably.
+    for (const hung of failingHung) hung.resolve({ ok: false, errorCode: 'http_503', retryable: true });
+    const failingSummaries = await Promise.all(failingHung.map((hung) => hung.pending));
+    assert.deepEqual(failing.row(), exhausted, 'a late failure neither reschedules nor relabels the abandoned event');
+    assert.deepEqual(failingSummaries.at(-1), { delivered: [], retrying: [], abandoned: [failing.eventId] });
+
+    // The same, finishing late with a success: not acknowledged.
+    const succeeding = setup();
+    const succeedingHung = await crashCycles(succeeding.tenant, 3, { maxAttempts: 3 });
+    await noDelivery({ maxAttempts: 3 }).dispatch(succeeding.tenant);
+    const abandoned = succeeding.row();
+    assert.equal(abandoned.last_error_code, ATTEMPTS_EXHAUSTED);
+    for (const hung of succeedingHung) hung.resolve({ ok: true });
+    const succeedingSummaries = await Promise.all(succeedingHung.map((hung) => hung.pending));
+    assert.deepEqual(succeeding.row(), abandoned, 'a late success does not acknowledge the abandoned event');
+    assert.deepEqual(succeedingSummaries.at(-1).abandoned, [succeeding.eventId]);
+
+    // The horizon: the third cycle abandons on reclaim; the second attempt then fails late, non-retryably.
+    const horizon = setup();
+    const horizonOptions = { maxAttempts: 50, horizonMs: 120_000 };
+    const horizonHung = await crashCycles(horizon.tenant, 3, horizonOptions);
+    assert.deepEqual(horizonHung.map((hung) => hung.attempt), [1, 2]);
+    const passed = horizon.row();
+    assert.deepEqual([passed.attempts, passed.next_attempt_at, passed.last_error_code], [2, null, RETRY_HORIZON_PASSED]);
+    for (const hung of horizonHung) hung.resolve({ ok: false, errorCode: 'http_400', retryable: false });
+    await Promise.all(horizonHung.map((hung) => hung.pending));
+    assert.deepEqual(horizon.row(), passed, 'retry_horizon_passed stays recorded');
+
+    // Hours later, none of them is delivered again.
+    state.now += 7_200_000;
+    for (const { tenant } of [failing, succeeding]) assert.deepEqual(await noDelivery({ maxAttempts: 3 }).dispatch(tenant), { delivered: [], retrying: [], abandoned: [] });
+    assert.deepEqual(await noDelivery(horizonOptions).dispatch(horizon.tenant), { delivered: [], retrying: [], abandoned: [] });
   } finally {
     db.close();
   }

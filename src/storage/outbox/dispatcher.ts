@@ -14,7 +14,9 @@
 // event_id and bytes once the claim window has passed; consumers deduplicate
 // on event_id. Reclaiming such an expired claim is held to the same bounds:
 // an event that already used maxAttempts attempts, or whose retry horizon has
-// passed, is abandoned in the claim transaction and never delivered again.
+// passed, is abandoned in the claim transaction and never delivered again. A
+// late settle of an attempt whose event was abandoned meanwhile changes
+// nothing, so attempts_exhausted and retry_horizon_passed stay recorded.
 
 import type { Database } from '../db/connection.ts';
 import { StorageUsageError } from '../db/errors.ts';
@@ -167,6 +169,10 @@ export class OutboxDispatcher {
       // Another attempt took over after this claim expired: leave its state alone.
       if (current === undefined || current['acknowledged_at'] !== null) return 'delivered';
       if (Number(current['attempts']) !== attempt) return 'retrying';
+      // Abandoned while this attempt was in flight (on reclaim, past
+      // maxAttempts or the horizon): a late result never resurrects or
+      // relabels it.
+      if (current['next_attempt_at'] === null) return 'abandoned';
       const now = this.#now();
       if (result.ok) {
         store.update('outbox_events', { event_id: eventId }, { acknowledged_at: new Date(now).toISOString(), next_attempt_at: null, last_error_code: null });
