@@ -11,6 +11,11 @@
 //   older than the last exported head, and a different digest at that seq as
 //   a divergence. The ledger must exist: a missing ledger is refused unless
 //   the explicit firstRestore option says nothing was exported yet;
+// - the full ledger is read, retired entries included: a backup that
+//   contains a retired tenant is refused (never restored or reported
+//   verified), after its chain is checked against the retained head, so the
+//   reason says whether it is older than that head, diverges from it, or
+//   would reintroduce the tenant at it (there is no un-retire);
 // - the directory is a published backup: a directory holding a staged
 //   manifest (manifest.staged.json: staging under any name, a copy or a link
 //   of one included), a staging directory name (`.staging-*`), and a
@@ -46,7 +51,18 @@ import { StorageError, StorageUsageError } from '../db/errors.ts';
 import { BACKUP_SCHEMA, BLOBS_DIRECTORY, DATABASE_FILE, hasStagedManifest, MANIFEST_FILE, requiredBlobRefs, STAGED_MANIFEST_FILE, type BackupManifest } from './backup.ts';
 import { checkAbsolute, copyPrivateFile, fileDigest, prepareEmptyDirectory, removeQuietly, syncDirectory } from './files.ts';
 import { isStagingDirectory } from './backup.ts';
-import { LedgerCommitUnsyncedError, ledgerDigest, LedgerSession, readLedger, refuseWhilePending, type HeadUpdate, type Ledger, type LedgerIo } from './ledger.ts';
+import {
+  LedgerCommitUnsyncedError,
+  ledgerDigest,
+  LedgerSession,
+  readLedgerDocument,
+  refuseWhilePending,
+  type HeadUpdate,
+  type Ledger,
+  type LedgerDocument,
+  type LedgerIo,
+  type RetiredTenant,
+} from './ledger.ts';
 
 export class RestoreRefusedError extends StorageError {
   readonly reasons: readonly string[];
@@ -135,6 +151,29 @@ function describeProblem(tenantId: string, problem: ChainProblem, ledger: Ledger
   return `tenant ${tenantId}: audit chain ${problem.kind} at seq ${problem.seq}`;
 }
 
+/**
+ * A backup that contains a retired tenant is refused. Its chain is first
+ * checked against the retained head, so the reason says which case it is.
+ */
+function describeRetired(tenantId: string, retained: RetiredTenant, problems: readonly ChainProblem[]): string[] {
+  const never = 'a backup that contains a retired tenant is never restored or verified';
+  const reasons: string[] = [];
+  let placed = false;
+  for (const problem of problems) {
+    if (problem.kind === 'truncated' && problem.seq === retained.seq) {
+      reasons.push(`tenant ${tenantId}: the tenant is retired; the backup's audit chain head is older than its retained head (seq ${retained.seq}); ${never}`);
+      placed = true;
+    } else if (problem.kind === 'head-mismatch') {
+      reasons.push(`tenant ${tenantId}: the tenant is retired; the backup's audit chain diverges from its retained head at seq ${problem.seq}; ${never}`);
+      placed = true;
+    } else {
+      reasons.push(`tenant ${tenantId}: audit chain ${problem.kind} at seq ${problem.seq}`);
+    }
+  }
+  if (!placed) reasons.push(`tenant ${tenantId}: the tenant is retired; restoring this backup would reintroduce it at its retained head (seq ${retained.seq}); ${never}`);
+  return reasons;
+}
+
 interface Inspection {
   readonly report: RestoreReport;
   readonly blobs: FileBlobStore;
@@ -143,7 +182,8 @@ interface Inspection {
 }
 
 /** Run every check against a staged copy of the backup database. */
-function inspect(db: Database, backupDir: string, manifest: BackupManifest, ledger: Ledger, reasons: string[]): Inspection | undefined {
+function inspect(db: Database, backupDir: string, manifest: BackupManifest, document: LedgerDocument, reasons: string[]): Inspection | undefined {
+  const ledger = document.tenants;
   let schemaVersion = 0;
   try {
     schemaVersion = db.checkSchema();
@@ -161,8 +201,12 @@ function inspect(db: Database, backupDir: string, manifest: BackupManifest, ledg
   const tenants: RestoredTenant[] = [];
   for (const tenantId of [...new Set([...dbTenants, ...Object.keys(ledger)])].sort()) {
     const recorded = ledger[tenantId];
-    const chain = verifyChain(db, tenantId, recorded === undefined ? {} : { expectedHead: recorded });
-    for (const problem of chain.problems) reasons.push(describeProblem(tenantId, problem, ledger));
+    // A tenant is active or retired in the ledger, never both.
+    const retained = Object.hasOwn(document.retired, tenantId) ? document.retired[tenantId] : undefined;
+    const expectedHead = recorded ?? retained;
+    const chain = verifyChain(db, tenantId, expectedHead === undefined ? {} : { expectedHead });
+    if (retained !== undefined) reasons.push(...describeRetired(tenantId, retained, chain.problems));
+    else for (const problem of chain.problems) reasons.push(describeProblem(tenantId, problem, ledger));
     if (!dbTenants.includes(tenantId)) continue;
     const listed = manifest.tenants.find((tenant) => tenant.tenant_id === tenantId);
     const recordedHead = listed?.audit_head ?? null;
@@ -190,7 +234,7 @@ function inspect(db: Database, backupDir: string, manifest: BackupManifest, ledg
  * RestoreRefusedError (after closing and removing the staging copy) on any
  * problem.
  */
-function stageAndInspect(backupDir: string, ledger: Ledger, staging: string, manifestFile: string): { readonly db: Database; readonly inspection: Inspection } {
+function stageAndInspect(backupDir: string, document: LedgerDocument, staging: string, manifestFile: string): { readonly db: Database; readonly inspection: Inspection } {
   const reasons: string[] = [];
   const manifest = readManifest(backupDir, reasons, manifestFile);
   if (manifest === undefined) throw new RestoreRefusedError(reasons);
@@ -208,7 +252,7 @@ function stageAndInspect(backupDir: string, ledger: Ledger, staging: string, man
   let db: Database | undefined;
   try {
     db = openDatabase({ path: staging });
-    const inspection = inspect(db, backupDir, manifest, ledger, reasons);
+    const inspection = inspect(db, backupDir, manifest, document, reasons);
     if (inspection === undefined || reasons.length > 0) throw new RestoreRefusedError(reasons);
     return { db, inspection };
   } catch (error) {
@@ -231,14 +275,15 @@ function refuseStaging(backupDir: string): void {
 }
 
 /**
- * Full verification of a backup directory against a given ledger, reading
- * the given manifest file (internal: --complete-staged re-verifies a staged
- * backup with its staged manifest). Returns the report and the manifest.
+ * Full verification of a backup directory against a given ledger document
+ * (active and retired tenants), reading the given manifest file (internal:
+ * --complete-staged re-verifies a staged backup with its staged manifest).
+ * Returns the report and the manifest.
  */
-export function inspectBackupDirectory(backupDir: string, ledger: Ledger, manifestFile: string = MANIFEST_FILE): { readonly report: RestoreReport; readonly manifest: BackupManifest } {
+export function inspectBackupDirectory(backupDir: string, document: LedgerDocument, manifestFile: string = MANIFEST_FILE): { readonly report: RestoreReport; readonly manifest: BackupManifest } {
   const scratch = mkdtempSync(join(tmpdir(), 'opensig-restore-check-'));
   try {
-    const { db, inspection } = stageAndInspect(backupDir, ledger, join(scratch, DATABASE_FILE), manifestFile);
+    const { db, inspection } = stageAndInspect(backupDir, document, join(scratch, DATABASE_FILE), manifestFile);
     db.close();
     const manifest = parseJson(readFileSync(join(backupDir, manifestFile), 'utf8')) as unknown as BackupManifest;
     return { report: inspection.report, manifest };
@@ -253,8 +298,8 @@ export function verifyBackup(options: VerifyBackupOptions): RestoreReport {
   const ledgerPath = checkAbsolute(options.ledgerPath, 'ledger path');
   refuseWhilePending(ledgerPath);
   refuseStaging(backupDir);
-  const ledger = readLedger(ledgerPath, { allowMissing: options.firstRestore === true });
-  return inspectBackupDirectory(backupDir, ledger).report;
+  const document = readLedgerDocument(ledgerPath, { allowMissing: options.firstRestore === true });
+  return inspectBackupDirectory(backupDir, document).report;
 }
 
 /** Verify a backup, then restore it into a new database path and a new or empty blob root. */
@@ -278,9 +323,9 @@ export function restoreBackup(options: RestoreOptions): RestoreReport {
   const session = options.firstRestore === true && ledgerDigest(ledgerPath) === null ? LedgerSession.open(ledgerPath, { allowMissing: true }) : undefined;
   try {
     const writeHeads = session !== undefined && !session.existed;
-    const ledger = session === undefined ? readLedger(ledgerPath, { allowMissing: options.firstRestore === true }) : session.document.tenants;
+    const document = session === undefined ? readLedgerDocument(ledgerPath, { allowMissing: options.firstRestore === true }) : session.document;
     const staging = join(dirname(databasePath), `.${randomBytes(12).toString('hex')}.restoring`);
-    const { db, inspection } = stageAndInspect(backupDir, ledger, staging, MANIFEST_FILE);
+    const { db, inspection } = stageAndInspect(backupDir, document, staging, MANIFEST_FILE);
     let createdRoot = false;
     let preparedRoot = false;
     let placed = false;

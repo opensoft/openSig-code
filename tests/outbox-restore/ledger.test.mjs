@@ -42,7 +42,9 @@
 //       target) is refused, exit 1; exit 2 means usage errors only;
 // OR-41 a real non-dumpable live writer holding a torn, aged lock:
 //       --break-lock damaged refuses, names it as uninspectable and leaves the
-//       lock untouched; Linux only, otherwise skipped (VACUOUS, never a pass).
+//       lock untouched; Linux only, otherwise skipped (VACUOUS, never a pass);
+// OR-42 verify and restore read retired tenants' retained heads: a backup
+//       containing a retired tenant is refused (exit 1) after the head check.
 // All data is synthetic. The backup module is imported as a namespace so that
 // every test reports its own failure against an older API.
 
@@ -102,7 +104,7 @@ const { BackupError, createBackup, LedgerError, readLedger, recordExportedHead, 
 // A-009 additions.
 const { breakLedgerLock, completeStaged, discardStaged, LedgerSession, pendingPublication, PendingPublicationError, readLedgerLock } = backupApi;
 // A-010 additions.
-const { breakDamagedLock, LedgerCommitUnsyncedError, resyncLedger, withLedgerSession } = backupApi;
+const { breakDamagedLock, LedgerCommitUnsyncedError, readLedgerDocument, resyncLedger, withLedgerSession } = backupApi;
 const { BlobDisposer, RetentionService } = retentionApi;
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -2293,6 +2295,89 @@ test('[OR-41] a real non-dumpable live writer (an execute-only copy of the pinne
       if (ended === undefined) writer.kill('SIGKILL');
     }
     rmSync(binDir, { recursive: true, force: true });
+    sys.db.close();
+  }
+});
+
+// ------------------------------------------------------------------- OR-42
+
+test('[OR-42] verify and restore read retired tenants\' retained heads: a backup containing a retired tenant is refused (exit 1) after the head check, as older, divergent or a reintroduction; a backup without it restores (A-010 Codex [18])', async () => {
+  const sys = system({ tenants: 2, events: 1 });
+  try {
+    const [tenant, other] = sys.tenants;
+    const bk1 = join(sys.backups, 'bk1');
+    const bk2 = join(sys.backups, 'bk2');
+    const fork = join(sys.backups, 'fork');
+
+    // Codex's reproduction: a seq-1 backup is refused once seq 2 is exported.
+    await backup(sys, 'bk1', { firstBackup: true });
+    appendEvents(sys, tenant, 1);
+    await backup(sys, 'bk2');
+    const exported = readLedger(sys.ledgerPath)[tenant];
+    assert.equal(exported.seq, 2);
+    assert.throws(
+      () => verifyBackup({ backupDir: bk1, ledgerPath: sys.ledgerPath }),
+      (error) => error instanceof RestoreRefusedError && error.reasons.join() === `tenant ${tenant}: audit chain head is older than the last exported head (seq 2)`,
+    );
+
+    // A backup whose chain forks from the exported one at seq 2, made against a separate ledger.
+    const raw = rawConnection(sys.path);
+    try {
+      const trigger = raw.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'audit_events_append_only_delete'").get().sql;
+      raw.exec('DROP TRIGGER audit_events_append_only_delete');
+      raw.prepare('DELETE FROM audit_events WHERE tenant_id = ? AND seq > 1').run(tenant);
+      raw.exec(trigger);
+    } finally {
+      raw.close();
+    }
+    appendEvents(sys, tenant, 1);
+    const forked = headOf(sys, tenant);
+    assert.equal(forked.seq, 2);
+    assert.notEqual(forked.digest, exported.digest);
+    await createBackup({ databasePath: sys.path, blobRoot: sys.blobRoot, outDir: fork, ledgerPath: join(scratch.dir(), LEDGER_FILE), clock, firstBackup: true });
+
+    // The tenant leaves the system and is retired at its last exported head.
+    deleteTenant(sys, tenant);
+    const retire = cli('--retire-tenant', tenant, '--db', sys.path, '--ledger', sys.ledgerPath);
+    assert.equal(retire.status, 0, retire.stdout + retire.stderr);
+    const retained = readLedgerDocument(sys.ledgerPath).retired[tenant];
+    assert.deepEqual([retained?.seq, retained?.digest], [2, exported.digest]);
+    assert.equal(readLedger(sys.ledgerPath)[tenant], undefined, 'the active heads no longer list it');
+
+    // Every backup that contains the retired tenant stays refused, through the
+    // library and the command line, and nothing is restored.
+    const never = 'a backup that contains a retired tenant is never restored or verified';
+    const cases = [
+      [bk1, `tenant ${tenant}: the tenant is retired; the backup's audit chain head is older than its retained head (seq 2); ${never}`],
+      [fork, `tenant ${tenant}: the tenant is retired; the backup's audit chain diverges from its retained head at seq 2; ${never}`],
+      [bk2, `tenant ${tenant}: the tenant is retired; restoring this backup would reintroduce it at its retained head (seq 2); ${never}`],
+    ];
+    const ledgerBefore = sha(sys.ledgerPath);
+    for (const [dir, reason] of cases) {
+      const label = basename(dir);
+      const refusedWithReason = (error) => error instanceof RestoreRefusedError && error.reasons.length === 1 && error.reasons[0] === reason;
+      assert.throws(() => verifyBackup({ backupDir: dir, ledgerPath: sys.ledgerPath }), refusedWithReason, `${label}: verify`);
+      const into = target();
+      assert.throws(() => restoreBackup({ backupDir: dir, ledgerPath: sys.ledgerPath, ...into }), refusedWithReason, `${label}: restore`);
+      assert.deepEqual(readdirSync(dirname(into.databasePath)), [], `${label}: nothing restored`);
+      const verified = cli('verify', '--from', dir, '--ledger', sys.ledgerPath);
+      assert.deepEqual([verified.status, verified.stdout, verified.stderr], [1, `backup: refused 1 reason(s): ${reason}\n`, ''], `${label}: verify, command line`);
+      const viaCli = target();
+      const restored = cli('restore', '--from', dir, '--ledger', sys.ledgerPath, '--db', viaCli.databasePath, '--blobs', viaCli.blobRoot);
+      assert.deepEqual([restored.status, restored.stdout, restored.stderr], [1, `backup: refused 1 reason(s): ${reason}\n`, ''], `${label}: restore, command line`);
+      assert.deepEqual(readdirSync(dirname(viaCli.databasePath)), [], `${label}: nothing restored by the command line`);
+    }
+    assert.equal(sha(sys.ledgerPath), ledgerBefore, 'verify and restore never write the ledger');
+    assert.ok(Object.hasOwn(readLedgerDocument(sys.ledgerPath).retired, tenant), 'there is no un-retire');
+
+    // A backup without the retired tenant verifies and restores.
+    await backup(sys, 'bk3');
+    const bk3 = join(sys.backups, 'bk3');
+    assert.deepEqual(verifyBackup({ backupDir: bk3, ledgerPath: sys.ledgerPath }).tenants.map((entry) => entry.tenant_id), [other]);
+    const into = target();
+    assert.deepEqual(restoreBackup({ backupDir: bk3, ledgerPath: sys.ledgerPath, ...into }).tenants.map((entry) => entry.tenant_id), [other]);
+    assert.ok(existsSync(into.databasePath));
+  } finally {
     sys.db.close();
   }
 });

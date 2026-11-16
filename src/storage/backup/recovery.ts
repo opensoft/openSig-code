@@ -106,7 +106,7 @@ export function completeStaged(dir: string, options: RecoveryOptions): Completed
     }
     let manifest;
     try {
-      ({ manifest } = inspectBackupDirectory(where.current, session.document.tenants, stagedManifest ? STAGED_MANIFEST_FILE : MANIFEST_FILE));
+      ({ manifest } = inspectBackupDirectory(where.current, session.document, stagedManifest ? STAGED_MANIFEST_FILE : MANIFEST_FILE));
     } catch (error) {
       if (error instanceof RestoreRefusedError) throw new RecoveryRefusedError(`the staged backup does not verify: ${error.reasons.join('; ')}`, { cause: error });
       throw error;
