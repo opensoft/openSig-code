@@ -14,7 +14,16 @@ export {
   type BackupTenant,
   type CreateBackupOptions,
 } from './backup.ts';
-export { LEDGER_SCHEMA, LedgerError, readLedger, recordExportedHead, type ExportedHead, type Ledger, type RecordOptions } from './ledger.ts';
+export {
+  LEDGER_SCHEMA,
+  LedgerError,
+  readLedger,
+  recordExportedHead,
+  type ExportedHead,
+  type Ledger,
+  type ReadLedgerOptions,
+  type RecordOptions,
+} from './ledger.ts';
 export {
   restoreBackup,
   RestoreRefusedError,

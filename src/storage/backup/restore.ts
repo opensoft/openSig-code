@@ -9,7 +9,8 @@
 //   recomputed event digests, checkpoints), and contains the head recorded in
 //   the exported-head ledger: a chain that ends before it is refused as
 //   older than the last exported head, and a different digest at that seq as
-//   a divergence;
+//   a divergence. The ledger must exist: a missing ledger is refused unless
+//   the explicit firstRestore option says nothing was exported yet;
 // - every blob in the backup verifies against its digest, and every blob a
 //   database row still requires is present.
 // Only then are the blobs copied into the (new or empty) target blob root and
@@ -55,6 +56,11 @@ export interface RestoreReport {
 export interface VerifyBackupOptions {
   readonly backupDir: string;
   readonly ledgerPath: string;
+  /**
+   * The first restore of a system whose ledger never existed: proceed without
+   * the exported-head ledger. Without this option a missing ledger is refused.
+   */
+  readonly firstRestore?: boolean;
 }
 
 export interface RestoreOptions extends VerifyBackupOptions {
@@ -156,10 +162,15 @@ function inspect(db: Database, backupDir: string, manifest: BackupManifest, ledg
  * RestoreRefusedError (after closing and removing the staging copy) on any
  * problem.
  */
-function stageAndInspect(backupDir: string, ledgerPath: string, staging: string): { readonly db: Database; readonly inspection: Inspection } {
+function stageAndInspect(
+  backupDir: string,
+  ledgerPath: string,
+  firstRestore: boolean,
+  staging: string,
+): { readonly db: Database; readonly inspection: Inspection } {
   const reasons: string[] = [];
   const manifest = readManifest(backupDir, reasons);
-  const ledger = readLedger(ledgerPath);
+  const ledger = readLedger(ledgerPath, { allowMissing: firstRestore });
   if (manifest === undefined) throw new RestoreRefusedError(reasons);
   const databaseFile = join(backupDir, DATABASE_FILE);
   let digest;
@@ -195,7 +206,7 @@ export function verifyBackup(options: VerifyBackupOptions): RestoreReport {
   const ledgerPath = checkAbsolute(options.ledgerPath, 'ledger path');
   const scratch = mkdtempSync(join(tmpdir(), 'opensig-restore-check-'));
   try {
-    const { db, inspection } = stageAndInspect(backupDir, ledgerPath, join(scratch, DATABASE_FILE));
+    const { db, inspection } = stageAndInspect(backupDir, ledgerPath, options.firstRestore === true, join(scratch, DATABASE_FILE));
     db.close();
     return inspection.report;
   } finally {
@@ -217,7 +228,7 @@ export function restoreBackup(options: RestoreOptions): RestoreReport {
     throw new StorageUsageError('the target blob root must be new or empty');
   }
   const staging = join(dirname(databasePath), `.${randomBytes(12).toString('hex')}.restoring`);
-  const { db, inspection } = stageAndInspect(backupDir, ledgerPath, staging);
+  const { db, inspection } = stageAndInspect(backupDir, ledgerPath, options.firstRestore === true, staging);
   let createdRoot = false;
   try {
     createdRoot = prepareEmptyDirectory(blobRoot);

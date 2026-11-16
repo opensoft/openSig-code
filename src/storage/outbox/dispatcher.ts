@@ -12,7 +12,9 @@
 // not retryable, reaches maxAttempts or passes the retry horizon. A crash
 // after delivery but before acknowledgement leads to a redelivery of the same
 // event_id and bytes once the claim window has passed; consumers deduplicate
-// on event_id.
+// on event_id. Reclaiming such an expired claim is held to the same bounds:
+// an event that already used maxAttempts attempts, or whose retry horizon has
+// passed, is abandoned in the claim transaction and never delivered again.
 
 import type { Database } from '../db/connection.ts';
 import { StorageUsageError } from '../db/errors.ts';
@@ -56,6 +58,11 @@ export interface DispatchSummary {
 
 export const RETRY_HORIZON_MS = 72 * 60 * 60 * 1000;
 const ERROR_CODE = /^[a-z0-9_.-]{1,64}$/;
+/** last_error_code of an event abandoned on reclaim. */
+export const ATTEMPTS_EXHAUSTED = 'attempts_exhausted';
+export const RETRY_HORIZON_PASSED = 'retry_horizon_passed';
+
+type Claim = { readonly attempt: number; readonly row: Row } | { readonly abandoned: true } | undefined;
 
 function positive(value: number | undefined, fallback: number, name: string): number {
   const result = value ?? fallback;
@@ -95,12 +102,14 @@ export class OutboxDispatcher {
     return now.getTime();
   }
 
-  /** Unacknowledged events that are due now, oldest first. */
+  /** Unacknowledged events that are due now, oldest first (at most batchSize). */
   due(tenantId: string): Row[] {
     const store = this.#db.forTenant(tenantId);
     const now = new Date(this.#now()).toISOString();
-    const fresh = store.list('outbox_events', { acknowledged_at: null, attempts: 0 });
-    const retries = store.list('outbox_events', { acknowledged_at: null, next_attempt_at: { op: '<=', value: now } });
+    // The oldest batchSize of each kind cover the oldest batchSize overall.
+    const page = { orderBy: [['created_at', 'asc'], ['event_id', 'asc']] as const, limit: this.#batchSize };
+    const fresh = store.list('outbox_events', { acknowledged_at: null, attempts: 0 }, page);
+    const retries = store.list('outbox_events', { acknowledged_at: null, next_attempt_at: { op: '<=', value: now } }, page);
     const byId = new Map([...fresh, ...retries].map((row) => [String(row['event_id']), row]));
     return [...byId.values()]
       .sort((a, b) => String(a['created_at']).localeCompare(String(b['created_at'])) || String(a['event_id']).localeCompare(String(b['event_id'])))
@@ -109,13 +118,19 @@ export class OutboxDispatcher {
 
   /** Events that will not be retried: unacknowledged, attempted, with no next attempt. */
   abandoned(tenantId: string): Row[] {
-    return this.#db
-      .forTenant(tenantId)
-      .list('outbox_events', { acknowledged_at: null, next_attempt_at: null, attempts: { op: '>', value: 0 } }, { orderBy: [['created_at', 'asc']] });
+    return [
+      ...this.#db
+        .forTenant(tenantId)
+        .iterate('outbox_events', { acknowledged_at: null, next_attempt_at: null, attempts: { op: '>', value: 0 } }, { orderBy: [['created_at', 'asc']] }),
+    ];
   }
 
-  /** Claim an event for one attempt; returns the attempt number, or undefined if no longer due. */
-  #claim(tenantId: string, eventId: string): { readonly attempt: number; readonly row: Row } | undefined {
+  /**
+   * Claim an event for one attempt; returns the attempt number, undefined if
+   * it is no longer due, or abandoned when a reclaim would exceed maxAttempts
+   * or the retry horizon (the event is then abandoned in this transaction).
+   */
+  #claim(tenantId: string, eventId: string): Claim {
     return this.#db.transaction(() => {
       const store = this.#db.forTenant(tenantId);
       const row = store.get('outbox_events', { event_id: eventId });
@@ -125,6 +140,17 @@ export class OutboxDispatcher {
       const next = row['next_attempt_at'];
       const isDue = attempts === 0 ? next === null : typeof next === 'string' && next <= new Date(now).toISOString();
       if (!isDue) return undefined;
+      if (attempts > 0) {
+        const exhausted = attempts >= this.#maxAttempts;
+        const pastHorizon = now > Date.parse(String(row['created_at'])) + this.#horizonMs;
+        if (exhausted || pastHorizon) {
+          store.update('outbox_events', { event_id: eventId }, {
+            next_attempt_at: null,
+            last_error_code: exhausted ? ATTEMPTS_EXHAUSTED : RETRY_HORIZON_PASSED,
+          });
+          return { abandoned: true } as const;
+        }
+      }
       store.update('outbox_events', { event_id: eventId }, {
         attempts: attempts + 1,
         last_attempt_at: new Date(now).toISOString(),
@@ -166,6 +192,10 @@ export class OutboxDispatcher {
       const eventId = String(candidate['event_id']);
       const claimed = this.#claim(tenantId, eventId);
       if (claimed === undefined) continue;
+      if ('abandoned' in claimed) {
+        summary.abandoned.push(eventId);
+        continue;
+      }
       const attempt: DeliveryAttempt = {
         tenantId,
         eventId,

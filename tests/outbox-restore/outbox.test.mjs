@@ -3,14 +3,15 @@
 // Transactional outbox (T030): OR-01 the event commits exactly with the state
 // change it announces; OR-02 every delivery attempt, including a redelivery
 // after a crash before acknowledgement, carries the same event_id and bytes;
-// OR-05 retries are bounded (backoff cap, attempts, horizon, non-retryable).
+// OR-05 retries are bounded (backoff cap, attempts, horizon, non-retryable);
+// OR-14 reclaiming an expired claim is held to the same bounds.
 
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
 import { canonicalize } from '../../src/domain/canonical/index.ts';
 import { StorageConstraintError, StorageUsageError } from '../../src/storage/db/index.ts';
-import { enqueueOutboxEvent, OutboxDispatcher, RETRY_HORIZON_MS } from '../../src/storage/outbox/index.ts';
+import { ATTEMPTS_EXHAUSTED, enqueueOutboxEvent, OutboxDispatcher, RETRY_HORIZON_MS, RETRY_HORIZON_PASSED } from '../../src/storage/outbox/index.ts';
 import { makeScratch } from '../storage/support/fixtures.mjs';
 import { addEnvelope, BASE_TIME, createTenant, environment, sid, terminalEnvelope, ts } from '../audit-chain/support/chain.mjs';
 
@@ -214,6 +215,85 @@ test('[OR-05] retries are bounded: capped backoff, maximum attempts, the 72-hour
 
     assert.throws(() => new OutboxDispatcher({ db, clock }), /deliver function/);
     assert.throws(() => new OutboxDispatcher({ db, clock, deliver: async () => ({ ok: true }), baseDelayMs: 0 }), /positive integer/);
+  } finally {
+    db.close();
+  }
+});
+
+test('[OR-14] reclaiming an expired claim enforces maxAttempts and the retry horizon: the event is abandoned without another delivery', async () => {
+  const { db } = environment(scratch);
+  try {
+    const tenant = sid('tenant');
+    createTenant(db, tenant);
+    const { state, clock } = controllableClock();
+    const store = db.forTenant(tenant);
+    const row = (eventId) => store.get('outbox_events', { event_id: eventId });
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+    // maxAttempts 1: the only attempt is claimed, then the dispatcher dies
+    // with the delivery in flight.
+    const single = voidEnvelope(db, tenant, addEnvelope(db, tenant), clock);
+    const inFlight = [];
+    let release;
+    const crashed = new OutboxDispatcher({
+      db,
+      clock,
+      maxAttempts: 1,
+      deliver: (attempt) => (inFlight.push(attempt), new Promise((resolve) => (release = resolve))),
+    });
+    const pending = crashed.dispatch(tenant);
+    await settle();
+    assert.deepEqual(inFlight.map((attempt) => attempt.attempt), [1]);
+    assert.equal(row(single.eventId).attempts, 1);
+
+    state.now += 60_001; // the claim window has passed
+    const redelivered = [];
+    const restarted = new OutboxDispatcher({ db, clock, maxAttempts: 1, deliver: async (attempt) => (redelivered.push(attempt), { ok: true }) });
+    assert.deepEqual(await restarted.dispatch(tenant), { delivered: [], retrying: [], abandoned: [single.eventId] });
+    assert.deepEqual(redelivered, [], 'deliver() is not called past maxAttempts');
+    assert.deepEqual(
+      [row(single.eventId).attempts, row(single.eventId).next_attempt_at, row(single.eventId).last_error_code],
+      [1, null, ATTEMPTS_EXHAUSTED],
+    );
+    assert.deepEqual(restarted.abandoned(tenant).map((event) => event.event_id), [single.eventId]);
+    state.now += 3_600_000;
+    assert.deepEqual(await restarted.dispatch(tenant), { delivered: [], retrying: [], abandoned: [] }, 'an abandoned event stays abandoned');
+    // The original attempt finishing late may still record its delivery.
+    release({ ok: true });
+    assert.deepEqual((await pending).delivered, [single.eventId]);
+    assert.equal(row(single.eventId).attempts, 1);
+
+    // The horizon: a retry is claimed just inside it, the dispatcher dies, and
+    // the claim expires after the horizon has passed.
+    const late = voidEnvelope(db, tenant, addEnvelope(db, tenant), clock);
+    const createdAt = Date.parse(row(late.eventId).created_at);
+    const options = { db, clock, horizonMs: 120_000, baseDelayMs: 100_000, maxAttempts: 50 };
+    const failing = new OutboxDispatcher({ ...options, deliver: async () => ({ ok: false, errorCode: 'http_503' }) });
+    assert.deepEqual((await failing.dispatch(tenant)).retrying, [late.eventId]);
+    state.now = Date.parse(row(late.eventId).next_attempt_at);
+    const hung = [];
+    const stalled = new OutboxDispatcher({ ...options, deliver: (attempt) => (hung.push(attempt), new Promise(() => {})) });
+    void stalled.dispatch(tenant);
+    await settle();
+    assert.deepEqual(hung.map((attempt) => attempt.attempt), [2]);
+    state.now += 60_001;
+    assert.ok(state.now > createdAt + 120_000, 'the claim expired after the horizon');
+    const afterHorizon = [];
+    const recovering = new OutboxDispatcher({ ...options, deliver: async (attempt) => (afterHorizon.push(attempt), { ok: true }) });
+    assert.deepEqual(await recovering.dispatch(tenant), { delivered: [], retrying: [], abandoned: [late.eventId] });
+    assert.deepEqual(afterHorizon, [], 'deliver() is not called past the horizon');
+    assert.deepEqual([row(late.eventId).attempts, row(late.eventId).next_attempt_at, row(late.eventId).last_error_code], [2, null, RETRY_HORIZON_PASSED]);
+
+    // Within both bounds an expired claim is still redelivered (OR-02).
+    const ok = voidEnvelope(db, tenant, addEnvelope(db, tenant), clock);
+    const firstTry = new OutboxDispatcher({ db, clock, maxAttempts: 3, deliver: () => new Promise(() => {}) });
+    void firstTry.dispatch(tenant);
+    await settle();
+    state.now += 60_001;
+    const retried = [];
+    const second = new OutboxDispatcher({ db, clock, maxAttempts: 3, deliver: async (attempt) => (retried.push(attempt.attempt), { ok: true }) });
+    assert.deepEqual((await second.dispatch(tenant)).delivered, [ok.eventId]);
+    assert.deepEqual(retried, [2]);
   } finally {
     db.close();
   }

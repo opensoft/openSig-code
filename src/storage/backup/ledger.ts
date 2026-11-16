@@ -3,9 +3,14 @@
 // The exported-head ledger: per tenant, the most advanced audit chain head
 // that has left the system (in a backup, and later in audit receipts). It is
 // kept in a file outside the database, so restoring an older database cannot
-// roll it back, and restore refuses any backup whose chain does not contain
-// the recorded head. Heads only move forward; a different digest at a
-// recorded seq is a divergence and is refused.
+// roll it back, and backup and restore refuse any chain that does not contain
+// the recorded head. Heads only move forward, and only along one chain: a new
+// head is recorded only when the chain it comes from contains the recorded
+// head (ancestry); otherwise the chain was rolled back or diverged.
+//
+// A missing ledger fails closed. Only an explicit first-backup or
+// first-restore option (nothing has been exported yet) treats it as empty, so
+// deleting the ledger cannot make rolled-back state acceptable.
 //
 // Format (RFC 8785 canonical JSON, mode 0600):
 //   { "schema": "opensig.exported-heads/1",
@@ -53,11 +58,23 @@ function checkHead(tenantId: string, value: unknown): ExportedHead {
   return { seq, digest, exported_at: exportedAt, source };
 }
 
-/** Read the ledger; a missing file is an empty ledger. */
-export function readLedger(path: string): Ledger {
+export interface ReadLedgerOptions {
+  /**
+   * Treat a missing ledger as empty. Only for the explicit first backup or
+   * first restore, when nothing has been exported yet; otherwise a missing
+   * ledger is refused.
+   */
+  readonly allowMissing?: boolean;
+}
+
+/** Read the ledger. A missing file is refused unless allowMissing is set. */
+export function readLedger(path: string, options: ReadLedgerOptions = {}): Ledger {
   checkAbsolute(path, 'ledger path');
   const stat = lstatSync(path, { throwIfNoEntry: false });
-  if (stat === undefined) return {};
+  if (stat === undefined) {
+    if (options.allowMissing === true) return {};
+    throw new LedgerError('the exported-head ledger is missing; only an explicit first backup or first restore may proceed without it');
+  }
   if (!stat.isFile()) throw new LedgerError('ledger path is not a regular file');
   let value: JsonValue;
   try {
@@ -80,22 +97,34 @@ export function readLedger(path: string): Ledger {
 export interface RecordOptions {
   readonly clock: () => Date;
   readonly source: string;
+  /**
+   * The event_digest at a seq of the chain that `head` comes from (undefined
+   * when the chain has no such event). Used to require ancestry: the chain
+   * must contain both `head` and the head already recorded.
+   */
+  readonly digestAt: (seq: number) => string | undefined;
+  /** Create the ledger if it is missing (the explicit first backup only). */
+  readonly createIfMissing?: boolean;
 }
 
 /**
- * Record that `head` left the system for `tenantId`. Keeps the more advanced
- * head; refuses a different digest at an already recorded seq.
+ * Record that `head` left the system for `tenantId`. Requires ancestry: the
+ * chain `head` comes from must contain the recorded head unchanged, or the
+ * chain was rolled back or diverged and nothing is recorded. Keeps the more
+ * advanced head.
  */
 export function recordExportedHead(path: string, tenantId: string, head: { readonly seq: number; readonly digest: string }, options: RecordOptions): ExportedHead {
   if (!TENANT.test(tenantId)) throw new StorageUsageError('tenant id is malformed');
   if (!SOURCE.test(options.source)) throw new StorageUsageError('ledger source is malformed');
+  if (typeof options.digestAt !== 'function') throw new StorageUsageError('recording an exported head needs digestAt for the ancestry check');
   const now = options.clock();
   const candidate = checkHead(tenantId, { seq: head.seq, digest: head.digest, exported_at: now.toISOString(), source: options.source });
-  const ledger: Record<string, ExportedHead> = { ...readLedger(path) };
+  if (options.digestAt(candidate.seq) !== candidate.digest) throw new LedgerError('the head to record is not part of the given chain');
+  const ledger: Record<string, ExportedHead> = { ...readLedger(path, { allowMissing: options.createIfMissing === true }) };
   const existing = ledger[tenantId];
   if (existing !== undefined) {
-    if (existing.seq === candidate.seq && existing.digest !== candidate.digest) {
-      throw new LedgerError('the chain diverged: a different digest was already exported at this seq');
+    if (options.digestAt(existing.seq) !== existing.digest) {
+      throw new LedgerError(`the chain does not contain the last exported head (seq ${existing.seq}): it was rolled back or diverged`);
     }
     if (existing.seq >= candidate.seq) return existing;
   }

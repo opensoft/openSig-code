@@ -12,8 +12,10 @@ export {
   type WebhookEventPayload,
 } from './outbox.ts';
 export {
+  ATTEMPTS_EXHAUSTED,
   OutboxDispatcher,
   RETRY_HORIZON_MS,
+  RETRY_HORIZON_PASSED,
   type DeliveryAttempt,
   type DeliveryResult,
   type DispatcherOptions,
