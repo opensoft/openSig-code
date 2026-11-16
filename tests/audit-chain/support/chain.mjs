@@ -47,10 +47,26 @@ export function rawConnection(path) {
 }
 
 /**
- * An envelope taken directly to a terminal state, with a real document blob
- * and, for a completed envelope, real final PDF and evidence blobs.
+ * The legal walk from draft to each state this fixture builds (data-model.md
+ * § Envelope states, transition graph; A-010 row ST11-FX). Each step is one
+ * storage-level compare-and-set that moves the version by exactly one.
+ */
+const LEGAL_WALKS = Object.freeze({
+  completed: ['prepared', 'sent', 'finalizing', 'completed'],
+  sent: ['prepared', 'sent'],
+  declined: ['prepared', 'sent', 'declined'],
+  voided: ['voided'],
+  expired: ['expired'],
+});
+
+/**
+ * An envelope taken to a terminal (or sent) state by legal transitions only,
+ * with a real document blob and, for a completed envelope, real final PDF and
+ * evidence blobs. The walk adds no audit event, outbox event or other row.
  */
 export function terminalEnvelope(db, blobs, tenant, { state = 'completed', updatedMinutes = 10, documentSeed } = {}) {
+  const walk = LEGAL_WALKS[state];
+  if (walk === undefined) throw new Error(`terminalEnvelope has no legal walk to ${state}`);
   const store = db.forTenant(tenant);
   const env = sid('env');
   const rev = sid('rev');
@@ -72,18 +88,27 @@ export function terminalEnvelope(db, blobs, tenant, { state = 'completed', updat
       created_at: ts(2),
       frozen_at: ts(3),
     });
-    store.compareAndSet('envelopes', { id: env }, 1, {
-      state,
-      base_revision_id: rev,
-      manifest_digest: hex(`manifest-${env}`),
-      recipients_digest: hex(`recipients-${env}`),
-      approvals_complete: completed ? 1 : 0,
-      updated_at: ts(updatedMinutes),
+    // The step that leaves draft carries the frozen content; approvals_complete
+    // is set on entering finalizing, as the schema ties it to that state.
+    walk.forEach((step, index) => {
+      const values = {
+        state: step,
+        ...(index === 0
+          ? { base_revision_id: rev, manifest_digest: hex(`manifest-${env}`), recipients_digest: hex(`recipients-${env}`) }
+          : {}),
+        ...(step === 'finalizing' ? { approvals_complete: 1 } : {}),
+        updated_at: ts(updatedMinutes),
+      };
+      if (!store.compareAndSet('envelopes', { id: env }, index + 1, values)) {
+        throw new Error(`terminalEnvelope: the ${step} step lost its compare-and-set`);
+      }
     });
     if (completed) {
       store.insert('signing_jobs', {
         envelope_id: env,
-        reserved_version: 2,
+        // The version written on entering finalizing: draft 1, prepared 2,
+        // sent 3, finalizing 4 (data-model.md § Entities, SigningJob; A-010).
+        reserved_version: 4,
         status: 'succeeded',
         attempt_count: 1,
         max_attempts: 3,
