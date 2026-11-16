@@ -34,10 +34,15 @@
 //                      A quoted value is always a literal, even when spelt
 //                      like a variable name; only unquoted values can be
 //                      variable references (OTHER_VAR, process.env.X).
-//                      A value that is wholly one placeholder (${VAR}, $VAR,
-//                      $(cmd), {{x}}) is exempt only where it would expand
-//                      (unquoted, double-quoted, or outside shell and .env
-//                      files); a value that merely contains ${ is a literal.
+//                      Placeholders (${VAR}, $VAR, $(cmd), {{x}}) count only
+//                      where they would expand (unquoted, double-quoted, or
+//                      outside shell and .env files), need a variable name,
+//                      and exempt nothing but themselves: their defaults,
+//                      literal arguments and the text around them are
+//                      tested; only placeholders with path punctuation or a
+//                      plain path (${HOME}/.ssh/id_ed25519) are exempt.
+//   scan-limit         content a matcher could not finish (stack exhausted):
+//                      the file is reported rather than passed
 //
 // Content encodings. The PEM and PKCS#12 rules run on every file, binary or
 // not, and also on its UTF-16 decoding whenever it contains a NUL byte. Text
@@ -61,6 +66,7 @@ export const RULES = Object.freeze([
   'fixture-image',
   'env-file',
   'secret-assignment',
+  'scan-limit',
 ]);
 
 const MAX_BUFFER = 1024 * 1024 * 1024;
@@ -420,10 +426,15 @@ const TYPE_ARGS = String.raw`<[^=;\r\n<>()]*(?:<[^=;\r\n<>()]*>[^=;\r\n<>()]*)*>
 const TYPE_TERM = String.raw`&?(?:'[A-Za-z_]+[ \t]+)?(?:mut[ \t]+)?[A-Za-z_$][\w$.]*(?:${TYPE_ARGS})?(?:\[\])*\??`;
 const TYPE = String.raw`${TYPE_TERM}(?:[ \t]*\|[ \t]*${TYPE_TERM})*`;
 
-// A value: double-quoted, single-quoted, backtick (no interpolation) or bare.
-// A bare value may hold balanced ${...} groups (up to 256 characters each), so
-// an unquoted ${NAME} is read whole rather than cut before its closing brace.
-const VALUE = String.raw`(?:"((?:[^"\\\r\n]|\\.)*)"|'((?:[^'\\\r\n]|\\.)*)'|` + '`((?:[^`\\\\\\r\\n$]|\\\\.)*)`' + String.raw`|((?:\$\{[^{}\s]{0,256}\}|[^\s"'` + '`' + String.raw`,;#&|)\]}])+))`;
+// A value: double-quoted, single-quoted, backtick (a template literal, which
+// may hold ${...} and $; R4-2) or bare. The quoted forms are unrolled
+// (q[^q\\]*(?:\\.[^q\\]*)*q) so the matcher keeps no backtracking state per
+// character, only per escape, and a value of 10 MB does not exhaust its stack
+// (R4-3). A bare value is a run of characters other than the value terminators
+// (whitespace and " ' ` , ; # & | ) ] }); bareValue() extends it, in one linear
+// pass, over ${...} groups and $(...) commands.
+const BT = '`';
+const VALUE = String.raw`(?:"([^"\\\r\n]*(?:\\.[^"\\\r\n]*)*)"|'([^'\\\r\n]*(?:\\.[^'\\\r\n]*)*)'|${BT}([^${BT}\\\r\n]*(?:\\.[^${BT}\\\r\n]*)*)${BT}|([^\s"'${BT},;#&|)\]}]+))`;
 
 // An optional "-" or "--" flag prefix, NAME (optionally quoted, optionally
 // followed by TypeScript "?" or "!"), then an operator: Go ":=", a typed
@@ -435,7 +446,7 @@ const ASSIGNMENT = new RegExp(
 );
 
 // Go typed declarations: var NAME TYPE = "value" (quoted values only).
-const GO_TYPED = /\b(?:var|const)[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]+[[\]*A-Za-z_][\w.[\]*]*[ \t]*=(?![=>~])[ \t]*(?:"((?:[^"\\\r\n]|\\.)*)"|`([^`]*)`)/g;
+const GO_TYPED = /\b(?:var|const)[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]+[[\]*A-Za-z_][\w.[\]*]*[ \t]*=(?![=>~])[ \t]*(?:"([^"\\\r\n]*(?:\\.[^"\\\r\n]*)*)"|`([^`]*)`)/g;
 
 // A password in URL userinfo: scheme://user:password@host.
 const URL_CREDENTIALS = /\b[A-Za-z][A-Za-z0-9+.-]{1,31}:\/\/([^\s:/?#@'"`<>\\]{1,128}):([^\s/?#@'"`<>\\]{1,256})@(?=[A-Za-z0-9[])/g;
@@ -447,19 +458,36 @@ const BARE_VALUE_EXTENSIONS = new Set(['', '.ini', '.cfg', '.conf', '.properties
 // Files where a backtick is shell command substitution, not a string literal.
 const SHELL_EXTENSIONS = new Set(['', '.sh', '.bash', '.zsh']);
 
-// A value that is wholly one interpolation placeholder: ${NAME}, $NAME,
-// $(command), {{name}}, <name> or %NAME%. Each form excludes its own closing
-// bracket, so `${a}literal${b}` or `$(a)literal$(b)` is not "wholly" one.
-// Such a value is exempt only where it would be expanded (NS-10): unquoted,
-// double-quoted, or in a file that is not shell-like (YAML, JSON, TypeScript,
-// templates), never single-quoted in a shell or .env file, where it is a
-// literal. A value that merely contains ${ is a literal.
-const PLACEHOLDER_VALUE = /^(?:\$\{[^{}]*\}|\$\([^()]*\)|\$[A-Za-z_][A-Za-z0-9_]*|\{\{[^{}]*\}\}|<[^<>]*>|%[A-Za-z_][A-Za-z0-9_]*%)$/;
-// Unquoted only: a command substitution cut at its first space by the value
-// tokenizer ($(openssl rand -hex 32) reads as "$(openssl"), and a variable
-// followed by a path ($HOME/.config/x; no braces).
-const BARE_SUBSTITUTION = /^\$\(/;
-const VARIABLE_PATH = /^\$[A-Za-z_][A-Za-z0-9_]*\/[^\s]*$/;
+// Placeholders (NS-10, R4-1, R4-5). A value is split into placeholders and the
+// literal text around them; only literal text can be a secret.
+//   ${NAME}, ${NAME:-word} (and -, :=, =, :+, +), ${NAME:?message}, $NAME,
+//   $(command args), {{ expr }}, ${{ expr }}, %NAME%: only where they would
+//   expand: unquoted, double-quoted, or in a file that is not shell-like.
+//   Single-quoted in a shell or .env file they are literal text.
+//   ${expr}, {{ expr }}, %NAME%: in a backtick string outside shell files (a
+//   template literal; a Go raw string holding a template).
+//   <name> and $(NAME): in any quoting (a template field; a Make variable).
+// A NAME is an identifier (dotted for ${var.a}, ${process.env.X}) that does
+// not look random, so ${<literal>}, $<literal>, {{<literal>}} and <literal>
+// are literals. The default and alternate words of ${NAME:-word} are literal
+// text, and so is a command argument that looks random: $(openssl rand -hex 32)
+// and $(cat /run/secrets/x) are exempt, $(echo <literal>) is not. A value made
+// only of placeholders, path punctuation and plain path components
+// (${HOME}/.ssh/id_ed25519) is exempt; any other literal text is tested.
+const NAME_AT = /[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d{1,6}\])*/y;
+const SHELL_NAME_AT = /[A-Za-z_][A-Za-z0-9_]*/y;
+const PERCENT_NAME_AT = /%[A-Za-z_][A-Za-z0-9_]*%/y;
+const MAKE_VARIABLE_AT = /\$\(([A-Za-z_][A-Za-z0-9_.]*)\)/y;
+// Shell parameter operators: defaults and alternates (literal words), errors
+// (a message) and patterns (#, %, /, ^, , and :offset).
+const SHELL_OPERATOR_AT = /:?[-=+?]|##?|%%?|\/\/?|\^\^?|,,?|:/y;
+const MESSAGE_OPERATOR = /^:?\?$/;
+const WORD_OPERATOR = /^:?[-=+]$/;
+const MAX_NESTING = 16;
+const MAX_ENCLOSED = 256;
+const PUNCTUATION_RUN = /^[\s/.,:@_-]*$/;
+const PATH_RUN = /^(?:~|\.{1,2})?(?:\/\.?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)+\/?$/;
+const MAYBE_PLACEHOLDER = /[$<{%]/;
 // Variable references: only an unquoted value can refer to another variable
 // (OTHER_VAR, process.env.X, import.meta.env.X). Quoted, the same spelling is
 // a literal string (Codex [3], NS-09).
@@ -493,17 +521,245 @@ function expands(quote, shell) {
   return quote === null || quote === 'double' || !shell;
 }
 
+/** The placeholder forms a value written with `quote` can hold (see Placeholders). */
+function contextOf(quote, shell) {
+  const template = quote === 'backtick';
+  return { dollar: expands(quote, shell) && !template, template };
+}
+
+/** A token of 8 or more letters and digits that mixes case, or is 16 or more long: random, not a word. */
+function isRandomToken(token) {
+  return token.length >= 8 && /[0-9]/.test(token) && /[A-Za-z]/.test(token) && ((/[a-z]/.test(token) && /[A-Z]/.test(token)) || token.length >= 16);
+}
+
+function looksRandom(text) {
+  return text.length >= 8 && text.split(/[^A-Za-z0-9]+/).some(isRandomToken);
+}
+
+/** A path of plain components (/.ssh/id_ed25519, ./conf/app.yaml), none random-looking. */
+function isPlainPath(text) {
+  return text.length <= 4096 && PATH_RUN.test(text) && !looksRandom(text);
+}
+
+/** text.indexOf(needle, from), remembered in `cache` so that rising `from` values cost linear time overall. */
+function indexFrom(text, needle, from, cache) {
+  const hit = cache.get(needle);
+  if (hit && from >= hit.from && (hit.at === -1 || from <= hit.at)) return hit.at;
+  const at = text.indexOf(needle, from);
+  cache.set(needle, { from, at });
+  return at;
+}
+
+function lineEnd(text, from, cache) {
+  const at = indexFrom(text, '\n', from, cache);
+  return at === -1 ? text.length : at;
+}
+
+/** Whether a random-looking token starts in text[from, to) (token starts are found once per text). */
+function randomTokenWithin(text, from, to, cache) {
+  let starts = cache.get('random-token-starts');
+  if (starts === undefined) {
+    starts = [];
+    for (const match of text.matchAll(/[A-Za-z0-9]{8,}/g)) if (isRandomToken(match[0])) starts.push(match.index);
+    cache.set('random-token-starts', starts);
+  }
+  let low = 0;
+  let high = starts.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (starts[mid] < from) low = mid + 1;
+    else high = mid;
+  }
+  return low < starts.length && starts[low] < to;
+}
+
+/**
+ * Splits `value` into placeholders and literal text, for a context from
+ * contextOf(). Returns { placeholders, literal }: how many placeholders it
+ * holds, and whether it holds literal text: a run beside the placeholders
+ * that is more than punctuation or a plain path, a default or alternate word,
+ * or a random-looking pattern or command argument. One linear pass that stops
+ * at the first literal; nesting deeper than MAX_NESTING is literal text.
+ */
+function splitValue(value, context) {
+  const state = { context, placeholders: 0, literal: false, open: false, cache: null };
+  if (MAYBE_PLACEHOLDER.test(value)) sequence(value, 0, state, 0, true);
+  return state;
+}
+
+/**
+ * Parses `v` from `start` to its end or, in a word, to the first closing brace
+ * not balanced inside the word. Returns the index where it stopped and, for a
+ * word, its literal text (quotes removed) in `words`. Once a ${ is found
+ * unterminated (state.open), the rest of the value is literal text.
+ */
+function sequence(v, start, state, depth, outer, words) {
+  const inWord = !outer;
+  let from = start;
+  const flush = (to) => {
+    if (to <= from) return;
+    const text = v.slice(from, to);
+    if (inWord) words.push(text);
+    else if (isLiteralRun(text)) state.literal = true;
+  };
+  let balance = 0;
+  let i = start;
+  while (i < v.length && !state.literal) {
+    const c = v[i];
+    if (inWord && c === '}' && balance === 0) break;
+    if (inWord && (c === '"' || c === "'")) {
+      const close = indexFrom(v, c, i + 1, (state.cache ??= new Map()));
+      if (close !== -1) {
+        flush(i);
+        words.push(v.slice(i + 1, close));
+        i = close + 1;
+        from = i;
+        continue;
+      }
+    }
+    if (c === '\\' && i + 1 < v.length) {
+      i += 2;
+      continue;
+    }
+    if ((c === '$' || c === '<' || c === '{' || c === '%') && !state.open && depth < MAX_NESTING) {
+      const end = placeholder(v, i, state, depth);
+      if (end > i) {
+        // Runs beside placeholders are judged one by one: "${A}-${B}" holds only punctuation.
+        flush(i);
+        state.placeholders += 1;
+        i = end;
+        from = i;
+        continue;
+      }
+      if (state.open) {
+        i = v.length;
+        break;
+      }
+    }
+    if (inWord && c === '{') balance += 1;
+    else if (inWord && c === '}') balance -= 1;
+    i += 1;
+  }
+  if (state.literal) return v.length;
+  flush(i);
+  return i;
+}
+
+/** The end of the placeholder at `v[i]`, or -1 when none starts there. */
+function placeholder(v, i, state, depth) {
+  const { dollar, template } = state.context;
+  const c = v[i];
+  const next = v[i + 1];
+  if (c === '$') {
+    if (next === '{') {
+      if (v[i + 2] === '{') return dollar ? enclosed(v, i + 3, '}}', state) : -1;
+      if (dollar) return parameter(v, i, state, depth);
+      return template ? enclosed(v, i + 2, '}', state) : -1;
+    }
+    if (next === '(') {
+      MAKE_VARIABLE_AT.lastIndex = i;
+      const make = MAKE_VARIABLE_AT.exec(v);
+      if (make && !looksRandom(make[1])) return i + make[0].length;
+      return dollar ? command(v, i, state) : -1;
+    }
+    if (dollar) {
+      SHELL_NAME_AT.lastIndex = i + 1;
+      const name = SHELL_NAME_AT.exec(v);
+      if (name && !looksRandom(name[0])) return i + 1 + name[0].length;
+    }
+    return -1;
+  }
+  if (c === '{' && next === '{') return dollar || template ? enclosed(v, i + 2, '}}', state) : -1;
+  if (c === '<') return enclosed(v, i + 1, '>', state);
+  if (c === '%' && (dollar || template)) {
+    PERCENT_NAME_AT.lastIndex = i;
+    const name = PERCENT_NAME_AT.exec(v);
+    if (name && !looksRandom(name[0])) return i + name[0].length;
+  }
+  return -1;
+}
+
+/**
+ * A template field closed by `close` within MAX_ENCLOSED characters whose
+ * content names something: a letter, no bracket or backslash, no
+ * random-looking token. Returns its end, or -1.
+ */
+function enclosed(v, start, close, state) {
+  const end = indexFrom(v, close, start, (state.cache ??= new Map()));
+  if (end === -1 || end - start > MAX_ENCLOSED) return -1;
+  const content = v.slice(start, end);
+  if (!/[A-Za-z_]/.test(content) || /[{}<>\\]/.test(content) || looksRandom(content)) return -1;
+  return end + close.length;
+}
+
+/** A shell parameter expansion ${NAME}, ${NAME<operator>word}, ${#NAME} or ${!NAME} at `v[i]`. */
+function parameter(v, i, state, depth) {
+  let j = i + 2;
+  if (v[j] === '#' || v[j] === '!') j += 1;
+  NAME_AT.lastIndex = j;
+  const name = NAME_AT.exec(v);
+  if (!name || looksRandom(name[0])) return -1;
+  j += name[0].length;
+  if (v[j] === '}') return j + 1;
+  SHELL_OPERATOR_AT.lastIndex = j;
+  const operator = SHELL_OPERATOR_AT.exec(v);
+  if (!operator) return -1;
+  j += operator[0].length;
+  const placeholders = state.placeholders;
+  const words = [];
+  const end = sequence(v, j, state, depth + 1, false, words);
+  if (state.literal) return v.length;
+  if (end >= v.length) {
+    state.placeholders = placeholders;
+    state.open = true;
+    return -1;
+  }
+  if (!MESSAGE_OPERATOR.test(operator[0])) {
+    const word = words.join('');
+    if (WORD_OPERATOR.test(operator[0]) ? isLiteralWord(word) : looksRandom(word)) state.literal = true;
+  }
+  return end + 1;
+}
+
+/** A command substitution $(command args) at `v[i]`; unterminated, it runs to the end of the value. */
+function command(v, i, state) {
+  let j = i + 2;
+  let balance = 0;
+  for (; j < v.length; j += 1) {
+    if (v[j] === '(') balance += 1;
+    else if (v[j] === ')') {
+      if (balance === 0) break;
+      balance -= 1;
+    }
+  }
+  if (looksRandom(v.slice(i + 2, j))) state.literal = true;
+  return Math.min(j + 1, v.length);
+}
+
+/** Whether a default or alternate word is a literal value. */
+function isLiteralWord(word) {
+  if (word.length < 8 || PLACEHOLDER_WORDS.test(word) || namesVariable(word) || isPlainPath(word)) return false;
+  return !/^(?:true|false|null|none|undefined)$/i.test(word);
+}
+
+/** Whether literal text beside placeholders is a literal: not only punctuation, a plain path or a placeholder word. */
+function isLiteralRun(text) {
+  return !PUNCTUATION_RUN.test(text) && !PLACEHOLDER_WORDS.test(text) && !isPlainPath(text);
+}
+
 /**
  * Whether `value`, assigned to secret name `name`, is a literal secret.
  * `quote` is how the value was written (null when unquoted, else 'double',
- * 'single' or 'backtick') and `shell` whether the file is shell-like. A
- * variable reference is exempt only unquoted (NS-09); a placeholder only when
- * it is the whole value and would be expanded there (NS-10).
+ * 'single' or 'backtick'), `shell` whether the file is shell-like, and `open`
+ * how many ${ groups a value terminator cut short in a bare value (they are
+ * read as closed there). A value with placeholders is a literal only through
+ * its literal text (R4-1, R4-5); one without is tested whole, and is a
+ * variable reference only unquoted (NS-09).
  */
-function isLiteralSecret(value, name, { quote, shell }) {
+function isLiteralSecret(value, name, { quote, shell, open = 0 }) {
   if (value.length < 8) return false;
-  if (expands(quote, shell) && PLACEHOLDER_VALUE.test(value)) return false;
-  if (quote === null && (BARE_SUBSTITUTION.test(value) || VARIABLE_PATH.test(value))) return false;
+  const parts = splitValue(open > 0 && open <= MAX_NESTING ? value + '}'.repeat(open) : value, contextOf(quote, shell));
+  if (parts.placeholders > 0) return parts.literal;
   if (PLACEHOLDER_WORDS.test(value)) return false;
   if (quote === null && (namesVariable(value) || REFERENCE_EXPRESSION.test(value))) return false;
   if (/^(?:true|false|null|none|undefined)$/i.test(value)) return false;
@@ -513,7 +769,9 @@ function isLiteralSecret(value, name, { quote, shell }) {
 
 function isLiteralUrlPassword(user, password) {
   if (password.length < 4 || /^\d{1,5}$/.test(password)) return false; // too short, or host:port
-  if (PLACEHOLDER_VALUE.test(password) || REFERENCE_EXPRESSION.test(password)) return false; // wholly a placeholder (NS-10)
+  const parts = splitValue(password, contextOf(null, false));
+  if (parts.placeholders > 0) return parts.literal; // literal text beside a placeholder (NS-10)
+  if (REFERENCE_EXPRESSION.test(password)) return false;
   if (PLACEHOLDER_WORDS.test(password) || URL_PASSWORD_PLACEHOLDER.test(password)) return false;
   return password.toLowerCase() !== user.toLowerCase();
 }
@@ -526,6 +784,73 @@ function isShellLike(path) {
   return isEnvFile(path) || SHELL_EXTENSIONS.has(extname(basename(path)).toLowerCase());
 }
 
+// Characters that end a bare value (the VALUE bare class), as char codes.
+const BARE_STOP = new Set([...' \t\n\v\f\r"\'`,;#&|)]}'].map((ch) => ch.charCodeAt(0)));
+
+function isBareStop(text, i) {
+  const c = text.charCodeAt(i);
+  return BARE_STOP.has(c) || (c > 127 && /\s/.test(text[i]));
+}
+
+/**
+ * The extent of a bare value starting at `start` whose terminator-free run
+ * ends at `runEnd`, in one linear pass: ${...} groups are taken in whole
+ * (balanced braces, paired quotes) unless a value terminator ends them first
+ * (R4-4), and $(...) commands up to a ")" on the same line. Returns
+ * { end, open, resume, literal }: `open` counts groups cut short, `literal`
+ * marks a random-looking argument of an unterminated command, `resume` is where
+ * the search for the next assignment continues (never past the start of a
+ * command, whose flags may be assignments).
+ */
+function bareValue(text, start, runEnd, cache) {
+  let dollar = false;
+  for (let k = start; k < runEnd && !dollar; k += 1) dollar = text.charCodeAt(k) === 36;
+  if (!dollar) return { end: runEnd, open: 0, resume: runEnd, literal: false };
+  let depth = 0;
+  let command = -1;
+  let i = start;
+  while (i < text.length) {
+    const c = text.charCodeAt(i);
+    if (c === 36 && text.charCodeAt(i + 1) === 123) {
+      depth += 1;
+      i += 2;
+      continue;
+    }
+    if (c === 36 && text.charCodeAt(i + 1) === 40 && depth === 0) {
+      if (command === -1) command = i;
+      const close = indexFrom(text, ')', i + 2, cache);
+      const eol = lineEnd(text, i, cache);
+      if (close !== -1 && close < eol && close - i <= MAX_ENCLOSED) {
+        i = close + 1;
+        continue;
+      }
+      // Unterminated on this line: the value is the token, and the arguments
+      // up to the line end (at most MAX_ENCLOSED characters) are tested apart.
+      let j = i + 2;
+      while (j < text.length && !isBareStop(text, j)) j += 1;
+      const literal = randomTokenWithin(text, i + 2, Math.min(eol, i + 2 + MAX_ENCLOSED), cache);
+      return { end: j, open: 0, resume: Math.max(runEnd, command), literal };
+    }
+    if (depth > 0) {
+      if (c === 123 || c === 125) {
+        depth += c === 123 ? 1 : -1;
+        i += 1;
+        continue;
+      }
+      if (c === 34 || c === 39) {
+        const close = indexFrom(text, text[i], i + 1, cache);
+        if (close !== -1 && close < lineEnd(text, i, cache) && close - i <= MAX_ENCLOSED) {
+          i = close + 1;
+          continue;
+        }
+      }
+    }
+    if (isBareStop(text, i)) break;
+    i += 1;
+  }
+  return { end: i, open: depth, resume: command === -1 ? i : Math.max(runEnd, command), literal: false };
+}
+
 /** Indexes of secret assignments with literal values. */
 function assignmentIndexes(text, { bare, shell }) {
   const indexes = [];
@@ -533,18 +858,34 @@ function assignmentIndexes(text, { bare, shell }) {
     indexes.push(index);
     return indexes.length >= MAX_MATCHES_PER_RULE;
   };
-  for (const match of text.matchAll(ASSIGNMENT)) {
-    const [, flag, , name, operator] = match;
+  const cache = new Map();
+  const assignment = new RegExp(ASSIGNMENT.source, 'g');
+  for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
+    const [whole, flag, , name, operator] = match;
     if (!isSecretName(name)) continue;
     // `cond ? password : "fallback"`: the literal belongs to the ternary, not to the name.
     if (operator === ':' && /\?[ \t]*$/.test(text.slice(Math.max(0, match.index - 64), match.index))) continue;
+    const end = match.index + whole.length;
     const backtick = match[7];
-    if (backtick !== undefined && shell) continue; // shell command substitution
-    const quoted = match[5] ?? match[6] ?? backtick;
+    if (backtick !== undefined && shell) {
+      // Shell command substitution: no value, but its flags may be assignments.
+      assignment.lastIndex = end - backtick.length - 1;
+      continue;
+    }
     const quote = match[5] !== undefined ? 'double' : match[6] !== undefined ? 'single' : backtick !== undefined ? 'backtick' : null;
-    const bareCounts = bare || (flag !== undefined && operator === '=');
-    const value = quoted ?? (bareCounts ? match[8] : undefined);
-    if (value === undefined || !isLiteralSecret(value, name, { quote, shell })) continue;
+    let value = match[5] ?? match[6] ?? backtick;
+    let open = 0;
+    let literal = false;
+    if (value === undefined) {
+      if (!bare && !(flag !== undefined && operator === '=')) continue;
+      const start = end - match[8].length;
+      const extent = bareValue(text, start, end, cache);
+      value = text.slice(start, extent.end);
+      open = extent.open;
+      literal = extent.literal;
+      assignment.lastIndex = Math.max(assignment.lastIndex, extent.resume);
+    }
+    if (!literal && !isLiteralSecret(value, name, { quote, shell, open })) continue;
     if (add(match.index)) return indexes;
   }
   for (const match of text.matchAll(GO_TYPED)) {
@@ -562,10 +903,23 @@ function assignmentIndexes(text, { bare, shell }) {
 
 // --- per-file text views ---------------------------------------------------------
 
-function lineAt(text, index) {
-  let line = 1;
-  for (let i = text.indexOf('\n'); i !== -1 && i < index; i = text.indexOf('\n', i + 1)) line += 1;
-  return line;
+/** Maps a character index of `text` to its 1-based line number (line starts found once, then binary search). */
+function lineIndex(text) {
+  let starts = null;
+  return (index) => {
+    if (starts === null) {
+      starts = [0];
+      for (let i = text.indexOf('\n'); i !== -1; i = text.indexOf('\n', i + 1)) starts.push(i + 1);
+    }
+    let low = 0;
+    let high = starts.length - 1;
+    while (low < high) {
+      const mid = (low + high + 1) >> 1;
+      if (starts[mid] <= index) low = mid;
+      else high = mid - 1;
+    }
+    return low + 1;
+  };
 }
 
 function isText(buffer) {
@@ -600,18 +954,29 @@ function utf16Text(buffer) {
 /**
  * Findings in one decoded view of a file. `full` views (text, or UTF-16 text)
  * get every rule; other views (binary content and its UTF-16 decodings) get the
- * PEM and PKCS#12 rules and quoted secret assignments.
+ * PEM and PKCS#12 rules and quoted secret assignments. A rule whose matcher
+ * runs out of stack on this content reports the file as scan-limit: never a
+ * crash, never a silent pass (R4-3).
  */
 function viewFindings(path, text, { full }) {
   const found = [];
-  const push = (rule, indexes) => {
-    for (const index of indexes) found.push({ rule, line: lineAt(text, index) });
+  const lineOf = lineIndex(text);
+  const push = (rule, find) => {
+    let indexes;
+    try {
+      indexes = find();
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      found.push({ rule: 'scan-limit' });
+      return;
+    }
+    for (const index of indexes) found.push({ rule, line: lineOf(index) });
   };
-  push('private-key-pem', privateKeyIndexes(text));
-  push('private-key-pem', base64PrivateKeyIndexes(text));
-  push('pkcs12-content', base64PfxIndexes(text));
+  push('private-key-pem', () => privateKeyIndexes(text));
+  push('private-key-pem', () => base64PrivateKeyIndexes(text));
+  push('pkcs12-content', () => base64PfxIndexes(text));
   if (full && underFixtures(path) && SVG_ELEMENT.test(text)) found.push({ rule: 'fixture-image' });
-  push('secret-assignment', assignmentIndexes(text, { bare: full && allowsBareValues(path), shell: isShellLike(path) }));
+  push('secret-assignment', () => assignmentIndexes(text, { bare: full && allowsBareValues(path), shell: isShellLike(path) }));
   return found;
 }
 

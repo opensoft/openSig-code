@@ -164,6 +164,18 @@ function randomValue() {
   return randomBytes(18).toString('base64url');
 }
 
+/** `length` random letters and digits. */
+function randomAlnum(length) {
+  let text = '';
+  while (text.length < length) text += randomBytes(length * 2).toString('base64').replace(/[^A-Za-z0-9]/g, '');
+  return text.slice(0, length);
+}
+
+/** A random 16-character identifier mixing upper case, lower case and digits (a literal, not a variable name). */
+function randomIdent() {
+  return `Q${randomAlnum(7)}4k${randomAlnum(6)}`;
+}
+
 /** A random base32 (RFC 4648) string, the shape of a TOTP shared secret. */
 function randomBase32(length) {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
@@ -691,7 +703,7 @@ test('[NS-10] a literal that merely contains ${ is reported; only a whole placeh
     'conf/url.yaml': line('url: postgres://svc:', parts[5], dollarBrace, 'X}', parts[6], '@db.example.test/app'),
   };
   const negatives = {
-    'conf/whole.json': `${JSON.stringify({ password: `${dollarBrace}OPENSIG_DB_PASSWORD}` })}\n`,
+    'conf/whole.json': `${JSON.stringify({ password: dollarBrace + 'OPENSIG_DB_PASSWORD}' })}\n`,
     'scripts/whole.sh': [
       line('DB_PASSWORD', '="', dollarBrace, 'OPENSIG_DB_PASSWORD}', '"'),
       line('API_KEY', '=', dollarBrace, 'OPENSIG_API_KEY}'),
@@ -708,6 +720,132 @@ test('[NS-10] a literal that merely contains ${ is reported; only a whole placeh
   for (const file of Object.keys(positives)) expectFinding(result, 'secret-assignment', file, 'index');
   for (const file of Object.keys(negatives)) expectNoFinding(result, file);
   expectNoContent(result, parts.slice(0, 7));
+});
+
+// Samples below are joined from pieces at run time, with each secret name and
+// its operator in separate pieces, so this file's own scan sees no sample.
+const DOLLAR_BRACE = '$' + '{';
+const BACKTICK = String.fromCharCode(0x60);
+const joinLine = (...pieces) => `${pieces.join('')}\n`;
+
+function expectOutcome(cases) {
+  const repo = newRepo();
+  for (const [file, content] of Object.entries({ ...cases.positives, ...cases.negatives })) put(repo, file, content);
+  track(repo, '.');
+  const result = scan(repo);
+  assert.equal(result.code, 1, `${result.stdout}${result.stderr}`);
+  for (const file of Object.keys(cases.positives)) expectFinding(result, 'secret-assignment', file, 'index');
+  for (const file of Object.keys(cases.negatives)) expectNoFinding(result, file);
+  expectNoContent(result, cases.literals);
+  return result;
+}
+
+test('[NS-11] a placeholder needs a variable name; literal defaults, alternates and command arguments are reported (R4-1)', () => {
+  const D = DOLLAR_BRACE;
+  const lit = Array.from({ length: 12 }, () => randomIdent());
+  expectOutcome({
+    literals: lit,
+    positives: {
+      'scripts/default.sh': joinLine('DB_PASSWORD', '=', D, 'DB_PASSWORD:-', lit[0], '}'),
+      'deploy/compose.yaml': 'services:\n  db:\n    environment:\n' + joinLine('      POSTGRES_PASSWORD', ': ', D, 'POSTGRES_PASSWORD:-', lit[1], '}'),
+      'scripts/alternate.sh': joinLine('API_KEY', '="', D, 'A:+', lit[2], '}"'),
+      'conf/assign-default.json': `${JSON.stringify({ password: D + 'DB_PASSWORD' + ':=' + lit[3] + '}' })}\n`,
+      'scripts/echo.sh': joinLine('API_KEY', '=$(echo ', lit[4], ')'),
+      'scripts/printf.sh': joinLine('API_TOKEN', '="$(printf %s ', lit[5], ')"'),
+      'scripts/command-tail.sh': joinLine('CLIENT_SECRET', '=$(cmd_abc)', lit[6]),
+      'scripts/variable-path.sh': joinLine('API_KEY', '=$EMPTY/', lit[7]),
+      'conf/angle.json': `${JSON.stringify({ password: '<' + lit[8] + '>' })}\n`,
+      'conf/mustache.json': `${JSON.stringify({ apiKey: '{{' + lit[9] + '}}' })}\n`,
+      'conf/dollar.json': `${JSON.stringify({ password: '$' + lit[10] })}\n`,
+      'conf/brace.json': `${JSON.stringify({ secret: D + lit[11] + '+/=}' })}\n`,
+    },
+    negatives: {
+      'scripts/required.sh': joinLine('DB_PASSWORD', '="', D, 'DB_PASSWORD:?required}"'),
+      'scripts/generated.sh': joinLine('X_SECRET', '=$(openssl rand -hex 32)') + joinLine('Y_SECRET', '="$(cat /run/secrets/db_password)"'),
+      'scripts/empty-default.sh': joinLine('API_KEY', '=', D, 'OPENSIG_API_KEY:-}') + joinLine('DB_PASSWORD', '=', D, 'DB_PASSWORD:-secret}'),
+      'conf/dotted.json': `${JSON.stringify({ password: D + 'secrets.DB_PASSWORD}' })}\n`,
+    },
+  });
+});
+
+test('[NS-12] template literals holding ${...} or $ are scanned for their literal text (R4-2)', () => {
+  const D = DOLLAR_BRACE;
+  const B = BACKTICK;
+  const lit = Array.from({ length: 4 }, () => randomIdent());
+  expectOutcome({
+    literals: lit,
+    positives: {
+      'src/suffix.ts': joinLine('export const apiKey', ' = ', B, lit[0], D, 'suffix}', B, ';'),
+      'src/prefix.js': joinLine('const password', ' = ', B, D, 'prefix}', lit[1], B, ';'),
+      'src/dollar.ts': joinLine('const clientSecret', ' = ', B, lit[2].slice(0, 8), '$', lit[2].slice(8), B, ';'),
+      'src/raw.go': joinLine('\tapiToken', ' := ', B, lit[3], '$', B),
+    },
+    negatives: {
+      'src/env.ts': joinLine('const password', ' = ', B, D, 'process.env.DB_PASSWORD}', B, ';'),
+      'src/joined.ts': joinLine('const apiKey', ' = ', B, D, 'prefix}', D, 'suffix}', B, ';'),
+      'scripts/generated.sh': joinLine('Y_SECRET', '=', B, 'openssl rand -hex 32', B) + joinLine('Z_SECRET', '=', B, 'printf %s ', D, 'SEED}', B),
+    },
+  });
+});
+
+test('[NS-13] values of 10 MB are scanned without exhausting the regular-expression stack (R4-3)', () => {
+  const repo = newRepo();
+  const size = 10 * 1024 * 1024;
+  const lit = randomIdent();
+  const files = {
+    'deploy/secret.yaml': `kind: Secret\ndata:\n  blob: ${'QUJD'.repeat(size / 4)}\n` + joinLine('  api_key', ': ', lit),
+    'conf/large.json': `${JSON.stringify({ password: 'q'.repeat(size) })}\n`,
+    'scripts/large.sh': joinLine('DB_PASSWORD', '=', 'q'.repeat(size)),
+  };
+  for (const [file, content] of Object.entries(files)) put(repo, file, content);
+  track(repo, '.');
+  const result = scan(repo);
+  assert.doesNotMatch(result.stderr, /RangeError|Maximum call stack/, 'the scan must not overflow');
+  assert.equal(result.code, 1, `${result.stdout}${result.stderr}`);
+  for (const file of Object.keys(files)) expectFinding(result, 'secret-assignment', file, 'index');
+  assert.ok(findingsOf(result).some((f) => f.file === 'deploy/secret.yaml' && f.line === 4), result.stdout);
+  expectNoContent(result, [lit]);
+});
+
+test('[NS-14] a ${...} group ends at a value terminator and never swallows the next assignment (R4-4)', () => {
+  const D = DOLLAR_BRACE;
+  const lit = Array.from({ length: 6 }, () => randomIdent());
+  expectOutcome({
+    literals: lit,
+    positives: {
+      'scripts/semicolon.sh': joinLine('X_PASSWORD', '=', D, 'A;API_KEY', '=', lit[0], '}'),
+      'scripts/and.sh': joinLine('X_PASSWORD', '=', D, 'A&&CLIENT_SECRET', '=', lit[1], '}'),
+      'scripts/pipe.sh': joinLine('X_PASSWORD', '=', D, 'A|ACCESS_TOKEN', '=', lit[2], '}'),
+      'scripts/hash.sh': joinLine('X_PASSWORD', '=', D, 'A#API_TOKEN', '=', lit[3], '}'),
+      'scripts/paren.sh': joinLine('X_PASSWORD', '=', D, 'A)AUTH_TOKEN', '=', lit[4], '}'),
+      'conf/comma.ini': joinLine('db_password', '=', D, 'A,api_secret', '=', lit[5], '}'),
+    },
+    negatives: {
+      'scripts/trim.sh': joinLine('DB_PASSWORD', '=', D, 'DB_PASSWORD#prefix_}'),
+      'deploy/whole.yaml': joinLine('smtp_password', ': ', D, 'SMTP_PASSWORD}'),
+    },
+  });
+});
+
+test('[NS-15] values made only of placeholders and path punctuation are not reported; a literal tail or default still is (R4-5)', () => {
+  const D = DOLLAR_BRACE;
+  const lit = Array.from({ length: 2 }, () => randomIdent());
+  expectOutcome({
+    literals: lit,
+    positives: {
+      'scripts/tail.sh': joinLine('SSH_PRIVATE_KEY', '="$HOME/', lit[0], '"'),
+      'deploy/tail.yaml': joinLine('password', ': ', D, 'DB_PASSWORD:-', D, 'FALLBACK}', lit[1], '}'),
+    },
+    negatives: {
+      '.github/workflows/ci.yml': 'jobs:\n  publish:\n    env:\n' + joinLine('      NPM_TOKEN', ': "', D, '{ secrets.NPM_TOKEN }}"') + joinLine('      GH_TOKEN', ': ', D, '{secrets.GH_TOKEN}}'),
+      'scripts/two.sh': joinLine('DB_PASSWORD', '="', D, 'DB_PASS_PREFIX}', D, 'DB_PASS_SUFFIX}"'),
+      'scripts/keys.sh': joinLine('SSH_PRIVATE_KEY', '="$HOME/.ssh/id_ed25519"') + joinLine('DEPLOY_PRIVATE_KEY', '=', D, 'HOME}/.ssh/id_ed25519'),
+      'deploy/nested.yaml': joinLine('password', ': ', D, 'DB_PASSWORD:-', D, 'FALLBACK_DB_PASSWORD}}'),
+      'infra/main.tf': joinLine('  password', ' = "', D, 'var.prefix}-', D, 'random_password.db.result}"'),
+      'scripts/angle.sh': joinLine('export OPENSIG_API_KEY', "='<api-key>'"),
+      Makefile: joinLine('API_KEY', " := '$(OPENSIG_API_KEY)'"),
+    },
+  });
 });
 
 test('staged and working-tree content of tracked files is scanned; untracked files are not', () => {
