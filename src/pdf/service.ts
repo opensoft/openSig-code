@@ -41,6 +41,17 @@
 //   guarantees, a byte count equal to the input length, a bounded trailer and objects map
 //   whose references are consistent, and reported objects that pass the active-content
 //   policy (policy.ts). Anything else is a fail-closed 500 service-failure.
+// - Report budget (A-010 LBR3-1): the report is bounded in bytes and in JSON values by
+//   reportBudget() (limits.ts), derived from the parser limits. The child refuses a document
+//   whose report would exceed it (422 limit-exceeded); the parent stops reading a longer
+//   report and stops converting one with more values, and fails closed (500 service-failure).
+//   At the 10 MiB input ceiling that keeps one maximal report under 128 MiB of parent memory.
+// - Concurrency (A-010 LBR3-1): at most MAX_CONCURRENT_PARSES children run, and have their
+//   reports decoded, at once. Up to MAX_WAITING_PARSES more parses wait for a slot in FIFO
+//   order without reading their input (a streamed body is read only once its parse has a
+//   slot, so a waiting upload is held back at the socket). A parse beyond that is refused at
+//   once, before its input is read: 429 rate_limited, reason parse-capacity. The slot is held
+//   while a streamed body is read; the caller's request timeout bounds a slow sender.
 // - The PL-12 import boundary (src/pdf/ imports no net, http, https, dns, tls, dgram or
 //   http2 module) stays as defence in depth; it is not the isolation.
 //
@@ -55,7 +66,15 @@ import { fileURLToPath } from 'node:url';
 
 import { REJECT_REASONS, type RejectReason } from './errors.ts';
 import { isDict, isRef, type PdfDict, type PdfValue } from './lexer.ts';
-import { DEFAULT_PARSER_LIMITS, MAX_DOCUMENT_PAGES, resolveParserLimits, resolveServiceLimits, type ParserLimits, type ServiceLimits } from './limits.ts';
+import {
+  DEFAULT_PARSER_LIMITS,
+  MAX_DOCUMENT_PAGES,
+  reportBudget,
+  resolveParserLimits,
+  resolveServiceLimits,
+  type ParserLimits,
+  type ServiceLimits,
+} from './limits.ts';
 import type { PageReport, ParseReport } from './parser.ts';
 import { classifyValue, createFindings } from './policy.ts';
 import {
@@ -110,9 +129,9 @@ export type ParseOutcome =
   | { ok: true; status: 200; report: ServiceReport; network_sandbox: NetworkSandboxLabel }
   | {
       ok: false;
-      status: 413 | 422 | 500;
-      code: 'payload_too_large' | 'unsupported_pdf' | 'internal';
-      reason: RejectReason | 'service-failure' | 'sandbox-unavailable';
+      status: 413 | 422 | 429 | 500;
+      code: 'payload_too_large' | 'unsupported_pdf' | 'rate_limited' | 'internal';
+      reason: RejectReason | 'service-failure' | 'sandbox-unavailable' | 'parse-capacity';
       detail: string;
       detections: string[];
       network_sandbox: NetworkSandboxLabel;
@@ -139,6 +158,37 @@ function reject(reason: RejectReason, detail: string, label: NetworkSandboxLabel
 
 function failure(detail: string, label: NetworkSandboxLabel): ParseOutcome {
   return { ok: false, status: 500, code: 'internal', reason: 'service-failure', detail, detections: [], network_sandbox: label };
+}
+
+// --- concurrency ---------------------------------------------------------------------------
+
+/** Parse children that run, and have their reports decoded, at once (A-010 LBR3-1). */
+export const MAX_CONCURRENT_PARSES = 2;
+/** Parses that may wait for a slot; one more is refused with 429 rate_limited. */
+export const MAX_WAITING_PARSES = 32;
+
+const gate = { running: 0, waiting: [] as Array<() => void> };
+
+/** Take a slot, or join the FIFO queue for one; null when the queue is full. */
+function acquireSlot(): Promise<void> | null {
+  if (gate.running < MAX_CONCURRENT_PARSES) {
+    gate.running += 1;
+    return Promise.resolve();
+  }
+  if (gate.waiting.length >= MAX_WAITING_PARSES) return null;
+  return new Promise<void>((resolveSlot) => gate.waiting.push(resolveSlot));
+}
+
+/** Pass the slot to the oldest waiting parse, or free it. */
+function releaseSlot(): void {
+  const next = gate.waiting.shift();
+  if (next !== undefined) next();
+  else gate.running -= 1;
+}
+
+/** Current use of the parse slots (read-only; for monitoring and the tests). */
+export function parseCapacity(): { running: number; waiting: number; max_concurrent: number; max_waiting: number } {
+  return { running: gate.running, waiting: gate.waiting.length, max_concurrent: MAX_CONCURRENT_PARSES, max_waiting: MAX_WAITING_PARSES };
 }
 
 // --- plan --------------------------------------------------------------------------------
@@ -299,17 +349,20 @@ function validIsolation(value: unknown): value is Isolation {
  * Convert a reported JSON value (parser.ts toJson form) back to a PDF value, or undefined if
  * it is not one. The bounds are the parser's own, so an honest report always converts
  * (LBR2-1): nesting up to the parser's maxDepth; names, strings and arrays of any length
- * (the report as a whole is capped by maxReportBytes); references with any object number
- * of at least 1, because a reference to an object outside the file is legal and means null.
+ * (the report as a whole is capped at reportBudget().bytes); references with any object
+ * number of at least 1, because a reference to an object outside the file is legal and means
+ * null. Each value takes one node from `budget`, exactly as the child counts them (parser.ts
+ * toJson); past the budget the conversion stops (LBR3-1).
  */
-function fromJson(value: unknown, maxDepth: number, depth = 0): PdfValue | undefined {
-  if (depth > maxDepth) return undefined;
+function fromJson(value: unknown, maxDepth: number, budget: { nodes: number }, depth = 0): PdfValue | undefined {
+  budget.nodes -= 1;
+  if (budget.nodes < 0 || depth > maxDepth) return undefined;
   if (value === null || typeof value === 'boolean') return value;
   if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
   if (Array.isArray(value)) {
     const items: PdfValue[] = [];
     for (const item of value) {
-      const converted = fromJson(item, maxDepth, depth + 1);
+      const converted = fromJson(item, maxDepth, budget, depth + 1);
       if (converted === undefined) return undefined;
       items.push(converted);
     }
@@ -332,7 +385,7 @@ function fromJson(value: unknown, maxDepth: number, depth = 0): PdfValue | undef
   if (isObject(value.dict)) {
     const map = new Map<string, PdfValue>();
     for (const [key, inner] of Object.entries(value.dict)) {
-      const converted = fromJson(inner, maxDepth, depth + 1);
+      const converted = fromJson(inner, maxDepth, budget, depth + 1);
       if (converted === undefined) return undefined;
       map.set(key, converted);
     }
@@ -355,17 +408,18 @@ function validTrailer(value: unknown, size: number): value is ParseReport['trail
 }
 
 /** Shape, bounds, references and policy of the reported objects map (LBR-4); returns the catalog. */
-function validObjects(report: Record<string, unknown>, pages: PageReport[], size: number, maxDepth: number): PdfDict | null {
+function validObjects(report: Record<string, unknown>, pages: PageReport[], size: number, maxDepth: number, maxNodes: number): PdfDict | null {
   const objects = report.objects;
   if (!isObject(objects)) return null;
   const entries = Object.entries(objects);
   if (entries.length > 3 + 2 * pages.length) return null;
   const converted = new Map<number, { gen: number; value: PdfValue }>();
+  const budget = { nodes: maxNodes };
   for (const [key, entry] of entries) {
     // Any object number the cross-reference covers (every entry is below /Size).
     if (!/^[1-9]\d*$/.test(key) || !Number.isSafeInteger(Number(key)) || Number(key) >= size) return null;
     if (!isObject(entry) || !hasExactly(entry, ['gen', 'value']) || !isCount(entry.gen) || entry.gen > 65535) return null;
-    const value = fromJson(entry.value, maxDepth);
+    const value = fromJson(entry.value, maxDepth, budget);
     if (value === undefined) return null;
     converted.set(Number(key), { gen: entry.gen, value });
   }
@@ -397,7 +451,7 @@ function validObjects(report: Record<string, unknown>, pages: PageReport[], size
 }
 
 const KNOWN_FEATURES = new Set(['acroform', 'incremental-updates', 'hybrid-xref', 'object-streams', 'xref-stream', 'jbig2', 'jpx', 'unsigned-signature-field']);
-const STATS_KEYS = ['objects', 'xref_entries', 'object_streams', 'max_depth', 'inflated_bytes'];
+const STATS_KEYS = ['objects', 'object_streams', 'max_depth', 'inflated_bytes'];
 
 /** Known feature names only, and those the report itself determines must agree with it. */
 function validFeatures(features: string[], xref: Record<string, unknown>, stats: Record<string, unknown>, catalog: PdfDict): boolean {
@@ -413,9 +467,16 @@ function validFeatures(features: string[], xref: Record<string, unknown>, stats:
 
 /**
  * Validate the child's result against the input it was given. Returns null for anything
- * that is not exactly a well-formed rejection or a consistent report.
+ * that is not exactly a well-formed rejection or a consistent report. `maxDepth` and
+ * `maxNodes` are the parser's nesting limit and the report node budget (reportBudget).
  */
-export function validateChildResult(value: unknown, inputBytes: number, maxPages: number, maxDepth: number = DEFAULT_PARSER_LIMITS.maxDepth): ChildResult | null {
+export function validateChildResult(
+  value: unknown,
+  inputBytes: number,
+  maxPages: number,
+  maxDepth: number = DEFAULT_PARSER_LIMITS.maxDepth,
+  maxNodes: number = reportBudget(DEFAULT_PARSER_LIMITS).nodes,
+): ChildResult | null {
   if (!isObject(value)) return null;
   if (value.ok === false) {
     const { reason, detail, detections } = value;
@@ -442,7 +503,7 @@ export function validateChildResult(value: unknown, inputBytes: number, maxPages
   if (!isObject(report.stats) || !hasExactly(report.stats, STATS_KEYS) || !Object.values(report.stats).every((n) => isCount(n))) return null;
   if (!isStringList(report.features, 64, 64)) return null;
   if (!validIsolation(report.isolation)) return null;
-  const catalog = validObjects(report, pages as PageReport[], size, maxDepth);
+  const catalog = validObjects(report, pages as PageReport[], size, maxDepth, maxNodes);
   if (catalog === null || !validFeatures(report.features, xref, report.stats, catalog)) return null;
   return { ok: true, report: report as unknown as ParseReport & { isolation: Isolation } };
 }
@@ -471,13 +532,41 @@ async function runParse(input: Uint8Array | AsyncIterable<Uint8Array | string>, 
       network_sandbox: label,
     };
   }
-  const collected = await collect(input, parser.maxBytes);
-  if (!(collected instanceof Buffer)) return reject('size-limit', `more than ${parser.maxBytes} bytes`, label);
-  const bytes = collected;
-  const digest = createHash('sha256').update(bytes).digest('hex');
-  const { file, args } = command;
+  if (input instanceof Uint8Array && input.length > parser.maxBytes) return reject('size-limit', `more than ${parser.maxBytes} bytes`, label);
+  const slot = acquireSlot();
+  if (slot === null) {
+    return {
+      ok: false,
+      status: 429,
+      code: 'rate_limited',
+      reason: 'parse-capacity',
+      detail: `${MAX_CONCURRENT_PARSES} parses are running and ${MAX_WAITING_PARSES} are waiting`,
+      detections: [],
+      network_sandbox: label,
+    };
+  }
+  await slot;
+  try {
+    const collected = await collect(input, parser.maxBytes);
+    if (!(collected instanceof Buffer)) return reject('size-limit', `more than ${parser.maxBytes} bytes`, label);
+    return await runChild(collected, command, parser, service, label);
+  } finally {
+    releaseSlot();
+  }
+}
 
-  return await new Promise<ParseOutcome>((resolveOutcome) => {
+/** Run one parse child on `bytes` and validate its report; holds a parse slot throughout. */
+function runChild(
+  bytes: Buffer,
+  { file, args }: { file: string; args: string[] },
+  parser: ParserLimits,
+  service: ServiceLimits,
+  label: NetworkSandboxLabel,
+): Promise<ParseOutcome> {
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  const budget = reportBudget(parser);
+
+  return new Promise<ParseOutcome>((resolveOutcome) => {
     const child = spawn(file, args, { cwd: dirname(WORKER_ENTRY), env: {}, stdio: ['pipe', 'pipe', 'pipe'] });
     let killedFor: 'cpu' | 'memory' | 'wall-time' | 'report-size' | null = null;
     const stdout: Buffer[] = [];
@@ -520,9 +609,14 @@ async function runParse(input: Uint8Array | AsyncIterable<Uint8Array | string>, 
     };
 
     child.stdout.on('data', (chunk: Buffer) => {
+      if (killedFor === 'report-size') return;
       stdoutBytes += chunk.length;
-      if (stdoutBytes > service.maxReportBytes) kill('report-size');
-      else stdout.push(chunk);
+      if (stdoutBytes > budget.bytes) {
+        stdout.length = 0;
+        kill('report-size');
+      } else {
+        stdout.push(chunk);
+      }
     });
     child.stderr.setEncoding('latin1');
     child.stderr.on('data', (chunk: string) => {
@@ -533,18 +627,22 @@ async function runParse(input: Uint8Array | AsyncIterable<Uint8Array | string>, 
     });
     child.on('error', () => finish(failure('the parse child could not be started', label)));
     child.on('close', (code, signal) => {
-      if (killedFor === 'report-size') return finish(reject('limit-exceeded', 'report-size', label));
+      // The child refuses a document whose report would exceed the budget, so a longer report
+      // comes only from a broken or lying child (LBR3-1).
+      if (killedFor === 'report-size') return finish(failure('the parse child sent more than the report budget', label));
       if (killedFor !== null) return finish(reject('resource-limit', killedFor, label));
       if (/heap out of memory|Reached heap limit|Allocation failed/i.test(stderr)) return finish(reject('resource-limit', 'memory', label));
       if (signal === 'SIGKILL' || signal === 'SIGXCPU' || (code !== null && KILLED_EXIT_CODES.has(code))) return finish(reject('resource-limit', 'cpu', label));
       if (code !== 0) return finish(failure(`the parse child exited with ${signal ?? `status ${code}`}`, label));
       let parsed: unknown;
       try {
-        parsed = JSON.parse(Buffer.concat(stdout).toString('utf8'));
+        const text = Buffer.concat(stdout, stdoutBytes).toString('utf8');
+        stdout.length = 0;
+        parsed = JSON.parse(text);
       } catch {
         return finish(failure('the parse child returned no valid result', label));
       }
-      const result = validateChildResult(parsed, bytes.length, parser.maxPages, parser.maxDepth);
+      const result = validateChildResult(parsed, bytes.length, parser.maxPages, parser.maxDepth, budget.nodes);
       if (result === null) return finish(failure('the parse child returned an invalid report', label));
       if (!result.ok) return finish(reject(result.reason, result.detail, label, result.detections));
       return finish({ ok: true, status: 200, report: { ...result.report, digest, network_sandbox: label }, network_sandbox: label });

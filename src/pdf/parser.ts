@@ -42,7 +42,7 @@ import {
   type PdfRef,
   type PdfValue,
 } from './lexer.ts';
-import type { ParserLimits } from './limits.ts';
+import { reportBudget, type ParserLimits } from './limits.ts';
 import { classifyValue, createFindings } from './policy.ts';
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -61,6 +61,17 @@ export interface PageReport {
   ref: [number, number];
 }
 
+/**
+ * The child's report (A-010 LBR3-1: only what a named reader uses). Upload validation (T034)
+ * reads the page count and geometry; the composer (T036) reads the page references and boxes,
+ * `xref` (where and how to append the incremental update), `trailer` and `objects` (the
+ * dictionaries and arrays it rewrites); the parent (service.ts) checks `schema`, `bytes` and
+ * the child's isolation claims; `features` carries the detections reported rather than
+ * rejected (JBIG2, JPX, unsigned signature fields) and `stats` the evidence that the parser
+ * limits held, both fixed in size. Only `objects` and the trailer /ID vary with the document:
+ * both count against the report's byte budget, and `objects` against its node budget too
+ * (limits.ts reportBudget).
+ */
 export interface ParseReport {
   schema: 'opensig.pdf.parse-report.v1';
   header_version: string;
@@ -68,10 +79,10 @@ export interface ParseReport {
   pages: PageReport[];
   xref: { kind: 'table' | 'stream'; sections: number; startxref: number; size: number; hybrid: boolean };
   trailer: { root: [number, number]; info: [number, number] | null; id: [string, string] | null };
-  /** The catalog, page, AcroForm, AcroForm /Fields and page /Annots objects, as JSON values. */
+  /** Only the objects the composer rewrites: the catalog, the pages, and the AcroForm, its /Fields and page /Annots when indirect. */
   objects: Record<string, { gen: number; value: JsonValue }>;
   features: string[];
-  stats: { objects: number; xref_entries: number; object_streams: number; max_depth: number; inflated_bytes: number };
+  stats: { objects: number; object_streams: number; max_depth: number; inflated_bytes: number };
 }
 
 export type ParseResult =
@@ -94,15 +105,22 @@ interface ObjectStream {
   offsets: number[];
 }
 
-/** A PDF value as plain JSON: names {name}, strings {hex}, references {ref}, dictionaries {dict}. */
-export function toJson(value: PdfValue): JsonValue {
+/**
+ * A PDF value as plain JSON: names {name}, strings {hex}, references {ref}, dictionaries {dict}.
+ * Every value converted (each scalar, name, string, reference, array and dictionary) takes one
+ * node from `budget`; past it, the document is refused (limit-exceeded `report-nodes`). The
+ * parent counts the same way (service.ts fromJson).
+ */
+export function toJson(value: PdfValue, budget: { nodes: number } = { nodes: Number.POSITIVE_INFINITY }): JsonValue {
+  budget.nodes -= 1;
+  if (budget.nodes < 0) throw limitExceeded('report-nodes');
   if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
-  if (Array.isArray(value)) return value.map((item) => toJson(item));
+  if (Array.isArray(value)) return value.map((item) => toJson(item, budget));
   if (value.t === 'name') return { name: value.v };
   if (value.t === 'str') return { hex: Buffer.from(value.v).toString('hex') };
   if (value.t === 'ref') return { ref: [value.num, value.gen] };
   const dict: { [key: string]: JsonValue } = {};
-  for (const [key, inner] of value.map) Object.defineProperty(dict, key, { value: toJson(inner), enumerable: true, writable: true, configurable: true });
+  for (const [key, inner] of value.map) Object.defineProperty(dict, key, { value: toJson(inner, budget), enumerable: true, writable: true, configurable: true });
   return { dict };
 }
 
@@ -179,11 +197,12 @@ class DocumentParser {
     const pages = this.walkPages(catalog);
 
     const objects: ParseReport['objects'] = {};
+    const nodes = { nodes: reportBudget(this.limits).nodes };
     const include = (ref: PdfRef): void => {
       const obj = this.objects.get(ref.num);
-      if (obj !== undefined && obj.stream === null) {
+      if (obj !== undefined && obj.stream === null && !Object.hasOwn(objects, String(ref.num))) {
         Object.defineProperty(objects, String(ref.num), {
-          value: { gen: obj.gen, value: toJson(obj.value) },
+          value: { gen: obj.gen, value: toJson(obj.value, nodes) },
           enumerable: true,
           writable: true,
           configurable: true,
@@ -231,7 +250,6 @@ class DocumentParser {
       features: [...this.features].sort(),
       stats: {
         objects: inUse,
-        xref_entries: this.entries.size,
         object_streams: this.objectStreams.size,
         max_depth: this.deepest,
         inflated_bytes: this.budget.inflated,

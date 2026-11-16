@@ -7,7 +7,9 @@
 //        --disallow-code-generation-from-strings src/pdf/worker.ts '<parser limits JSON>'
 //
 // under an RLIMIT_CPU backstop, with an empty environment. It reads the PDF bytes from
-// stdin (bounded by maxBytes), parses them and writes exactly one JSON line to stdout.
+// stdin (bounded by maxBytes), parses them and writes exactly one JSON line to stdout. A
+// report line longer than the report budget (limits.ts reportBudget, which the parent
+// enforces too) is replaced by a limit-exceeded `report-size` rejection.
 // It refuses to parse unless the Node permission model is active with no fs-write,
 // child-process or worker grant.
 //
@@ -22,7 +24,7 @@
 
 import { Buffer } from 'node:buffer';
 
-import { resolveParserLimits } from './limits.ts';
+import { reportBudget, resolveParserLimits } from './limits.ts';
 import { parseDocument } from './parser.ts';
 
 export const ISOLATION_EXIT = 70;
@@ -69,8 +71,13 @@ async function main(): Promise<void> {
   }
 
   const result = parseDocument(Buffer.concat(chunks, total), limits);
-  if (result.ok) reply({ ok: true, report: { ...result.report, isolation } });
-  else reply(result);
+  if (result.ok) {
+    const line = `${JSON.stringify({ ok: true, report: { ...result.report, isolation } })}\n`;
+    if (Buffer.byteLength(line) > reportBudget(limits).bytes) reply({ ok: false, reason: 'limit-exceeded', detail: 'report-size', detections: [] });
+    else process.stdout.write(line);
+  } else {
+    reply(result);
+  }
   process.exitCode = 0;
 }
 

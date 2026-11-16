@@ -34,8 +34,29 @@ export interface ServiceLimits {
   cpuMs: number;
   /** Wall-clock cap of the parse child, in ms. */
   wallMs: number;
-  /** Maximum size of the child's JSON report, in bytes. */
-  maxReportBytes: number;
+}
+
+/**
+ * Budget of the child's JSON report (A-010 LBR3-1), derived from the parser limits so that the
+ * child and the parent apply the same numbers. The child refuses a document whose report would
+ * exceed it (422 limit-exceeded, `report-size` or `report-nodes`); the parent stops reading a
+ * report longer than `bytes` and stops converting one with more than `nodes` values, and fails
+ * closed (500 service-failure) on either, because only a broken or lying child sends one.
+ * - bytes: the whole report line, newline included;
+ * - nodes: the JSON values (scalars, names, strings, references, arrays and dictionaries)
+ *   inside the reported objects; the rest of the report has a fixed shape.
+ * Both follow maxBytes, whose FR-002 ceiling (10 MiB) caps them: at most 1,376,256 bytes and
+ * 266,240 nodes. That keeps the parent's cost of one maximal report, in its costliest shape,
+ * under the 128 MiB ceiling (PL-24 measures about 95 MiB of committed heap at worst), while an
+ * honest report (a few dictionaries and arrays per page) stays far below it.
+ */
+export interface ReportBudget {
+  readonly bytes: number;
+  readonly nodes: number;
+}
+
+export function reportBudget(limits: Pick<ParserLimits, 'maxBytes'>): ReportBudget {
+  return { bytes: 64 * 1024 + Math.floor(limits.maxBytes / 8), nodes: 4096 + Math.floor(limits.maxBytes / 40) };
 }
 
 export const DEFAULT_PARSER_LIMITS: Readonly<ParserLimits> = Object.freeze({
@@ -63,7 +84,6 @@ export const DEFAULT_SERVICE_LIMITS: Readonly<ServiceLimits> = Object.freeze({
   rssBytes: 512 * 1024 * 1024,
   cpuMs: 10_000,
   wallMs: 20_000,
-  maxReportBytes: 16 * 1024 * 1024,
 });
 
 const SERVICE_CEILINGS: Readonly<ServiceLimits> = Object.freeze({
@@ -71,7 +91,6 @@ const SERVICE_CEILINGS: Readonly<ServiceLimits> = Object.freeze({
   rssBytes: 2 * 1024 * 1024 * 1024,
   cpuMs: 60_000,
   wallMs: 120_000,
-  maxReportBytes: 64 * 1024 * 1024,
 });
 
 function resolve<T extends object>(kind: string, defaults: Readonly<T>, ceilings: Readonly<T>, overrides: unknown): T {

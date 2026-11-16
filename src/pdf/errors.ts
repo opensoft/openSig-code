@@ -35,7 +35,8 @@ export type LimitName =
   | 'inflated-bytes'
   | 'xref-sections'
   | 'page-tree-depth'
-  | 'report-size';
+  | 'report-size'
+  | 'report-nodes';
 
 export class ParseFailure extends Error {
   readonly reason: RejectReason;
