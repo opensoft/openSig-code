@@ -6,7 +6,8 @@
 // in case 20). Amendment A-007: case 28 names the seven release gates,
 // case 34 covers N1 (.npmrc compared as a whole) and N3 (characters outside
 // tab, LF and printable ASCII), case 17 covers N2, and case 12 counts a zombie
-// test child as terminated (Codex [1]).
+// test child as terminated (Codex [1]) but never treats an unreadable /proc as
+// proof that a process is gone (re-check N4).
 //
 // FROZEN at the A-007 runner commit together with scripts/verify.mjs and
 // scripts/verify-modes.mjs.
@@ -213,23 +214,39 @@ function sleepMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+const readProcStat = (pid) => readFileSync(`/proc/${pid}/stat`, 'utf8');
+const sendSignalZero = (pid) => process.kill(pid, 0);
+
 /**
  * True when `pid` no longer runs: it does not exist, or it is a zombie (state Z
  * or X in /proc/<pid>/stat). A killed process whose parent never reaps it (an
  * orphan under a container PID 1 that does not reap) stays a zombie, and
- * `process.kill(pid, 0)` still succeeds for it, yet it has terminated.
+ * signal 0 still succeeds for it, yet it has terminated (Codex [1]).
+ *
+ * A-007 re-check N4: an unreadable /proc/<pid>/stat proves nothing. When it
+ * is absent (ENOENT, for example /proc not mounted, or the process exiting
+ * between the two probes), signal 0 is sent again and only ESRCH counts as
+ * gone; success or EPERM means the process may still run. Any other read
+ * error also counts as running. `readStat` and `signal` are injectable so
+ * RT-12 can prove this without unmounting /proc.
  */
-function processGone(pid) {
+function processGone(pid, { readStat = readProcStat, signal = sendSignalZero } = {}) {
   try {
-    process.kill(pid, 0);
+    signal(pid);
   } catch (error) {
     return error.code === 'ESRCH';
   }
   let stat;
   try {
-    stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    stat = readStat(pid);
   } catch (error) {
-    return error.code === 'ENOENT';
+    if (error.code !== 'ENOENT') return false;
+    try {
+      signal(pid);
+      return false;
+    } catch (again) {
+      return again.code === 'ESRCH';
+    }
   }
   const state = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0]; // the comm field may hold spaces or ')'
   return state === 'Z' || state === 'X';
@@ -394,7 +411,7 @@ test('[RT-11] syntax or import error -> FAIL (1)', async () => {
   expectStatus(missingImport, STATUS.FAIL, 'import error');
 });
 
-test('[RT-12] timeout -> FAIL (1) and the process group is killed; a zombie counts as terminated (A-007 Codex [1])', async () => {
+test('[RT-12] timeout -> FAIL (1) and the process group is killed; a zombie counts as terminated; an unavailable /proc proves nothing (A-007 Codex [1], N4)', async () => {
   executed += 1;
   const pidFile = join(scratch('pid'), 'pid');
   const source =
@@ -418,6 +435,40 @@ test('[RT-12] timeout -> FAIL (1) and the process group is killed; a zombie coun
     assert.doesNotThrow(() => process.kill(zombie, 0), 'signal 0 still reaches the zombie');
     assert.ok(processGone(zombie), `zombie ${zombie} counts as terminated`);
   });
+
+  // A-007 re-check N4: without a readable /proc a live process must not look
+  // terminated, or the group-kill check above would pass without proving
+  // anything. Simulate /proc being unavailable (ENOENT) and probe live and
+  // gone processes.
+  const enoent = (code = 'ENOENT') => {
+    const error = new Error(`simulated ${code}`);
+    error.code = code;
+    return error;
+  };
+  const noProc = { readStat: () => { throw enoent(); } };
+  assert.equal(processGone(process.pid, noProc), false, 'this live process is not gone when /proc is unavailable');
+  const live = spawn('sleep', ['30'], { stdio: 'ignore' });
+  try {
+    assert.equal(processGone(live.pid, noProc), false, `live child ${live.pid} is not gone when /proc is unavailable`);
+  } finally {
+    live.kill('SIGKILL');
+  }
+  const exited = spawnSync('true');
+  assert.equal(exited.status, 0);
+  assert.equal(processGone(exited.pid, noProc), true, 'a reaped child is gone (signal 0 gives ESRCH)');
+  // The second signal probe decides: ESRCH -> gone; success or EPERM -> still running.
+  const probes = (second) => {
+    let calls = 0;
+    return (pid) => {
+      calls += 1;
+      if (calls > 1 && second) throw enoent(second);
+      return pid;
+    };
+  };
+  assert.equal(processGone(424242, { ...noProc, signal: probes('ESRCH') }), true, 'exited between the probes');
+  assert.equal(processGone(424242, { ...noProc, signal: probes('EPERM') }), false, 'EPERM on re-probe means it still runs');
+  assert.equal(processGone(424242, { ...noProc, signal: probes(null) }), false, 'a successful re-probe means it still runs');
+  assert.equal(processGone(process.pid, { readStat: () => { throw enoent('EACCES'); } }), false, 'an unreadable stat proves nothing');
 });
 
 test('[RT-13] below minTests -> VACUOUS (4)', async () => {
