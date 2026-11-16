@@ -176,6 +176,11 @@ function randomIdent() {
   return `Q${randomAlnum(7)}4k${randomAlnum(6)}`;
 }
 
+/** `length` random letters from `alphabet` (a literal that has no digit, so it never looks random). */
+function randomLetters(length, alphabet = 'abcdefghijklmnopqrstuvwxyz') {
+  return [...randomBytes(length)].map((byte) => alphabet[byte % alphabet.length]).join('');
+}
+
 /** A random base32 (RFC 4648) string, the shape of a TOTP shared secret. */
 function randomBase32(length) {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
@@ -844,6 +849,62 @@ test('[NS-15] values made only of placeholders and path punctuation are not repo
       'infra/main.tf': joinLine('  password', ' = "', D, 'var.prefix}-', D, 'random_password.db.result}"'),
       'scripts/angle.sh': joinLine('export OPENSIG_API_KEY', "='<api-key>'"),
       Makefile: joinLine('API_KEY', " := '$(OPENSIG_API_KEY)'"),
+    },
+  });
+});
+
+test('[NS-16] a default holding spaces is read to its closing brace and tested whole (R5-1)', () => {
+  const D = DOLLAR_BRACE;
+  const words = [`my ${randomLetters(6)} ${randomLetters(4)}`, `my ${randomLetters(6)} ${randomLetters(8)}`, `${randomLetters(12)} x`];
+  expectOutcome({
+    literals: words,
+    positives: {
+      'scripts/default.sh': joinLine('DB_PASSWORD', '=', D, 'DB_PASSWORD:-', words[0], '}'),
+      'deploy/compose.yaml': 'services:\n  db:\n    environment:\n' + joinLine('      POSTGRES_PASSWORD', ': ', D, 'POSTGRES_PASSWORD:-', words[1], '}'),
+      'scripts/cut-name.sh': joinLine('DB_PASSWORD', '=', D, words[2], '}'),
+    },
+    negatives: {
+      'scripts/short.sh': joinLine('DB_PASSWORD', '=', D, 'DB_PASSWORD:-a b}'),
+      'scripts/message.sh': joinLine('DB_PASSWORD', '=', D, 'DB_PASSWORD:?must be set}'),
+    },
+  });
+});
+
+test('[NS-17] echo and printf arguments are tested as literal words, not only for looking random (R5-2)', () => {
+  const D = DOLLAR_BRACE;
+  const lit = [
+    randomLetters(24),
+    `${randomLetters(6)}2${randomLetters(7)}`,
+    randomLetters(20, 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'),
+    `${randomLetters(6)}7${randomLetters(7)}`,
+  ];
+  expectOutcome({
+    literals: lit,
+    positives: {
+      'scripts/echo.sh': joinLine('API_KEY', '=$(echo ', lit[0], ')'),
+      'scripts/echo-dq.sh': joinLine('API_KEY', '="$(echo ', lit[1], ')"'),
+      'scripts/printf.sh': joinLine('API_TOKEN', '="$(printf %s ', lit[2], ')"'),
+      'scripts/echo-quoted.sh': joinLine('export API_KEY', "=$(echo '", lit[3], "')"),
+    },
+    negatives: {
+      'scripts/generated.sh': joinLine('X_SECRET', '=$(openssl rand -hex 32)'),
+      'scripts/references.sh':
+        joinLine('API_KEY', '="$(echo ', D, 'OPENSIG_API_KEY})"') + joinLine('CLIENT_SECRET', '=$(echo -n $SEED)') + joinLine('API_TOKEN', `="$(printf '%s' "$TOKEN")"`),
+    },
+  });
+});
+
+test('[NS-18] command bodies are scanned for assignments whatever the outer name (R5-3)', () => {
+  const B = BACKTICK;
+  const lit = Array.from({ length: 2 }, () => randomIdent());
+  expectOutcome({
+    literals: lit,
+    positives: {
+      'scripts/backtick.sh': joinLine('RESULT', '=', B, 'curl --password', '=', lit[0], ' https://api.example.test', B),
+      'scripts/command.sh': joinLine('RESULT', '="$(curl --password', '=', lit[1], ' https://api.example.test)"'),
+    },
+    negatives: {
+      'scripts/plain.sh': joinLine('RESULT', '=', B, 'date -u', B) + joinLine('OUTPUT', '="$(curl --user "$API_USER" https://api.example.test)"'),
     },
   });
 });

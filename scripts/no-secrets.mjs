@@ -31,6 +31,8 @@
 //                      typed declarations (TypeScript, Python, Rust, Go), Go
 //                      ":=", command-line flags (--password=..., -Dx.password=...)
 //                      and a password in URL userinfo (scheme://user:pw@host).
+//                      Shell command bodies (backticks, "$(...)") are scanned
+//                      for their own assignments whatever the outer name.
 //                      A quoted value is always a literal, even when spelt
 //                      like a variable name; only unquoted values can be
 //                      variable references (OTHER_VAR, process.env.X).
@@ -470,8 +472,9 @@ const SHELL_EXTENSIONS = new Set(['', '.sh', '.bash', '.zsh']);
 // A NAME is an identifier (dotted for ${var.a}, ${process.env.X}) that does
 // not look random, so ${<literal>}, $<literal>, {{<literal>}} and <literal>
 // are literals. The default and alternate words of ${NAME:-word} are literal
-// text, and so is a command argument that looks random: $(openssl rand -hex 32)
-// and $(cat /run/secrets/x) are exempt, $(echo <literal>) is not. A value made
+// text, and so is a command argument that looks random, or what echo or
+// printf prints (R5-2): $(openssl rand -hex 32) and $(cat /run/secrets/x) are
+// exempt, $(echo <literal>) is not. A value made
 // only of placeholders, path punctuation and plain path components
 // (${HOME}/.ssh/id_ed25519) is exempt; any other literal text is tested.
 const NAME_AT = /[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*|\[\d{1,6}\])*/y;
@@ -501,7 +504,15 @@ function normalizeName(name) {
     .toLowerCase();
 }
 
+// The last word of every secret suffix (key, token, password ...). A name
+// that does not end in one, in any case, cannot be a secret name: it is
+// rejected before normalization, which is most of the cost of each candidate
+// assignment (R5-4). Normalization only inserts "_" before an upper-case
+// letter and maps "-" and "." to "_", so it never creates such an ending.
+const SECRET_TAIL = new RegExp(`(?:${[...new Set(SECRET_SUFFIXES.map((suffix) => suffix.split('_').at(-1)))].join('|')})$`, 'i');
+
 export function isSecretName(name) {
+  if (!SECRET_TAIL.test(name)) return false;
   const normalized = normalizeName(name);
   return SECRET_SUFFIXES.some((suffix) => normalized === suffix || normalized.endsWith(`_${suffix}`));
 }
@@ -732,8 +743,24 @@ function command(v, i, state) {
       balance -= 1;
     }
   }
-  if (looksRandom(v.slice(i + 2, j))) state.literal = true;
+  const body = v.slice(i + 2, j);
+  if (looksRandom(body) || printsLiteral(body)) state.literal = true;
   return Math.min(j + 1, v.length);
+}
+
+/**
+ * Whether an echo or printf command prints a literal word: its arguments,
+ * less echo options, a printf format and any argument holding a $ reference,
+ * joined as printed and tested like a default word (R5-2).
+ */
+function printsLiteral(body) {
+  const words = body.trim().split(/\s+/);
+  const name = words.shift();
+  if (name !== 'echo' && name !== 'printf') return false;
+  const args = words.map((word) => word.replace(/^(["'])(.*)\1$/, '$2'));
+  if (name === 'echo') while (args.length > 0 && /^-[neE]+$/.test(args[0])) args.shift();
+  if (name === 'printf' && args.length > 1 && args[0].includes('%')) args.shift();
+  return isLiteralWord(args.filter((arg) => !arg.includes('$')).join(' '));
 }
 
 /** Whether a default or alternate word is a literal value. */
@@ -845,10 +872,49 @@ function bareValue(text, start, runEnd, cache) {
         }
       }
     }
-    if (isBareStop(text, i)) break;
+    if (isBareStop(text, i)) {
+      // Inside an open group a terminator ends the value only when no brace
+      // closes the group on this line before an "=" (R4-4); otherwise the
+      // group runs to that brace and its word is tested whole (R5-1).
+      const close = depth > 0 ? groupClose(text, i, depth, cache) : -1;
+      if (close === -1) break;
+      i = close;
+      depth = 0;
+      continue;
+    }
     i += 1;
   }
   return { end: i, open: depth, resume: command === -1 ? i : Math.max(runEnd, command), literal: false };
+}
+
+/**
+ * From a value terminator at `i` inside `depth` open ${...} groups: the index
+ * just past the brace that closes them, on the same line within MAX_ENCLOSED
+ * characters with no "=" before it, or -1.
+ */
+function groupClose(text, i, depth, cache) {
+  const limit = Math.min(lineEnd(text, i, cache), i + MAX_ENCLOSED);
+  const brace = indexFrom(text, '}', i, cache);
+  if (brace === -1 || brace >= limit) return -1;
+  const equals = indexFrom(text, '=', i, cache);
+  if (equals !== -1 && equals < brace) return -1;
+  let open = depth;
+  for (let j = i; j < limit; j += 1) {
+    const c = text.charCodeAt(j);
+    if (c === 61 || c === 13) return -1; // "=" or a carriage return
+    if (c === 36 && text.charCodeAt(j + 1) === 123) {
+      open += 1;
+      j += 1;
+    } else if (c === 123) open += 1;
+    else if (c === 125 && --open === 0) return j + 1;
+  }
+  return -1;
+}
+
+/** Where the first command body in a double-quoted shell value starts, or -1. */
+function commandBody(value) {
+  const at = value.search(/\$\(|`/);
+  return at === -1 ? -1 : at + (value[at] === '`' ? 1 : 2);
 }
 
 /** Indexes of secret assignments with literal values. */
@@ -862,16 +928,20 @@ function assignmentIndexes(text, { bare, shell }) {
   const assignment = new RegExp(ASSIGNMENT.source, 'g');
   for (let match = assignment.exec(text); match !== null; match = assignment.exec(text)) {
     const [whole, flag, , name, operator] = match;
-    if (!isSecretName(name)) continue;
-    // `cond ? password : "fallback"`: the literal belongs to the ternary, not to the name.
-    if (operator === ':' && /\?[ \t]*$/.test(text.slice(Math.max(0, match.index - 64), match.index))) continue;
     const end = match.index + whole.length;
     const backtick = match[7];
+    // A shell command body (a backtick string, or $(...) or a backtick inside
+    // a double-quoted value) is scanned for assignments of its own, such as
+    // --password=..., whatever the outer name (R5-3).
     if (backtick !== undefined && shell) {
-      // Shell command substitution: no value, but its flags may be assignments.
       assignment.lastIndex = end - backtick.length - 1;
       continue;
     }
+    const body = match[5] !== undefined && shell ? commandBody(match[5]) : -1;
+    if (body !== -1) assignment.lastIndex = end - 1 - match[5].length + body;
+    if (!isSecretName(name)) continue;
+    // `cond ? password : "fallback"`: the literal belongs to the ternary, not to the name.
+    if (operator === ':' && /\?[ \t]*$/.test(text.slice(Math.max(0, match.index - 64), match.index))) continue;
     const quote = match[5] !== undefined ? 'double' : match[6] !== undefined ? 'single' : backtick !== undefined ? 'backtick' : null;
     let value = match[5] ?? match[6] ?? backtick;
     let open = 0;
