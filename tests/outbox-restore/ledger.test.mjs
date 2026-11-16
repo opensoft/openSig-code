@@ -898,8 +898,16 @@ test("[OR-21] the required-blob set is T029's reference-protection predicate: an
     assert.deepEqual(collected.disposedBlobRefs, [reused.ref]);
     const evidence = blobs.put(tenant, syntheticBytes('or21-evidence', 512));
     db.transaction(() => {
-      store.compareAndSet('envelopes', { id: envelope }, 1, { state: 'completed', base_revision_id: revision, manifest_digest: hex(`m-${envelope}`), recipients_digest: hex(`r-${envelope}`), approvals_complete: 1, updated_at: ts(10) });
-      store.insert('signing_jobs', { envelope_id: envelope, reserved_version: 2, status: 'succeeded', attempt_count: 2, max_attempts: 3, fencing_token: 2, created_at: ts(4), updated_at: ts(5) });
+      // The legal walk to completed (A-010 ST11-FX): draft 1, prepared 2, sent 3, finalizing 4, completed 5.
+      const walk = [
+        { state: 'prepared', base_revision_id: revision, manifest_digest: hex(`m-${envelope}`), recipients_digest: hex(`r-${envelope}`) },
+        { state: 'sent' },
+        { state: 'finalizing', approvals_complete: 1 },
+        { state: 'completed' },
+      ];
+      walk.forEach((step, index) => assert.equal(store.compareAndSet('envelopes', { id: envelope }, index + 1, { ...step, updated_at: ts(10) }), true, `${step.state} step`));
+      // reserved_version is the version written on entering finalizing (data-model.md § Entities, SigningJob).
+      store.insert('signing_jobs', { envelope_id: envelope, reserved_version: 4, status: 'succeeded', attempt_count: 2, max_attempts: 3, fencing_token: 2, created_at: ts(4), updated_at: ts(5) });
       store.insert('final_artifacts', { artifact_id: sid('art'), envelope_id: envelope, artifact_digest: reused.digest, approved_composition_digest: hex(`c-${envelope}`), pdf_blob_ref: reused.ref, evidence_blob_ref: evidence.ref, signer_certificate_sha256: hex('certificate'), development_certificate: 1, verifier_name: 'opensig-verifier', verifier_version: '0.0.0', verification_json: '{"integrity":"valid"}', fencing_token: 2, completed_at: ts(5) });
     });
     const required = requiredBlobRefs(db, tenant);

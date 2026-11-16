@@ -74,7 +74,17 @@ test('[OR-01] an outbox event is inserted in the transaction of the state change
 
     const completed = terminalEnvelope(db, blobs, tenant, { state: 'completed' });
     const artifact = store.get('final_artifacts', { envelope_id: completed.env });
-    const completion = { type: 'envelope.completed', envelopeId: completed.env, envelopeVersion: 2, artifactId: artifact.artifact_id, artifactDigest: artifact.artifact_digest };
+    // The completion announces the version the fixture stored, read back rather than assumed:
+    // it depends on how terminalEnvelope reaches completed (A-010 ST11-FX).
+    const completedVersion = Number(store.get('envelopes', { id: completed.env }).version);
+    const completion = { type: 'envelope.completed', envelopeId: completed.env, envelopeVersion: completedVersion, artifactId: artifact.artifact_id, artifactDigest: artifact.artifact_digest };
+    for (const wrong of [completedVersion - 1, completedVersion + 1]) {
+      assert.throws(
+        () => db.transaction(() => enqueueOutboxEvent(db, tenant, { ...completion, envelopeVersion: wrong }, { clock })),
+        (error) => error instanceof StorageUsageError && /envelope version written in this transaction/.test(error.message),
+        `the stored version ${completedVersion} is the only one accepted, not ${wrong}`,
+      );
+    }
     db.transaction(() => enqueueOutboxEvent(db, tenant, completion, { clock }));
     assert.throws(
       () => db.transaction(() => enqueueOutboxEvent(db, tenant, completion, { clock })),

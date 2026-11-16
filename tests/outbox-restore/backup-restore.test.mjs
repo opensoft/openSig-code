@@ -66,8 +66,11 @@ function liveSystem({ events = 4 } = {}) {
   const envelope = terminalEnvelope(env.db, env.blobs, tenant, { state: 'completed' });
   appendEvents(env, tenant, events, envelope.env);
   const artifact = env.db.forTenant(tenant).get('final_artifacts', { envelope_id: envelope.env });
+  // The completion announces the version the fixture stored, read back rather than assumed:
+  // it depends on how terminalEnvelope reaches completed (A-010 ST11-FX).
+  const storedVersion = Number(env.db.forTenant(tenant).get('envelopes', { id: envelope.env }).version);
   env.db.transaction(() =>
-    enqueueOutboxEvent(env.db, tenant, { type: 'envelope.completed', envelopeId: envelope.env, envelopeVersion: 2, artifactId: artifact.artifact_id, artifactDigest: artifact.artifact_digest }, { clock }),
+    enqueueOutboxEvent(env.db, tenant, { type: 'envelope.completed', envelopeId: envelope.env, envelopeVersion: storedVersion, artifactId: artifact.artifact_id, artifactDigest: artifact.artifact_digest }, { clock }),
   );
   return { ...env, tenant, envelope, blobRoot: join(env.dir, 'blobs'), ledgerPath: join(env.dir, 'exported-heads.json') };
 }
