@@ -46,12 +46,19 @@
 //   whose report would exceed it (422 limit-exceeded); the parent stops reading a longer
 //   report and stops converting one with more values, and fails closed (500 service-failure).
 //   At the 10 MiB input ceiling that keeps one maximal report under 128 MiB of parent memory.
-// - Concurrency (A-010 LBR3-1): at most MAX_CONCURRENT_PARSES children run, and have their
-//   reports decoded, at once. Up to MAX_WAITING_PARSES more parses wait for a slot in FIFO
-//   order without reading their input (a streamed body is read only once its parse has a
-//   slot, so a waiting upload is held back at the socket). A parse beyond that is refused at
-//   once, before its input is read: 429 rate_limited, reason parse-capacity. The slot is held
-//   while a streamed body is read; the caller's request timeout bounds a slow sender.
+// - Concurrency (A-010 LBR3-1, LBR4-1). Parse slots: at most MAX_CONCURRENT_PARSES children
+//   run, and have their reports decoded, at once; up to MAX_WAITING_PARSES more parses wait
+//   for a slot in FIFO order; when that queue is full a parse is refused at once, before its
+//   input is read: 429 rate_limited, reason parse-capacity. A parse takes its slot only once
+//   its input is fully buffered within maxBytes, so a slow body never holds a slot and a
+//   composition (an in-memory input) never waits behind a body that is still arriving.
+//   Body reads: a streamed input is read only under one of MAX_CONCURRENT_BODY_READS read
+//   permits, held while it is read and while the buffered input waits for its slot, so the
+//   memory of buffered uploads stays bounded. When every permit is held, a streamed parse is
+//   refused at once, before its input is read: 429 rate_limited, reason body-read-capacity
+//   (refused, not queued, so an upload never waits behind slow senders). Every path releases
+//   what it holds: a completed parse, a rejection, a 413, a refusal, or a client abort (the
+//   input iterator throws; parsePdf() rethrows that error).
 // - The PL-12 import boundary (src/pdf/ imports no net, http, https, dns, tls, dgram or
 //   http2 module) stays as defence in depth; it is not the isolation.
 //
@@ -131,7 +138,7 @@ export type ParseOutcome =
       ok: false;
       status: 413 | 422 | 429 | 500;
       code: 'payload_too_large' | 'unsupported_pdf' | 'rate_limited' | 'internal';
-      reason: RejectReason | 'service-failure' | 'sandbox-unavailable' | 'parse-capacity';
+      reason: RejectReason | 'service-failure' | 'sandbox-unavailable' | 'parse-capacity' | 'body-read-capacity';
       detail: string;
       detections: string[];
       network_sandbox: NetworkSandboxLabel;
@@ -189,6 +196,40 @@ function releaseSlot(): void {
 /** Current use of the parse slots (read-only; for monitoring and the tests). */
 export function parseCapacity(): { running: number; waiting: number; max_concurrent: number; max_waiting: number } {
   return { running: gate.running, waiting: gate.waiting.length, max_concurrent: MAX_CONCURRENT_PARSES, max_waiting: MAX_WAITING_PARSES };
+}
+
+/** True when a parse arriving now would find every slot taken and the queue full. */
+function parseQueueFull(): boolean {
+  return gate.running >= MAX_CONCURRENT_PARSES && gate.waiting.length >= MAX_WAITING_PARSES;
+}
+
+/** Streamed inputs read (or buffered and waiting for a slot) at once (A-010 LBR4-1). */
+export const MAX_CONCURRENT_BODY_READS = 4;
+
+const bodyReads = { held: 0 };
+
+/** Take a body-read permit; false when every permit is held. */
+function acquireBodyRead(): boolean {
+  if (bodyReads.held >= MAX_CONCURRENT_BODY_READS) return false;
+  bodyReads.held += 1;
+  return true;
+}
+
+function releaseBodyRead(): void {
+  bodyReads.held -= 1;
+}
+
+/** Current use of the body-read permits (read-only; for monitoring and the tests). */
+export function bodyReadCapacity(): { held: number; max: number } {
+  return { held: bodyReads.held, max: MAX_CONCURRENT_BODY_READS };
+}
+
+function rateLimited(reason: 'parse-capacity' | 'body-read-capacity', label: NetworkSandboxLabel): ParseOutcome {
+  const detail =
+    reason === 'parse-capacity'
+      ? `${MAX_CONCURRENT_PARSES} parses are running and ${MAX_WAITING_PARSES} are waiting`
+      : `${MAX_CONCURRENT_BODY_READS} uploads are being read`;
+  return { ok: false, status: 429, code: 'rate_limited', reason, detail, detections: [], network_sandbox: label };
 }
 
 // --- plan --------------------------------------------------------------------------------
@@ -533,23 +574,39 @@ async function runParse(input: Uint8Array | AsyncIterable<Uint8Array | string>, 
     };
   }
   if (input instanceof Uint8Array && input.length > parser.maxBytes) return reject('size-limit', `more than ${parser.maxBytes} bytes`, label);
+  if (parseQueueFull()) return rateLimited('parse-capacity', label);
+
+  // A-010 LBR4-1: buffer a streamed input in full, under a body-read permit, before taking a
+  // parse slot. The permit is held until the slot is taken (or the parse is refused).
+  let bytes: Buffer;
+  let permit = false;
+  if (input instanceof Uint8Array) {
+    bytes = Buffer.from(input.buffer, input.byteOffset, input.length);
+  } else {
+    if (!acquireBodyRead()) return rateLimited('body-read-capacity', label);
+    permit = true;
+    let collected: Buffer | { tooLarge: number };
+    try {
+      collected = await collect(input, parser.maxBytes);
+    } catch (error) {
+      releaseBodyRead();
+      throw error;
+    }
+    if (!(collected instanceof Buffer)) {
+      releaseBodyRead();
+      return reject('size-limit', `more than ${parser.maxBytes} bytes`, label);
+    }
+    bytes = collected;
+  }
   const slot = acquireSlot();
   if (slot === null) {
-    return {
-      ok: false,
-      status: 429,
-      code: 'rate_limited',
-      reason: 'parse-capacity',
-      detail: `${MAX_CONCURRENT_PARSES} parses are running and ${MAX_WAITING_PARSES} are waiting`,
-      detections: [],
-      network_sandbox: label,
-    };
+    if (permit) releaseBodyRead();
+    return rateLimited('parse-capacity', label);
   }
   await slot;
+  if (permit) releaseBodyRead();
   try {
-    const collected = await collect(input, parser.maxBytes);
-    if (!(collected instanceof Buffer)) return reject('size-limit', `more than ${parser.maxBytes} bytes`, label);
-    return await runChild(collected, command, parser, service, label);
+    return await runChild(bytes, command, parser, service, label);
   } finally {
     releaseSlot();
   }
