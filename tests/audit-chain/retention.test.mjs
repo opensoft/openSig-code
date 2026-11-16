@@ -7,7 +7,8 @@
 // its in-transaction re-check; RET-03 only retention records end retention;
 // RET-04 retained final artifacts keep protecting their blobs; RET-05 more
 // than 10,000 eligible envelopes; RET-06 every shared reference is seen;
-// RET-07 the exported reference-protection predicate is the disposer's rule.
+// RET-07 the exported reference-protection predicate is the disposer's rule;
+// RET-08 an envelope with more than 10,000 revisions is disposed in full.
 
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -17,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 
 import { canonicalDigest } from '../../src/domain/canonical/index.ts';
 import { eventDigest, eventFromRow, verifyChain } from '../../src/storage/audit/index.ts';
+import { nodeFsOps, openBlobStore } from '../../src/storage/blobs/index.ts';
 import { MAX_LIST_LIMIT, StorageConstraintError, StorageUsageError } from '../../src/storage/db/index.ts';
 import {
   BLOB_REFERENCE_COLUMNS,
@@ -545,6 +547,61 @@ test('[RET-07] the exported ReferenceProtection predicate is the one rule the di
     const source = readFileSync(join(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'), 'src', 'storage', 'retention', 'service.ts'), 'utf8');
     assert.equal([...source.matchAll(/new ReferenceProtection\(/g)].length, 1, 'one construction site, in BlobDisposer');
     assert.equal([...source.matchAll(/iterate\('final_artifacts'/g)].length, 0, 'no second scan of artifact references');
+  } finally {
+    db.close();
+  }
+});
+
+test('[RET-08] an envelope with more than 10,000 revisions is disposed in full: no blob is left, its one DisposalRecord lists every ref, and a second run finds nothing (A-010 Codex 16)', () => {
+  const env = environment(scratch, steppingClock());
+  const { db, audit } = env;
+  try {
+    // The same FileBlobStore over the same root with only fsync replaced:
+    // 10,001 fsynced writes and as many fsynced removals take minutes on a
+    // test host, and durability is not what this test checks. Every open,
+    // write, link, unlink and read is real.
+    const blobs = openBlobStore({ root: join(env.dir, 'blobs'), fsOps: { ...nodeFsOps, fsync() {} } });
+    const tenant = sid('tenant');
+    createTenant(db, tenant);
+    setPolicy(db, tenant, { policy_ref: 'synthetic-many-revisions', dispose_after_days: 1 });
+    const store = db.forTenant(tenant);
+    const envelope = sid('env');
+    const count = MAX_LIST_LIMIT + 1;
+    const documents = Array.from({ length: count }, (_, i) => blobs.put(tenant, Buffer.from(`synthetic revision ${i}`)));
+    db.transaction(() => {
+      store.insert('envelopes', envelopeRow(envelope, { state: 'declined', updated_at: ts(5) }));
+      documents.forEach((document, i) =>
+        store.insert('document_revisions', {
+          id: `rev_${String(i).padStart(12, '0')}`,
+          envelope_id: envelope,
+          content_digest: document.digest,
+          blob_ref: document.ref,
+          bytes: document.size,
+          pages: 1,
+          page_geometry_json: '[]',
+          parse_report_json: '{}',
+          created_at: ts(2),
+        }),
+      );
+    });
+    const refs = documents.map((document) => document.ref).sort();
+    assert.equal(new Set(refs).size, count, 'every revision holds a distinct blob');
+    assert.equal(store.count('document_revisions', { envelope_id: envelope }), count);
+    assert.equal(blobs.list(tenant).length, count);
+
+    const clock = fixedClock(new Date(BASE_TIME + 2 * DAY).toISOString());
+    const run = new RetentionService({ db, blobs, audit, clock }).run(tenant);
+    assert.deepEqual(run.disposals.map((disposal) => disposal.envelopeId), [envelope]);
+    assert.deepEqual([...run.disposals[0].disposedBlobRefs].sort(), refs, 'the disposal covers every revision');
+    assert.deepEqual(run.disposals[0].keptBlobRefs, []);
+    assert.deepEqual(blobs.list(tenant), [], 'no blob is left');
+    assert.equal(store.count('disposal_records', { envelope_id: envelope }), 1);
+    const record = store.get('disposal_records', { envelope_id: envelope });
+    assert.deepEqual(JSON.parse(record.disposed_blob_refs_json).sort(), refs, 'the DisposalRecord lists every ref');
+    assert.equal(verifyChain(db, tenant).ok, true);
+
+    const again = new RetentionService({ db, blobs, audit, clock }).run(tenant);
+    assert.deepEqual([again.disposals, again.resumedBlobRefs], [[], []], 'a second run finds nothing left');
   } finally {
     db.close();
   }
