@@ -208,6 +208,8 @@ export async function createWorld({ limits, idempotencyBodyLimit, scheduleWork, 
     ceremony,
     service,
     port,
+    /** The node:http server built by createAppServer; CH-07 observes its responses from the test process. */
+    server,
     scratch,
     logText: () => lines.join('\n'),
     req: (actor = HUMAN) => ({ tenantId: tenant, actor }),

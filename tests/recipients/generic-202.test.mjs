@@ -23,6 +23,15 @@
 // the lookup, (d) unknown, expired, superseded and locked invitations, and the
 // per-invitation serialization. Capability values stay in memory; assertion
 // messages carry labels only.
+//
+// Those cases hold the work through an injected scheduler, so they cannot see
+// where the DEFAULT scheduler starts it. The last case (A-010 D5, G1) runs the
+// production default with no hold and records, inside this process, the order
+// of two server-side events for each request: the 202's commit (the
+// ServerResponse's end() has returned with the status line, headers and body
+// handed to the socket) and the ceremony's first per-invitation storage work
+// (its first transaction or invitation lookup, seen through a database spy).
+// The 202 must come first. The order is an event sequence, not a time.
 
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
@@ -340,6 +349,83 @@ test('[CH-07] the post-response work is serialized per invitation: a second requ
   } finally {
     mail.open();
     work.open();
+    await settle(world);
+    await world.close();
+  }
+});
+
+test('[CH-07] with the default scheduler and no hold, the generic 202 is committed before the first per-invitation storage work, for live and not-live invitations (A-010 D5, G1)', async () => {
+  // A spy on the ceremony's database: its transactions and its invitation lookups, while armed.
+  const observed = { armed: false, events: [] };
+  const wrapDb = (db) =>
+    new Proxy(db, {
+      get(target, property) {
+        if (property === 'transaction') {
+          return (...args) => {
+            if (observed.armed) observed.events.push('transaction');
+            return target.transaction(...args);
+          };
+        }
+        if (property === 'resolveCapability') {
+          return (...args) => {
+            if (observed.armed && args[0] === 'invitations') observed.events.push('invitation lookup');
+            return target.resolveCapability(...args);
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  // The production defaults: no scheduleWork, no notifier wrapper.
+  const world = await createWorld({ wrapDb });
+  // The 202's commit, seen on the real server's ServerResponse: end() has returned for the challenge route.
+  world.server.prependListener('request', (req, res) => {
+    const end = res.end;
+    res.end = function observedEnd(...args) {
+      const result = end.apply(this, args);
+      if (observed.armed && req.method === 'POST' && req.url === '/v1/recipient-session/challenges' && this.statusCode === 202) {
+        observed.events.push(this.writableEnded ? '202 committed' : '202 end() returned without ending');
+      }
+      return result;
+    };
+  });
+  try {
+    const expiring = await sentEnvelope(world, { expiresAt: new Date(world.time.now.getTime() + 2 * HOUR).toISOString() });
+    const superseded = await sentEnvelope(world);
+    await resend(world, superseded.envelope, superseded.envelope.recipients[0]);
+    const locked = await sentEnvelope(world);
+    await lockOut(world, locked.token);
+    world.time.advance(3 * HOUR);
+    const live = await sentEnvelope(world);
+    world.takeMails('recipient_challenge');
+    const cases = [
+      ['live invitation', live.token, 1],
+      ['unknown token', randomBytes(32).toString('base64url'), 0],
+      ['expired invitation', expiring.token, 0],
+      ['superseded invitation', superseded.token, 0],
+      ['locked invitation', locked.token, 0],
+    ];
+    // Every case is observed before the order is asserted, so a failure names each case's order.
+    const workFirst = [];
+    for (const [label, token, mailed] of cases) {
+      observed.events = [];
+      observed.armed = true;
+      const response = await postChallenge(world, token);
+      await settle(world);
+      observed.armed = false;
+      const sequence = observed.events.join(' > ');
+      assertCommitted202(response, label);
+      assert.equal(observed.events.filter((event) => event.startsWith('202')).length, 1, `${label}: one 202 commit observed (observed: ${sequence})`);
+      assert.ok(observed.events.includes('transaction') && observed.events.includes('invitation lookup'), `${label}: the per-invitation work ran and was observed (observed: ${sequence})`);
+      if (observed.events[0] !== '202 committed') workFirst.push(`${label}: ${sequence}`);
+      assert.equal(world.takeMails('recipient_challenge').length, mailed, `${label}: ${mailed} code mailed once the work settled`);
+    }
+    assert.deepEqual(workFirst, [], 'for every case the 202 is committed before the first per-invitation transaction or invitation lookup');
+    const stats = world.ceremony.challengeWorkStats();
+    assert.equal(stats.pending, 0);
+    assert.equal(stats.failed, 0, 'no post-response work failed');
+  } finally {
+    observed.armed = false;
     await settle(world);
     await world.close();
   }
