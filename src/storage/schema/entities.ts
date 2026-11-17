@@ -56,6 +56,8 @@ export const TABLES: Readonly<Record<string, TablePolicy>> = Object.freeze({
     capabilityColumn: 'value_hash',
   },
   approvals: { entity: 'Approval', mutability: 'immutable', writer: 'store' },
+  // The exact receipt of each approval (T010, migration 0017): what an exact retry returns.
+  approval_receipts: { entity: 'Approval', mutability: 'immutable', writer: 'store' },
   idempotency_records: { entity: 'IdempotencyRecord', mutability: 'guarded', writer: 'store' },
   signing_jobs: { entity: 'SigningJob', mutability: 'guarded', writer: 'store' },
   final_artifacts: { entity: 'FinalArtifact', mutability: 'guarded', writer: 'store' },

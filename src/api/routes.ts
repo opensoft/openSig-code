@@ -27,6 +27,15 @@
 // src/server/main.ts; both lie outside T008's files, so switching ROUTES to the installed
 // handlers is left to the T031 follow-up that changes those tests and main.ts.
 //
+// Approval and decline (T010): APPROVAL_HANDLERS is T010's own handler map, with
+// approveAsHuman (src/api/recipients/approval.ts) and declineAsRecipient
+// (src/api/recipients/decline.ts). Each refuses any operator or service credential with
+// 401, then runs the same recipient session and CSRF guard, then the domain step, finding
+// the app's ApprovalApi under APPROVAL_API in the server locals. withApprovalHandlers()
+// installs them into a registry, over T008's guard-only entries. RECIPIENT_HANDLERS is left
+// as T008 made it, and ROUTES keeps `handler: null` for both operations, until T031's US1
+// composition slot (row WIRE-US1) composes the maps (A-010, request #24, ruling (7)).
+//
 // Operator envelope operations (T034): ENVELOPE_HANDLERS holds the handlers of
 // createEnvelope, readEnvelope, uploadDocument, prepareEnvelope, readRecipientPreview,
 // confirmSend, sendEnvelope, voidEnvelope, reissueEnvelope and resendInvitation (each finds
@@ -39,6 +48,8 @@
 import { withRecipientMutation } from './auth/recipient-session.ts';
 import type { OperationId } from './auth/matrix.ts';
 import { ENVELOPE_HANDLERS } from './envelopes/handlers.ts';
+import { approveAsHuman } from './recipients/approval.ts';
+import { declineAsRecipient } from './recipients/decline.ts';
 import { CEREMONY_HANDLERS, ceremonyAuthority } from './recipients/handlers.ts';
 import type { RouteHandler } from '../server/types.ts';
 
@@ -107,6 +118,26 @@ export function withRecipientHandlers(routes: readonly RouteDefinition[] = ROUTE
   return Object.freeze(
     routes.map((definition) => {
       const handler = RECIPIENT_HANDLERS[definition.operationId];
+      return handler === undefined ? definition : Object.freeze({ ...definition, handler });
+    }),
+  );
+}
+
+/**
+ * T010's handler map: approval and decline. Any operator or service credential is 401, then
+ * the recipient session and CSRF guard (a live session, then its X-CSRF-Token, else 401 or
+ * 403 csrf_failed), then the approval or decline.
+ */
+export const APPROVAL_HANDLERS: Readonly<Partial<Record<OperationId, RouteHandler>>> = Object.freeze({
+  approveAsHuman,
+  declineAsRecipient,
+});
+
+/** `routes` with T010's approval and decline handlers installed (every other route unchanged). */
+export function withApprovalHandlers(routes: readonly RouteDefinition[] = ROUTES): readonly RouteDefinition[] {
+  return Object.freeze(
+    routes.map((definition) => {
+      const handler = APPROVAL_HANDLERS[definition.operationId];
       return handler === undefined ? definition : Object.freeze({ ...definition, handler });
     }),
   );
