@@ -134,7 +134,7 @@ contract. Each test also checks:
 | `body-rule` (EnvelopeCreate "Ordinals must be exactly 1 or 1..2 without gaps.") | 400 | `invalid_request` | Ruled in spec 12de9e8, T006 readings (a): the EnvelopeCreate description is part of the schema, and BadRequest covers any schema violation |
 | `header-missing` (`Idempotency-Key`), `header-invalid` | 400 | `invalid_request` | Required header parameter and its pattern |
 | `header-missing` (`If-Match`) | 428 | `precondition_required` | PreconditionRequired: "If-Match missing on upload" |
-| `path-parameter` | 400 | `invalid_request` | Ruled in spec 12de9e8, T006 readings (b): the EnvelopeId pattern is part of the contract, and every operation with that path parameter declares 400. The uniform 404 applies to well-formed ids |
+| `path-parameter` | 404 | `not_found` | Ruled by request #16 (spec 48c9b26, row T006-EC22): T031's router answers a path parameter outside its pattern with the uniform 404 `not_found`, with the uniform Error body, before authentication (SEC-04). NotFound: "absent or inaccessible" covers an identifier that names nothing |
 | `absent-resource` | 404 | `not_found` | NotFound: "absent or inaccessible" |
 | `version-mismatch` | 409 | `version_conflict` | Conflict |
 | `state` (upload on a prepared envelope) | 409 | `state_conflict` | uploadDocument: "draft only" |

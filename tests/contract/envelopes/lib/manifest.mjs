@@ -70,8 +70,11 @@ export function expectedOutcome(defect) {
     case 'body-syntax':
     case 'body-rule':
     case 'header-invalid':
-    case 'path-parameter':
       return { status: 400, code: 'invalid_request', detailCodes: [] };
+    case 'path-parameter':
+      // Request #16 (row T006-EC22): T031's router gives a path parameter outside its pattern
+      // the uniform 404 not_found before authentication; it names no resource.
+      return { status: 404, code: 'not_found', detailCodes: [] };
     case 'header-missing':
       return defect.header === 'If-Match'
         ? { status: 428, code: 'precondition_required', detailCodes: [] }

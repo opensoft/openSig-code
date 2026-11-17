@@ -982,8 +982,8 @@
         "parameter": "envelope_id"
       },
       "expect": {
-        "status": 400,
-        "code": "invalid_request"
+        "status": 404,
+        "code": "not_found"
       },
       "basis": [
         {
@@ -991,8 +991,8 @@
           "value": "^[A-Za-z0-9_-]{16,64}$"
         },
         {
-          "pointer": "#/components/responses/BadRequest/description",
-          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+          "pointer": "#/components/responses/NotFound/description",
+          "text": "not_found: absent or inaccessible"
         }
       ]
     },
