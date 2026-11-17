@@ -15,8 +15,21 @@
 //   T008 recipient session, challenge, document and manifest, T010 approval and decline.
 // openReviewShell (GET /sign) is served by src/server/static.ts (T035) when that module
 // exists; see src/server/main.ts.
+//
+// Recipient ceremony (T008): RECIPIENT_HANDLERS holds the handlers of requestChallenge,
+// createRecipientSession, readRecipientSession, endRecipientSession, readRecipientDocument
+// and readRecipientManifest, plus the recipient session and CSRF guard in front of
+// approveAsHuman and declineAsRecipient, whose handlers T010 supplies (until then they
+// answer 501 after the guard). withRecipientHandlers() installs them into a registry. ROUTES
+// itself still carries `handler: null` for these operations: T031's server tests assert that
+// (SEC-04, and SEC-05's 501 for GET /v1/recipient-session on the entrypoint), and the
+// production ceremony (database, blob store, notifier, challenge key) is built in
+// src/server/main.ts; both lie outside T008's files, so switching ROUTES to the installed
+// handlers is left to the T031 follow-up that changes those tests and main.ts.
 
+import { withRecipientMutation } from './auth/recipient-session.ts';
 import type { OperationId } from './auth/matrix.ts';
+import { CEREMONY_HANDLERS, ceremonyAuthority } from './recipients/handlers.ts';
 import type { RouteHandler } from '../server/types.ts';
 
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
@@ -67,3 +80,24 @@ export const ROUTES: readonly RouteDefinition[] = Object.freeze([
   route('approveAsHuman', 'POST', '/v1/recipient-session/approval', 'json', 'T010'),
   route('declineAsRecipient', 'POST', '/v1/recipient-session/decline', 'json', 'T010'),
 ]);
+
+/**
+ * The recipient routes' handlers (T008). Approval and decline get the recipient session and
+ * CSRF guard now (a live session, then its X-CSRF-Token, else 401 or 403 csrf_failed);
+ * T010 replaces each `null` with its handler.
+ */
+export const RECIPIENT_HANDLERS: Readonly<Partial<Record<OperationId, RouteHandler>>> = Object.freeze({
+  ...CEREMONY_HANDLERS,
+  approveAsHuman: withRecipientMutation(ceremonyAuthority, null),
+  declineAsRecipient: withRecipientMutation(ceremonyAuthority, null),
+});
+
+/** `routes` with the recipient routes' handlers installed (every other route unchanged). */
+export function withRecipientHandlers(routes: readonly RouteDefinition[] = ROUTES): readonly RouteDefinition[] {
+  return Object.freeze(
+    routes.map((definition) => {
+      const handler = RECIPIENT_HANDLERS[definition.operationId];
+      return handler === undefined ? definition : Object.freeze({ ...definition, handler });
+    }),
+  );
+}
