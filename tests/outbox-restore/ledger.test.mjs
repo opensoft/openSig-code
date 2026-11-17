@@ -35,7 +35,8 @@
 // OR-34 --discard-staged identifies the staging by its real path and reports
 //       the path it deleted;
 // OR-35 the lock descriptor is held for the whole session and released on
-//       every path; --break-lock damaged;
+//       every path; --break-lock damaged (the cases that must move the lock
+//       depend on no process this test does not own; T30R4-1);
 // OR-38 a lock lost at release reports lock-lost, exit 70, over the
 //       outcome's own exit, still naming that outcome and its recovery;
 // OR-39 a refusal found during a run (a database appearing at the restore
@@ -306,34 +307,52 @@ function failDirFsync(ledgerPath) {
   };
 }
 
-/** This user's processes in /proc: those whose open files can be inspected, and those that cannot (non-dumpable). */
-function userProcesses() {
-  const inspectable = [];
-  const uninspectable = [];
-  for (const name of readdirSync('/proc')) {
-    if (!/^[0-9]+$/.test(name)) continue;
+/**
+ * Whether --break-lock damaged would count `pid` as an inspectable process of
+ * this user, by its own definition (lockHolders in ledger.ts): /proc/<pid> is
+ * this user's, its fd directory lists, and every entry in it stats (an entry
+ * that vanished meanwhile is skipped). Applied only to processes this test
+ * owns: the test never inspects any other process.
+ */
+function inspectableByTheCli(pid) {
+  let fds;
+  try {
+    if (statSync(`/proc/${pid}`).uid !== process.getuid()) return false;
+    fds = readdirSync(`/proc/${pid}/fd`);
+  } catch {
+    return false;
+  }
+  for (const fd of fds) {
     try {
-      if (statSync(`/proc/${name}`).uid !== process.getuid()) continue;
-      readdirSync(`/proc/${name}/fd`);
-      inspectable.push(Number(name));
+      statSync(`/proc/${pid}/fd/${fd}`);
     } catch (error) {
-      if (error.code !== 'ENOENT') uninspectable.push(Number(name));
+      if (error.code !== 'ENOENT') return false;
     }
   }
-  return { inspectable, uninspectable };
+  return true;
 }
 
 /**
- * Any process of this user on the host that is exiting, or is a zombie, is
- * uninspectable for a moment too (its /proc/<pid>/fd turns root-owned), and
- * on a shared host such processes come and go all the time. A pid is steadily
- * uninspectable, or steadily inspectable, when it is so in two scans taken
- * around a command; assertions about the whole of /proc use those.
+ * A live process this test owns, idle until stopped (only its own recorded
+ * pid is ever signalled). The cases that must move a damaged lock hand the
+ * library only such processes and this one.
  */
-function steadyProcesses(before, after = userProcesses()) {
+async function ownedIdleProcess() {
+  const child = spawn(process.execPath, ['-e', "process.stdout.write('ready\\n'); setInterval(() => {}, 60_000);"], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const closed = new Promise((resolveClose) => child.on('close', (code, signal) => resolveClose({ code, signal })));
+  await new Promise((resolveReady, rejectReady) => {
+    child.stdout.on('data', (chunk) => {
+      if (String(chunk).includes('ready')) resolveReady();
+    });
+    child.on('error', rejectReady);
+    child.on('exit', () => rejectReady(new Error('the idle process exited before it was ready')));
+  });
   return {
-    inspectable: before.inspectable.filter((pid) => after.inspectable.includes(pid)),
-    uninspectable: before.uninspectable.filter((pid) => after.uninspectable.includes(pid)),
+    pid: child.pid,
+    async stop() {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await closed;
+    },
   };
 }
 
@@ -1833,6 +1852,7 @@ test('[OR-34] --discard-staged identifies the staging by its real path, under an
 
 test('[OR-35] the lock owner holds its descriptor for the whole session and releases it on every path; --break-lock damaged moves aside only an unparseable lock older than 60 s that no live writer holds (T30R2-1)', async () => {
   const sys = system({ tenants: 2, events: 3 });
+  let idle;
   try {
     await backup(sys, 'bk1', { firstBackup: true });
     const lockPath = `${sys.ledgerPath}.lock`;
@@ -1866,28 +1886,38 @@ test('[OR-35] the lock owner holds its descriptor for the whole session and rele
     } finally {
       if (holder.exitCode === null && holder.signalCode === null) holder.kill('SIGKILL');
     }
-    // Through the CLI the whole of /proc is inspected. A process of this user
-    // that /proc does not let anyone but root inspect (a non-dumpable one,
-    // such as ssh-agent) means refuse, naming it, never assume it is not a
-    // holder; then the success path is shown over the inspectable processes.
-    // Every steadily uninspectable process is named, and no steadily
-    // inspectable one; a process exiting during the command may be named.
-    const scanBefore = userProcesses();
+    // The cases that must move the lock, or reach its identity re-check, give
+    // the library only processes this test owns and keeps alive: itself and an
+    // idle child, each first shown inspectable by the command line's own
+    // definition. No other process of this user on the host can decide them.
+    idle = await ownedIdleProcess();
+    const owned = [process.pid, idle.pid];
+    const ownedScan = { pids: () => owned };
+    const assertOwnedInspectable = () => {
+      for (const pid of owned) assert.ok(inspectableByTheCli(pid), `pid ${pid}, owned by this test, is inspectable`);
+    };
+
+    // Through the CLI the whole of /proc is inspected, so its outcome depends
+    // on every process of this user on the host: it moves the lock, or it
+    // refuses, naming the processes it could not clear (a non-dumpable one
+    // such as ssh-agent, or one exiting), and leaves the lock untouched. Both
+    // hold under any host state; the uninspectable-peer refusal itself is
+    // asserted by OR-41 and by case (d).
+    const tornLock = statSync(lockPath);
     const moved = cli('--break-lock', 'damaged', '--ledger', sys.ledgerPath);
-    const { inspectable, uninspectable } = steadyProcesses(scanBefore);
     let movedTo;
     if (moved.status === 0) {
-      assert.deepEqual(uninspectable, [], `moved although a process of this user stayed uninspectable (${moved.stdout})`);
       movedTo = /^backup: damaged-lock-moved path=(\S+)\n$/.exec(moved.stdout)?.[1];
     } else {
       assert.equal(moved.status, 1, moved.stdout + moved.stderr);
-      const named = /^backup: refused ledger_invalid: process\(es\) ([0-9, ]+) of this user cannot be inspected, so it cannot be shown that none holds the damaged lock; the lock was not moved\n$/.exec(moved.stdout);
-      assert.ok(named, moved.stdout);
-      const pids = named[1].split(', ').map(Number);
-      for (const pid of uninspectable) assert.ok(pids.includes(pid), `the refusal names pid ${pid}: ${moved.stdout}`);
-      for (const pid of pids) assert.ok(!inspectable.includes(pid), `pid ${pid}, inspectable before and after, is not named: ${moved.stdout}`);
-      assert.deepEqual(readFileSync(lockPath), torn, 'refused: the lock is untouched');
-      movedTo = breakDamagedLock(sys.ledgerPath, { pids: () => inspectable }).movedTo;
+      assert.match(
+        moved.stdout,
+        /^backup: refused ledger_invalid: (?:process\(es\) [0-9]+(?:, [0-9]+)* of this user cannot be inspected, so it cannot be shown that none holds the damaged lock|the damaged ledger lock is held by pid [0-9]+(?:, [0-9]+)*, a live writer); the lock was not moved\n$/,
+      );
+      const still = statSync(lockPath);
+      assert.deepEqual([still.dev, still.ino, readFileSync(lockPath)], [tornLock.dev, tornLock.ino, torn], 'refused: the lock is untouched');
+      assertOwnedInspectable();
+      movedTo = breakDamagedLock(sys.ledgerPath, ownedScan).movedTo;
     }
     assert.match(movedTo ?? '', new RegExp(`^${escapeRegExp(lockPath)}\\.damaged-\\d{4}-\\d\\d-\\d\\dT\\d\\d-\\d\\d-\\d\\d-\\d{3}Z$`), moved.stdout);
     assert.deepEqual(readFileSync(movedTo), torn, '(b) moved aside, never deleted');
@@ -1898,15 +1928,12 @@ test('[OR-35] the lock owner holds its descriptor for the whole session and rele
     // The 60 s rule, on the file's mtime and an injectable clock.
     writeFileSync(lockPath, torn, { flag: 'wx', mode: 0o600 });
     const mtime = statSync(lockPath).mtimeMs;
-    const scanYoung = userProcesses();
     const young = cli('--break-lock', 'damaged', '--ledger', sys.ledgerPath);
     assert.equal(young.status, 1);
     assert.match(young.stdout, /it is moved aside only when older than 60 s; the lock was not moved/);
-    const scanned = steadyProcesses(scanYoung).inspectable;
-    assert.ok(scanned.includes(process.pid));
-    const scan = { pids: () => scanned };
-    assert.throws(() => breakDamagedLock(sys.ledgerPath, { ...scan, now: () => mtime + 59_000 }), /only when older than 60 s/);
-    const aged = breakDamagedLock(sys.ledgerPath, { ...scan, now: () => mtime + 61_000 });
+    assert.throws(() => breakDamagedLock(sys.ledgerPath, { ...ownedScan, now: () => mtime + 59_000 }), /only when older than 60 s/);
+    assertOwnedInspectable();
+    const aged = breakDamagedLock(sys.ledgerPath, { ...ownedScan, now: () => mtime + 61_000 });
     assert.deepEqual(readFileSync(aged.movedTo), torn);
     rmSync(aged.movedTo);
 
@@ -1940,7 +1967,7 @@ test('[OR-35] the lock owner holds its descriptor for the whole session and rele
     });
     try {
       assert.throws(
-        () => breakDamagedLock(sys.ledgerPath, scan),
+        () => breakDamagedLock(sys.ledgerPath, ownedScan),
         (error) => error instanceof LedgerError && new RegExp(`process\\(es\\) (?:[0-9]+, )*${process.pid}(?:, [0-9]+)* of this user cannot be inspected`).test(error.message),
       );
     } finally {
@@ -1960,8 +1987,9 @@ test('[OR-35] the lock owner holds its descriptor for the whole session and rele
       }
       return real.call(fs, path, ...rest);
     });
+    assertOwnedInspectable();
     try {
-      assert.throws(() => breakDamagedLock(sys.ledgerPath, scan), (error) => error instanceof LedgerError && /changed while it was being checked; the lock was not moved/.test(error.message));
+      assert.throws(() => breakDamagedLock(sys.ledgerPath, ownedScan), (error) => error instanceof LedgerError && /changed while it was being checked; the lock was not moved/.test(error.message));
     } finally {
       unhookFs();
     }
@@ -2069,6 +2097,7 @@ test('[OR-35] the lock owner holds its descriptor for the whole session and rele
     assert.ok(warnings.some((warning) => warning.code === 'OPENSIG_LEDGER_LOCK_LOST'), 'the lost lock is reported');
     rmSync(lockPath);
   } finally {
+    await idle?.stop();
     sys.db.close();
   }
 });
