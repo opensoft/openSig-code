@@ -160,7 +160,8 @@ test('[CH-05] every recipient session has a CSRF secret, which never changes; mi
     const triggers = new DatabaseSync(world.path, { readOnly: true });
     try {
       const names = triggers
-        .prepare("SELECT name FROM sqlite_schema WHERE type = 'trigger' AND tbl_name IN ('invitations', 'challenges', 'recipient_sessions') AND sql LIKE '% AFTER %' ORDER BY name")
+        // 0013's AFTER triggers; 0016's AFTER INSERT rowid checks are inventoried with every other trigger by CH-08.
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'trigger' AND tbl_name IN ('invitations', 'challenges', 'recipient_sessions') AND sql LIKE '% AFTER %' AND name NOT LIKE '%rowid_positive' ORDER BY name")
         .all()
         .map((entry) => entry.name);
       assert.deepEqual(names, [
