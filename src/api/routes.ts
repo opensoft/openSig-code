@@ -26,9 +26,19 @@
 // production ceremony (database, blob store, notifier, challenge key) is built in
 // src/server/main.ts; both lie outside T008's files, so switching ROUTES to the installed
 // handlers is left to the T031 follow-up that changes those tests and main.ts.
+//
+// Operator envelope operations (T034): ENVELOPE_HANDLERS holds the handlers of
+// createEnvelope, readEnvelope, uploadDocument, prepareEnvelope, readRecipientPreview,
+// confirmSend, sendEnvelope, voidEnvelope, reissueEnvelope and resendInvitation (each finds
+// the app's EnvelopeApi under ENVELOPE_API in the server locals). withEnvelopeHandlers()
+// installs them into a registry, as withRecipientHandlers() does for T008. ROUTES itself
+// keeps `handler: null` for these operations until T031's US1 composition slot (row
+// WIRE-US1) sets ROUTES from the handler maps and composes their dependencies in
+// src/server/main.ts.
 
 import { withRecipientMutation } from './auth/recipient-session.ts';
 import type { OperationId } from './auth/matrix.ts';
+import { ENVELOPE_HANDLERS } from './envelopes/handlers.ts';
 import { CEREMONY_HANDLERS, ceremonyAuthority } from './recipients/handlers.ts';
 import type { RouteHandler } from '../server/types.ts';
 
@@ -97,6 +107,18 @@ export function withRecipientHandlers(routes: readonly RouteDefinition[] = ROUTE
   return Object.freeze(
     routes.map((definition) => {
       const handler = RECIPIENT_HANDLERS[definition.operationId];
+      return handler === undefined ? definition : Object.freeze({ ...definition, handler });
+    }),
+  );
+}
+
+export { ENVELOPE_HANDLERS };
+
+/** `routes` with the operator envelope routes' handlers installed (every other route unchanged). */
+export function withEnvelopeHandlers(routes: readonly RouteDefinition[] = ROUTES): readonly RouteDefinition[] {
+  return Object.freeze(
+    routes.map((definition) => {
+      const handler = ENVELOPE_HANDLERS[definition.operationId];
       return handler === undefined ? definition : Object.freeze({ ...definition, handler });
     }),
   );
