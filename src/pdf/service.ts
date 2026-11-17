@@ -19,9 +19,36 @@
 //   are unreachable (other network namespace) and host pathname sockets do not exist in
 //   the root. See sandbox.ts for exactly what is and is not provided.
 // - Limits: the parent polls /proc for the launcher and every process below it, and kills
-//   the tree when its CPU time or resident memory exceeds the limit, or at the wall-clock
-//   limit. A V8 heap exhaustion is detected from the child's exit. Every kill is a 422
-//   resource-limit rejection; the child is always gone when parsePdf() settles.
+//   the sandbox when its CPU time or resident memory exceeds the limit, or at the wall-clock
+//   limit, which is armed at spawn and so covers sandbox start-up. A V8 heap exhaustion is
+//   detected from the child's exit. Every kill is a 422 resource-limit rejection.
+// - A decided kill ends the whole sandbox (A-010 PL11-ESC). The launcher is the service's own
+//   child, spawned as it always was, in the service's process group and session. Each child of
+//   the launcher is the init of the sandbox's PID namespace: bwrap's, or the process unshare
+//   forks. Under bwrap, --new-session runs in that init, which leads its own session and process
+//   group; the worker is the init's child, in its namespace, session and group. The kill uses no
+//   group or session membership. It first stops the launcher (SIGSTOP). A stopped process can neither fork nor reap, so its children
+//   are then complete, and each child's pid stays allocated to that child. The kill captures
+//   and kills each child, then kills the launcher. An init's death ends every process in its
+//   namespace, and nothing can start after the decision: the stopped launcher cannot fork, and
+//   a killed child cannot either. If the launcher has not stopped within STOP_GRACE_MS, its
+//   captured children are killed through their identities all the same. Either way the
+//   launcher is killed next, so it is never left stopped.
+// - Ownership lease: an identity captured while ownership is proven. The launcher is signalled
+//   only while Node has not reaped it: until then its pid cannot be reused, because Linux keeps a
+//   pid while its task, live or zombie, holds it. A child of the launcher is captured only while
+//   the launcher is unreaped. Capture opens a handle on /proc/<pid> and reads, through that
+//   handle, the child's parent (it must be the launcher) and its start time. The handle names
+//   that one process: reads through it fail once the process is reaped, even if its pid is
+//   reused. A captured process is signalled only when its handle shows it alive and its pid
+//   still shows the same start time.
+// - Orphans: a captured child still alive after the launcher has ended (it exited or was
+//   killed first) is ended through its identity. parseOrphans() is a read-only, process-wide
+//   count of those ends (A-010 request #15).
+// - parsePdf() settles only once the sandbox is gone: the child's stdio has closed, a decided
+//   kill has sent all its signals, and every captured child has terminated (reaped, or a
+//   zombie, read through its handle). An exiting PID-namespace init first kills, and waits for,
+//   every other process of its namespace, so a terminated init means its worker is gone.
 // - Fail closed: without a launcher whose isolation the probe confirms, parsePdf() returns
 //   500 internal, reason sandbox-unavailable, and starts no child. The one exception is the
 //   explicit development opt-in OPENSIG_PARSER_ALLOW_UNSANDBOXED=1, read from the process
@@ -30,8 +57,9 @@
 // - No caller-supplied option can choose the launcher, the environment or the worker
 //   (LBR-3): parsePdf() accepts `limits` and `service` only and refuses anything else.
 //   createParseServiceForTests() exists for the tests; its options can only narrow the
-//   launchers (a narrowed set that is unusable refuses) or replace the worker inside the
-//   same sandbox, and never downgrade or relabel it.
+//   launchers (a narrowed set that is unusable refuses), replace the worker inside the
+//   same sandbox, or apply one test-only launch seam (PL-26: a held start-up, a launcher that
+//   ends first, or a channel to the worker), and never downgrade or relabel it.
 // - Every outcome carries `network_sandbox`: `netns+fs-enforced (local)` or `unavailable`.
 //   That is the locally observed capability; it never claims the production gate
 //   `parser-network-sandbox` passed (that gate needs deployment-environment evidence).
@@ -66,10 +94,11 @@
 // Linux only (the pinned runtime is linux-x64).
 
 import { Buffer } from 'node:buffer';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessByStdio, type StdioOptions } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { closeSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, sep } from 'node:path';
+import type { Duplex, Readable, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import { REJECT_REASONS, type RejectReason } from './errors.ts';
@@ -231,6 +260,18 @@ export function parseCapacity(): { running: number; waiting: number; max_concurr
  */
 export function parseAdmissions(): { readonly next_ticket: number; readonly admitted: readonly number[]; readonly max_records: number } {
   return Object.freeze({ next_ticket: gate.nextTicket, admitted: Object.freeze([...gate.admitted]), max_records: ADMISSION_RECORD_SIZE });
+}
+
+/** Captured children ended because they outlived their launcher, over every parse child (A-010 PL11-ESC). */
+const orphanRecord = { ended: 0 };
+
+/**
+ * The orphan record (read-only; for monitoring and the tests, A-010 PL11-ESC, request #15): how
+ * many captured children this process has ended because they outlived their launcher. Each
+ * end counts once, exactly as in that child's lifecycle `orphans_ended`. A frozen copy.
+ */
+export function parseOrphans(): { readonly orphans_ended: number } {
+  return Object.freeze({ orphans_ended: orphanRecord.ended });
 }
 
 /** True when a parse arriving now would find every slot taken and the queue full. */
@@ -589,6 +630,147 @@ export function validateChildResult(
 interface Runner {
   readonly kinds: readonly LauncherKind[];
   readonly entry: string;
+  readonly hooks: ChildHooks;
+}
+
+/** One parse child's lifecycle as the parent saw it (tests only; A-010 PL11-ESC, PL-26). */
+export interface ChildLifecycle {
+  /** The kill the parent decided, or null if it decided none. */
+  readonly kill: 'cpu' | 'memory' | 'wall-time' | 'report-size' | null;
+  /** Bytes the parent read from the child's stdout and stderr after it decided that kill. */
+  readonly output_after_kill: number;
+  /** Captured children ended because they outlived the launcher (the orphan path). */
+  readonly orphans_ended: number;
+  /**
+   * Milliseconds from stopping the launcher to signalling the sandbox, or null when the launcher
+   * was not stopped (no decided kill, or the launcher had already ended).
+   */
+  readonly stop_ms: number | null;
+}
+
+/**
+ * Test-only launch seams (createParseServiceForTests; PL-26). Production has none.
+ * - hold-startup: the launch forks a start-up stage that waits on fd 3 and only then execs the
+ *   launcher. The service lets it go on only after a decided kill has sent all its signals.
+ * - orphan-launcher: the same held start-up. As soon as the stage's identity has been captured,
+ *   the service kills the launcher alone, so the stage outlives it as an orphan.
+ * - channel: fd 3 passes through the unchanged launch into the sandbox, to the worker, so a
+ *   test can synchronize with the worker.
+ */
+export type LaunchSeam = 'hold-startup' | 'orphan-launcher' | 'channel';
+const LAUNCH_SEAMS: readonly LaunchSeam[] = Object.freeze(['hold-startup', 'orphan-launcher', 'channel']);
+
+interface ChildHooks {
+  readonly seam: LaunchSeam | null;
+  /** Receives the child's lifecycle when its outcome settles. */
+  readonly observe: ((lifecycle: ChildLifecycle) => void) | null;
+  /** Receives fd 3 of a child launched with the channel seam. */
+  readonly channel: ((stream: Duplex) => void) | null;
+}
+
+const NO_HOOKS: ChildHooks = Object.freeze({ seam: null, observe: null, channel: null });
+
+/**
+ * The held launch script (hold-startup and orphan-launcher). The shell forks a start-up stage
+ * that blocks reading fd 3 and only then execs the launcher, and the shell waits for it. The
+ * ulimit, the launcher, the sandbox and the worker are the production ones. fd 3 never reaches
+ * the launcher, and the stage gives it the child's stdin back (fd 4), since a background job
+ * of a non-interactive shell starts with stdin from /dev/null. Unlike production, the launcher
+ * inherits SIGINT and SIGQUIT ignored from that background job; the seams use SIGKILL only.
+ */
+const HELD_STARTUP_SCRIPT = 'ulimit -t "$1" || exit 70; shift; exec 4<&0; ( read -r line <&3; exec 0<&4 3<&- 4<&- "$@" ) & exec 3<&- 4<&-; wait $!';
+
+/** Lifecycles kept per test service (createParseServiceForTests). */
+const LIFECYCLE_RECORDS = 16;
+/** How long a decided kill waits for the launcher to stop before ending it through identities. */
+const STOP_GRACE_MS = 100;
+
+/** A child of the launcher, captured while ownership was proven (the ownership lease). */
+interface Identity {
+  readonly pid: number;
+  /** Start time from /proc/<pid>/stat (clock ticks since boot): with the pid, it names one process. */
+  readonly start: string;
+  /** A handle on /proc/<pid>. Reads through it fail once that very process is reaped. */
+  readonly fd: number;
+}
+
+interface ProcStat {
+  readonly state: string;
+  readonly ppid: number;
+  readonly start: string;
+}
+
+function parseStat(text: string): ProcStat {
+  const fields = text.slice(text.lastIndexOf(')') + 2).split(' ');
+  return { state: fields[0] ?? '', ppid: Number(fields[1]), start: fields[19] ?? '' };
+}
+
+/** /proc/<pid>/stat looked up by number, or null. */
+function statByPid(pid: number): ProcStat | null {
+  try {
+    return parseStat(readFileSync(`/proc/${pid}/stat`, 'latin1'));
+  } catch {
+    return null;
+  }
+}
+
+/** /proc/<pid>/stat read through a captured handle, or null once that process has been reaped. */
+function statByHandle(fd: number): ProcStat | null {
+  try {
+    return parseStat(readFileSync(`/proc/self/fd/${fd}/stat`, 'latin1'));
+  } catch {
+    return null;
+  }
+}
+
+/** Terminated: reaped (no stat through the handle), or a zombie that can never run again. */
+const terminated = (stat: ProcStat | null): boolean => stat === null || stat.state === 'Z' || stat.state === 'X';
+
+/**
+ * The children of `pid`, from its own /proc record; on a kernel without that record, from the
+ * /proc scan the poller already uses.
+ */
+function childrenOf(pid: number): number[] {
+  try {
+    return readFileSync(`/proc/${pid}/task/${pid}/children`, 'latin1')
+      .trim()
+      .split(/\s+/)
+      .filter((item) => item !== '')
+      .map(Number);
+  } catch {
+    return descendants(pid).filter((child) => statByPid(child)?.ppid === pid);
+  }
+}
+
+/** Capture `pid` as a child of `parent`: open its handle and confirm the parent through it. */
+function captureIdentity(pid: number, parent: number): Identity | null {
+  let fd: number;
+  try {
+    fd = openSync(`/proc/${pid}`, 'r');
+  } catch {
+    return null;
+  }
+  const stat = statByHandle(fd);
+  if (stat === null || terminated(stat) || stat.ppid !== parent) {
+    closeSync(fd);
+    return null;
+  }
+  return Object.freeze({ pid, start: stat.start, fd });
+}
+
+/**
+ * SIGKILL a captured process, only if right now its handle shows it alive and its pid still
+ * shows its start time. True when the signal was sent.
+ */
+function killIdentity(identity: Identity): boolean {
+  if (terminated(statByHandle(identity.fd))) return false;
+  if (statByPid(identity.pid)?.start !== identity.start) return false;
+  try {
+    process.kill(identity.pid, 'SIGKILL');
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function runParse(input: Uint8Array | AsyncIterable<Uint8Array | string>, options: ParseOptions, runner: Runner): Promise<ParseOutcome> {
@@ -641,26 +823,51 @@ async function runParse(input: Uint8Array | AsyncIterable<Uint8Array | string>, 
   await slot;
   if (permit) releaseBodyRead();
   try {
-    return await runChild(bytes, command, parser, service, label);
+    return await runChild(bytes, command, parser, service, label, runner.hooks);
   } finally {
     releaseSlot();
   }
 }
 
-/** Run one parse child on `bytes` and validate its report; holds a parse slot throughout. */
+/**
+ * Run one parse child on `bytes` and validate its report; holds a parse slot throughout. The
+ * outcome settles only once the whole sandbox is gone (see the header, A-010 PL11-ESC).
+ */
 function runChild(
   bytes: Buffer,
   { file, args }: { file: string; args: string[] },
   parser: ParserLimits,
   service: ServiceLimits,
   label: NetworkSandboxLabel,
+  hooks: ChildHooks = NO_HOOKS,
 ): Promise<ParseOutcome> {
   const digest = createHash('sha256').update(bytes).digest('hex');
   const budget = reportBudget(parser);
 
   return new Promise<ParseOutcome>((resolveOutcome) => {
-    const child = spawn(file, args, { cwd: dirname(WORKER_ENTRY), env: {}, stdio: ['pipe', 'pipe', 'pipe'] });
+    const seam = hooks.seam;
+    const held = seam === 'hold-startup' || seam === 'orphan-launcher';
+    const stdio: StdioOptions = seam === null ? ['pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe', 'pipe'];
+    const argv = held ? ['-c', HELD_STARTUP_SCRIPT, ...args.slice(2)] : args;
+    const child = spawn(file, argv, { cwd: dirname(WORKER_ENTRY), env: {}, stdio }) as ChildProcessByStdio<Writable, Readable, Readable>;
+    // A seam's fd 3 (tests only). A socket error on it must never crash the service.
+    const seamStream = seam === null ? null : (child.stdio[3] as Duplex | null);
+    seamStream?.on('error', () => {
+      // The seam's socket may reset when the sandbox dies.
+    });
+    if (seam === 'channel' && seamStream !== null) hooks.channel?.(seamStream);
     let killedFor: 'cpu' | 'memory' | 'wall-time' | 'report-size' | null = null;
+    let outputAfterKill = 0;
+    let orphansEnded = 0;
+    let closed: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    /** The launcher's children, captured while it was unreaped (the ownership lease). */
+    const owned: Identity[] = [];
+    /** A decided kill has started, and has sent every signal it will send. */
+    let killing = false;
+    let killSent = false;
+    let stopTimer: ReturnType<typeof setTimeout> | null = null;
+    let stopMs: number | null = null;
+    let seamFired = false;
     const stdout: Buffer[] = [];
     let stdoutBytes = 0;
     let stderr = '';
@@ -668,12 +875,91 @@ function runChild(
     let tree: number[] = [];
     let scanned = 0;
 
+    /** Node has not reaped the launcher, so its pid still names it (live or zombie). */
+    const launcherUnreaped = (): boolean => child.pid !== undefined && child.exitCode === null && child.signalCode === null;
+    /** Signal the launcher, only while Node has not reaped it. */
+    const signalLauncher = (signal: NodeJS.Signals): void => {
+      const launcher = child.pid;
+      if (launcher === undefined || !launcherUnreaped()) return;
+      try {
+        process.kill(launcher, signal);
+      } catch {
+        // Unreachable while the launcher is unreaped.
+      }
+    };
+
+    /** Capture each child of the unreaped launcher that is not captured yet. */
+    const captureChildren = (): void => {
+      const launcher = child.pid;
+      if (launcher === undefined || !launcherUnreaped()) return;
+      for (const pid of childrenOf(launcher)) {
+        if (owned.some((identity) => identity.pid === pid && !terminated(statByHandle(identity.fd)))) continue;
+        const identity = captureIdentity(pid, launcher);
+        if (identity === null) continue;
+        owned.push(identity);
+        // PL-26 orphan-launcher seam: the launcher ends first, its captured child still alive.
+        if (seam === 'orphan-launcher' && !seamFired) {
+          seamFired = true;
+          signalLauncher('SIGKILL');
+        }
+      }
+    };
+    /** Kill every captured process still alive, each through its identity; returns how many. */
+    const killCaptured = (): number => owned.reduce((count, identity) => count + (killIdentity(identity) ? 1 : 0), 0);
+    /** The launcher has ended: kill each captured child still alive, and count it as an orphan. */
+    const endOrphans = (): void => {
+      const ended = killCaptured();
+      orphansEnded += ended;
+      orphanRecord.ended += ended;
+    };
+    /** A decided kill has sent every signal it will send. */
+    const killComplete = (): void => {
+      killSent = true;
+      // PL-26 hold-startup seam: a held start-up may go on only now.
+      if (seam === 'hold-startup') seamStream?.destroy();
+      settleIfGone();
+    };
     const kill = (reason: NonNullable<typeof killedFor>): void => {
       if (killedFor === null) killedFor = reason;
-      child.kill('SIGKILL');
+      if (killing) return;
+      killing = true;
+      const launcher = child.pid;
+      if (launcher === undefined || !launcherUnreaped()) {
+        endOrphans();
+        return killComplete();
+      }
+      signalLauncher('SIGSTOP');
+      const stopSent = Date.now();
+      const step = (): void => {
+        stopTimer = null;
+        if (!launcherUnreaped()) {
+          // The launcher ended meanwhile: its captured children are orphans.
+          endOrphans();
+          return killComplete();
+        }
+        const state = statByPid(launcher)?.state;
+        const stopped = state === 'T' || state === 't';
+        if (!stopped && Date.now() - stopSent < STOP_GRACE_MS) {
+          stopTimer = setTimeout(step, 1);
+          return;
+        }
+        // Stopped: the launcher can neither fork nor reap, so its children are complete and
+        // each one's pid stays allocated to it. Capture them all, then kill each one. If it is
+        // not stopped within the grace, the children captured so far are killed all the same.
+        // Either way the launcher is killed next, so it is never left stopped.
+        if (stopped) captureChildren();
+        stopMs = Date.now() - stopSent;
+        killCaptured();
+        signalLauncher('SIGKILL');
+        killComplete();
+      };
+      // The stop may already have landed; otherwise check again every millisecond (a timer).
+      step();
     };
     const poller = setInterval(() => {
+      if (closed !== null) return settleIfGone();
       if (child.pid === undefined) return;
+      if (!killing) captureChildren();
       const now = Date.now();
       if (now - scanned >= RESCAN_MS) {
         tree = [child.pid, ...descendants(child.pid)];
@@ -697,10 +983,26 @@ function runChild(
       settled = true;
       clearInterval(poller);
       clearTimeout(wall);
+      if (stopTimer !== null) {
+        // Only an unexpected settle (a child 'error') could land here with a stop pending:
+        // finish the kill rather than leave the launcher stopped.
+        clearTimeout(stopTimer);
+        stopTimer = null;
+        killCaptured();
+        signalLauncher('SIGKILL');
+      }
+      for (const identity of owned) {
+        try {
+          closeSync(identity.fd);
+        } catch {
+          // already closed
+        }
+      }
       resolveOutcome(outcome);
     };
 
     child.stdout.on('data', (chunk: Buffer) => {
+      if (killedFor !== null) outputAfterKill += chunk.length;
       if (killedFor === 'report-size') return;
       stdoutBytes += chunk.length;
       if (stdoutBytes > budget.bytes) {
@@ -712,33 +1014,59 @@ function runChild(
     });
     child.stderr.setEncoding('latin1');
     child.stderr.on('data', (chunk: string) => {
+      if (killedFor !== null) outputAfterKill += chunk.length; // latin1: one character per byte
       if (stderr.length < MAX_STDERR_BYTES) stderr += chunk.slice(0, MAX_STDERR_BYTES - stderr.length);
     });
     child.stdin.on('error', () => {
       // The child may exit before reading all input (early rejection or a kill).
     });
     child.on('error', () => finish(failure('the parse child could not be started', label)));
+    child.on('exit', () => {
+      // The launcher has been reaped. Without a decided kill, a captured child still alive
+      // outlived it (the launcher exited or was killed first): end it through its identity.
+      if (!killing) endOrphans();
+      settleIfGone();
+    });
     child.on('close', (code, signal) => {
+      closed = { code, signal };
+      settleIfGone();
+    });
+
+    /**
+     * Settle only once the sandbox is gone: the child's stdio has closed, a decided kill has
+     * sent all its signals, and every captured child has terminated. A terminated namespace
+     * init means its namespace, the worker included, is gone. Until then the poller calls this
+     * every POLL_MS.
+     */
+    const settleIfGone = (): void => {
+      if (settled) return;
+      const done = closed;
+      if (done === null || (killing && !killSent)) return;
+      if (!owned.every((identity) => terminated(statByHandle(identity.fd)))) return;
+      hooks.observe?.(Object.freeze({ kill: killedFor, output_after_kill: outputAfterKill, orphans_ended: orphansEnded, stop_ms: stopMs }));
+      finish(outcomeAfterClose(done.code, done.signal));
+    };
+    const outcomeAfterClose = (code: number | null, signal: NodeJS.Signals | null): ParseOutcome => {
       // The child refuses a document whose report would exceed the budget, so a longer report
       // comes only from a broken or lying child (LBR3-1).
-      if (killedFor === 'report-size') return finish(failure('the parse child sent more than the report budget', label));
-      if (killedFor !== null) return finish(reject('resource-limit', killedFor, label));
-      if (/heap out of memory|Reached heap limit|Allocation failed/i.test(stderr)) return finish(reject('resource-limit', 'memory', label));
-      if (signal === 'SIGKILL' || signal === 'SIGXCPU' || (code !== null && KILLED_EXIT_CODES.has(code))) return finish(reject('resource-limit', 'cpu', label));
-      if (code !== 0) return finish(failure(`the parse child exited with ${signal ?? `status ${code}`}`, label));
+      if (killedFor === 'report-size') return failure('the parse child sent more than the report budget', label);
+      if (killedFor !== null) return reject('resource-limit', killedFor, label);
+      if (/heap out of memory|Reached heap limit|Allocation failed/i.test(stderr)) return reject('resource-limit', 'memory', label);
+      if (signal === 'SIGKILL' || signal === 'SIGXCPU' || (code !== null && KILLED_EXIT_CODES.has(code))) return reject('resource-limit', 'cpu', label);
+      if (code !== 0) return failure(`the parse child exited with ${signal ?? `status ${code}`}`, label);
       let parsed: unknown;
       try {
         const text = Buffer.concat(stdout, stdoutBytes).toString('utf8');
         stdout.length = 0;
         parsed = JSON.parse(text);
       } catch {
-        return finish(failure('the parse child returned no valid result', label));
+        return failure('the parse child returned no valid result', label);
       }
       const result = validateChildResult(parsed, bytes.length, parser.maxPages, parser.maxDepth, budget.nodes);
-      if (result === null) return finish(failure('the parse child returned an invalid report', label));
-      if (!result.ok) return finish(reject(result.reason, result.detail, label, result.detections));
-      return finish({ ok: true, status: 200, report: { ...result.report, digest, network_sandbox: label }, network_sandbox: label });
-    });
+      if (result === null) return failure('the parse child returned an invalid report', label);
+      if (!result.ok) return reject(result.reason, result.detail, label, result.detections);
+      return { ok: true, status: 200, report: { ...result.report, digest, network_sandbox: label }, network_sandbox: label };
+    };
 
     child.stdin.end(bytes);
   });
@@ -751,7 +1079,7 @@ function checkOptions(options: unknown): ParseOptions {
   return options as ParseOptions;
 }
 
-const PRODUCTION: Runner = Object.freeze({ kinds: LAUNCHER_KINDS, entry: WORKER_ENTRY });
+const PRODUCTION: Runner = Object.freeze({ kinds: LAUNCHER_KINDS, entry: WORKER_ENTRY, hooks: NO_HOOKS });
 
 /**
  * Parse a PDF in the sandboxed child. Options are `limits` and `service` only; anything
@@ -772,26 +1100,54 @@ export interface TestServiceOptions {
   readonly workerEntry?: string;
   /** Probe only these launchers (narrowing only: an unusable set refuses). */
   readonly launchers?: readonly LauncherKind[];
+  /** PL-26: one test-only launch seam (see LaunchSeam). */
+  readonly seam?: LaunchSeam;
 }
 
 export interface TestParseService {
   plan(): Promise<ServicePlan>;
   parse(input: Uint8Array | AsyncIterable<Uint8Array | string>, options?: ParseOptions): Promise<ParseOutcome>;
+  /** Lifecycles of this service's parse children, oldest first (at most LIFECYCLE_RECORDS). */
+  lifecycles(): readonly ChildLifecycle[];
+  /** With the channel seam: fd 3 of the next child this service launches. */
+  nextChannel(): Promise<Duplex>;
 }
 
 /**
- * Tests only (PL-13, PL-17, PL-18): the production launch with a replacement worker or a
- * narrowed launcher set. It cannot select an unsandboxed child, change the label, or read
- * the opt-in from anywhere but the process environment. Production callers use parsePdf().
+ * Tests only (PL-13, PL-17, PL-18, PL-26): the production launch with a replacement worker, a
+ * narrowed launcher set, or one test-only launch seam. It cannot select an unsandboxed child,
+ * change the label, or read the opt-in from anywhere but the process environment.
+ * lifecycles() only observes. Production callers use parsePdf().
  */
 export function createParseServiceForTests(options: TestServiceOptions = {}): TestParseService {
   const entry = options.workerEntry ?? WORKER_ENTRY;
   if (!isAbsolute(entry) || !lstatSync(entry).isFile()) throw new TypeError('workerEntry must be an absolute path to a regular file');
   const kinds = options.launchers ?? LAUNCHER_KINDS;
   if (!Array.isArray(kinds) || !kinds.every((kind) => LAUNCHER_KINDS.includes(kind))) throw new TypeError('launchers must be a subset of bwrap and util-linux');
-  const runner: Runner = Object.freeze({ kinds: LAUNCHER_KINDS.filter((kind) => kinds.includes(kind)), entry });
+  const seam = options.seam ?? null;
+  if (seam !== null && !LAUNCH_SEAMS.includes(seam)) throw new TypeError('seam must be hold-startup, orphan-launcher or channel');
+  const records: ChildLifecycle[] = [];
+  const observe = (lifecycle: ChildLifecycle): void => {
+    records.push(lifecycle);
+    if (records.length > LIFECYCLE_RECORDS) records.shift();
+  };
+  const ready: Duplex[] = [];
+  const waiting: ((stream: Duplex) => void)[] = [];
+  const channel = (stream: Duplex): void => {
+    const waiter = waiting.shift();
+    if (waiter === undefined) ready.push(stream);
+    else waiter(stream);
+  };
+  const hooks: ChildHooks = Object.freeze({ seam, observe, channel });
+  const runner: Runner = Object.freeze({ kinds: LAUNCHER_KINDS.filter((kind) => kinds.includes(kind)), entry, hooks });
   return Object.freeze({
     plan: () => planFor(runner.kinds),
     parse: async (input: Uint8Array | AsyncIterable<Uint8Array | string>, parseOptions?: ParseOptions) => runParse(input, checkOptions(parseOptions), runner),
+    lifecycles: () => Object.freeze([...records]),
+    nextChannel: (): Promise<Duplex> => {
+      if (seam !== 'channel') return Promise.reject(new TypeError('nextChannel() needs the channel seam'));
+      const stream = ready.shift();
+      return stream === undefined ? new Promise<Duplex>((resolveStream) => waiting.push(resolveStream)) : Promise.resolve(stream);
+    },
   });
 }
