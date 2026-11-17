@@ -486,8 +486,10 @@ test('[ST-13] the schema bounds response_body at 256 KiB for every writer (migra
       assert.equal(fires.get(null).fires, 0, `${name}: NULL passes`);
     }
 
-    // UPDATE: rows are immutable (0004), and 0012 bounds the column on update too. With the
-    // immutability trigger dropped on this scratch store, only 0012 can refuse.
+    // UPDATE: rows are immutable (0004), and 0012 bounds the column on update too. With 0004
+    // present, an oversized update is answered first by 0012's update trigger, not by 0004 (both
+    // abort with errcode 1811, so the first assertion holds whichever answers). Once 0004's
+    // trigger is dropped on this scratch store, only 0012 can refuse, and its message is asserted.
     const update = raw.prepare('UPDATE idempotency_records SET response_body = ? WHERE key = ?');
     const updateOver = thrown(() => update.run(Buffer.alloc(BODY_LIMIT + 1, 0x62), 'raw-at-limit-00000001'));
     assert.equal(updateOver?.errcode, SQLITE_CONSTRAINT_TRIGGER, `an update to 262,145 bytes is refused: ${updateOver}`);
