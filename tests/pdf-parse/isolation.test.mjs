@@ -31,7 +31,7 @@ import { after, test } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import { DEFAULT_PARSER_LIMITS, DEFAULT_SERVICE_LIMITS } from '../../src/pdf/limits.ts';
-import { createParseServiceForTests, parseOrphans, parsePdf, WORKER_ENTRY, workerCommand } from '../../src/pdf/service.ts';
+import { createParseServiceForTests, parseOrphans, parsePdf, parseStopsPastCap, WORKER_ENTRY, workerCommand } from '../../src/pdf/service.ts';
 import { heavyDocument } from './pdf-builder.mjs';
 import { fixtureBytes, REPO } from './support.mjs';
 
@@ -126,6 +126,83 @@ function handleState(fd) {
   } catch {
     return 'reaped';
   }
+}
+
+/** /proc status of the process a handle names: its state letter and thread count, or 'reaped'. */
+function handleStatus(fd) {
+  try {
+    const text = readFileSync(`/proc/self/fd/${fd}/status`, 'latin1');
+    return { state: /^State:\s+(\S)/m.exec(text)?.[1], threads: Number(/^Threads:\s+(\d+)/m.exec(text)?.[1]) };
+  } catch {
+    return 'reaped';
+  }
+}
+
+/** Terminated as the service settles (A-010 request #20): reaped, or a zombie with one thread. */
+const terminatedStatus = (status) => status === 'reaped' || ((status.state === 'Z' || status.state === 'X') && status.threads === 1);
+
+/** The tasks of a process (through its handle) that can still run: every thread not a zombie. */
+function runnableTasks(fd) {
+  let tids;
+  try {
+    tids = readdirSync(`/proc/self/fd/${fd}/task`);
+  } catch {
+    return [];
+  }
+  const runnable = [];
+  for (const tid of tids) {
+    try {
+      const text = readFileSync(`/proc/self/fd/${fd}/task/${tid}/stat`, 'latin1');
+      const state = text.slice(text.lastIndexOf(')') + 2).split(' ')[0];
+      if (state !== 'Z' && state !== 'X') runnable.push(`${tid}:${state}`);
+    } catch {
+      // that task is gone
+    }
+  }
+  return runnable;
+}
+
+/**
+ * Runnable tasks of a process the service killed, by its recorded identity (pid and start time):
+ * none once it is reaped (its pid is gone, or names a process with another start time).
+ */
+function runnableIdentity({ pid, start }) {
+  let text;
+  try {
+    text = readFileSync(`/proc/${pid}/stat`, 'latin1');
+  } catch {
+    return [];
+  }
+  if (text.slice(text.lastIndexOf(')') + 2).split(' ')[19] !== start) return [];
+  let fd;
+  try {
+    fd = openSync(`/proc/${pid}`, 'r');
+  } catch {
+    return [];
+  }
+  try {
+    return runnableTasks(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** This process's own descendants, found through each process's /proc children record. */
+function ownTree() {
+  const found = [];
+  const queue = [process.pid];
+  while (queue.length > 0) {
+    const pid = queue.shift();
+    let children = [];
+    try {
+      children = childrenOf(pid);
+    } catch {
+      // gone
+    }
+    found.push(...children);
+    queue.push(...children);
+  }
+  return found;
 }
 
 /** No process of a test sandbox is left (D2): the launcher, the namespace init and the worker. */
@@ -449,17 +526,100 @@ test('[PL-26] a captured child that outlives its launcher is ended through its c
   assert.deepEqual([outcome.status, outcome.reason, outcome.detail], [422, 'resource-limit', 'cpu']);
 });
 
+test('[PL-26] a launcher still unstopped past the stop cap while it forks a late child: the late child is ended through its identity, and the launcher is killed only once stopped (A-010 request #20)', async (t) => {
+  // The late-fork seam holds the launcher (a held /bin/sh) unstopped past STOP_GRACE_MS: on the
+  // decided kill, the service tells it to fork a late child, which the service has not
+  // captured, and sends the stop only after twice the cap. Its two children sleep without CPU
+  // and do not end by themselves within the test (80 s), and the launcher waits on fd 3 for
+  // good, so only the service's kills can end them. They hold the child's stdio, so the call
+  // can settle only once they are gone.
+  assertTimingOrder();
+  const held = createParseServiceForTests({ seam: 'late-fork' });
+  // For the hang guard's message only: every descendant of this process seen during the parse,
+  // by identity (pid and start time), so a survivor reparented away is still named.
+  const seen = new Map();
+  const record = setInterval(() => {
+    for (const pid of ownTree()) {
+      if (seen.has(pid)) continue;
+      try {
+        const text = readFileSync(`/proc/${pid}/stat`, 'latin1');
+        seen.set(pid, { pid, start: text.slice(text.lastIndexOf(')') + 2).split(' ')[19] });
+      } catch {
+        // gone
+      }
+    }
+  }, 10);
+  const seenAlive = () => [...seen.values()].filter((identity) => runnableIdentity(identity).length > 0).map(({ pid }) => pid);
+  // The process-wide count of stops past the cap (A-010 request #21), as a before/after delta.
+  const stopsBefore = parseStopsPastCap().stops_past_cap;
+  let timed;
+  try {
+    timed = await timedParse(
+      () => held.parse(Buffer.from('late-fork input'), { service: { cpuMs: 60_000, wallMs: WALL_MS } }),
+      `the late-fork launcher's parse at wall ${WALL_MS} ms`,
+      seenAlive,
+    );
+  } finally {
+    clearInterval(record);
+  }
+  const { outcome, elapsed } = timed;
+  const lifecycles = held.lifecycles();
+  assert.equal(lifecycles.length, 1, 'one parse child');
+  const [lifecycle] = lifecycles;
+  t.diagnostic(
+    `late-fork: the parse call took ${ms(elapsed)}; launcher stop to sandbox signals ${lifecycle.stop_ms} ms (the seam defers the stop by twice the cap); ` +
+      `late child ${lifecycle.late_child}; killed through identity: [${lifecycle.killed.map(({ pid }) => pid).join(', ')}]`,
+  );
+  assert.equal(lifecycle.kill, 'wall-time', 'the wall limit decided the kill');
+  assert.equal(lifecycle.stop_past_cap, true, 'the launcher was still unstopped after the stop cap (the hold worked)');
+  const stopsDelta = parseStopsPastCap().stops_past_cap - stopsBefore;
+  assert.equal(stopsDelta, 1, `the process-wide count of stops past the cap rose by ${stopsDelta}, as the lifecycle record says (1)`);
+  assert.ok(Number.isSafeInteger(lifecycle.late_child) && lifecycle.late_child > 0, 'the held launcher forked and reported a late child');
+  assert.ok(
+    lifecycle.killed.some(({ pid }) => pid === lifecycle.late_child),
+    `the late child ${lifecycle.late_child} was ended through its captured identity, but the service killed only [${lifecycle.killed.map(({ pid }) => pid).join(', ')}]`,
+  );
+  assert.equal(lifecycle.launcher_kill, 'stopped', 'the launcher was SIGKILLed only once it was observed stopped');
+  for (const identity of lifecycle.killed) {
+    assert.deepEqual(runnableIdentity(identity), [], `nothing runnable after settlement: the killed child ${identity.pid} still has runnable tasks`);
+  }
+  assert.deepEqual(ownTree(), [], 'none of this process own descendants is left');
+  assert.equal(lifecycle.orphans_ended, 0, 'the launcher was killed after its stop, so no child outlived it');
+  resourceRejection(outcome, 'wall-time', `late-fork launcher, wall ${WALL_MS} ms (parse call ${ms(elapsed)})`, ownTree);
+  assert.ok(elapsed < DEFAULT_WALL_MS, `the late child and the launcher were ended within one default wall period: the parse call took ${ms(elapsed)}, bound ${DEFAULT_WALL_MS} ms`);
+});
+
+test('[PL-26] the settle predicate counts a captured child as terminated only when reaped, or a zombie with one thread (A-010 request #20)', () => {
+  // The service's own predicate, applied to synthetic /proc status text (null means reaped). A
+  // zombie leader whose other threads still run, as a multithreaded Node init can be, must not
+  // count.
+  const service = createParseServiceForTests();
+  const status = (state, threads) =>
+    `Name:\tnode\nUmask:\t0022\nState:\t${state}\nTgid:\t7\nPid:\t7\nPPid:\t1\n${threads === undefined ? '' : `Threads:\t${threads}\n`}SigPnd:\t0000000000000000\n`;
+  assert.equal(service.terminatedForSettle(null), true, 'reaped');
+  assert.equal(service.terminatedForSettle(status('Z (zombie)', 1)), true, 'a zombie with one thread');
+  assert.equal(service.terminatedForSettle(status('X (dead)', 1)), true, 'a dead task being released, with one thread');
+  assert.equal(service.terminatedForSettle(status('Z (zombie)', 3)), false, 'a zombie leader whose other threads still run is NOT terminated');
+  assert.equal(service.terminatedForSettle(status('Z (zombie)', 0)), false, 'a zombie whose thread count could not be read does not count');
+  assert.equal(service.terminatedForSettle(status('Z (zombie)', undefined)), false, 'a status without a thread count does not count');
+  for (const state of ['R (running)', 'S (sleeping)', 'D (disk sleep)', 'T (stopped)', 't (tracing stop)']) {
+    assert.equal(service.terminatedForSettle(status(state, 1)), false, `${state} is not terminated`);
+  }
+});
+
 test('[PL-26] the kill reaches the sandbox as launched: the launcher stays in the service process group, its only child is the namespace init, and the worker lives in that namespace', async (t) => {
   // Read from the live tree of a real launch, under each launcher this host can use. The probe
   // worker says `started` over the channel seam and then waits for the test to close it, so the
   // tree is read at a known point. The normal teardown is then checked by properties (A-010
-  // request #17), the same under both launchers: (a) the normal outcome; (b) no limit-decided
-  // kill; (c) the captured init has terminated by settlement (reaped, or a zombie, which is the
-  // service's own settle condition) and is reaped within one default wall period of the channel
-  // closing; (d) nothing runnable after settlement; (e) the process-wide orphan count rose by
-  // exactly the lifecycle record's ended children. No orphan count is presumed: in a normal bwrap
-  // teardown the launcher can exit before its namespace init, which then already has its death
-  // signal pending, and the service ends it through its identity (observed, O1).
+  // requests #17 and #20), the same under both launchers: (a) the normal outcome; (b) no
+  // limit-decided kill; (c) the captured init has terminated by settlement as the service
+  // settles (reaped, or a zombie with one thread, read through the captured handle), and is
+  // reaped within one default wall period of the channel closing; (d) nothing runnable after
+  // settlement, read through the captured identities (launcher, init, worker) and their task
+  // entries, never command lines; (e) the process-wide orphan count rose by exactly the
+  // lifecycle record's ended children. No orphan count is presumed: in a normal bwrap teardown
+  // the launcher can exit before its namespace init, which then already has its death signal
+  // pending, and the service ends it through its identity (observed, O1).
   const self = procStat(process.pid);
   let checked = 0;
   for (const kind of ['bwrap', 'util-linux']) {
@@ -479,6 +639,8 @@ test('[PL-26] the kill reaches the sandbox as launched: the launcher stays in th
     settledFirst.catch(() => {});
     const channel = await withinGuard(Promise.race([probe.nextChannel(), settledFirst]), `the structure probe's launch under ${kind}`);
     let initHandle = null;
+    /** Handles on every captured identity of this sandbox: the launcher, the init and the worker. */
+    const handles = [];
     let endedAt = Number.NaN;
     try {
       const line = await withinGuard(readLine(channel, `the structure probe under ${kind}`), `the structure probe's start under ${kind}`);
@@ -493,6 +655,9 @@ test('[PL-26] the kill reaches the sandbox as launched: the launcher stays in th
       const i = procStat(init);
       const launcher = i.ppid;
       const l = procStat(launcher);
+      handles.push({ role: 'launcher', fd: openSync(`/proc/${launcher}`, 'r') });
+      handles.push({ role: 'init', fd: openSync(`/proc/${init}`, 'r') });
+      if (worker !== init) handles.push({ role: 'worker', fd: openSync(`/proc/${worker}`, 'r') });
       t.diagnostic(
         `${kind}: service ${process.pid} pgrp=${self.pgrp} session=${self.session}; launcher ${launcher} ppid=${l.ppid} pgrp=${l.pgrp} session=${l.session}; ` +
           `init ${init} pgrp=${i.pgrp} session=${i.session} NSpid=${nsPids(init).join('/')}; worker ${worker} pgrp=${w.pgrp} session=${w.session} NSpid=${nsPids(worker).join('/')}`,
@@ -526,30 +691,31 @@ test('[PL-26] the kill reaches the sandbox as launched: the launcher stays in th
       const outcome = await withinGuard(pending, `the structure probe's parse under ${kind}`);
       // Read at settlement, before anything else.
       const settledMs = performance.now() - endedAt;
-      const initAtSettle = handleState(initHandle);
-      const sandboxAtSettle = liveProcessesNaming(probeWorker.real);
+      const initAtSettle = handleStatus(initHandle);
+      const runnableAtSettle = handles.map(({ role, fd }) => ({ role, runnable: runnableTasks(fd) }));
       const orphansDelta = parseOrphans().orphans_ended - orphansBefore;
       const lifecycle = probe.lifecycles().at(-1);
       let reapedMs = initAtSettle === 'reaped' ? settledMs : Number.NaN;
       while (handleState(initHandle) !== 'reaped' && performance.now() - endedAt < DEFAULT_WALL_MS) await sleep(10);
       if (Number.isNaN(reapedMs) && handleState(initHandle) === 'reaped') reapedMs = performance.now() - endedAt;
+      const initText = initAtSettle === 'reaped' ? 'reaped' : `state ${initAtSettle.state}, Threads ${initAtSettle.threads}`;
       t.diagnostic(
-        `${kind}: normal teardown settled ${ms(settledMs)} after the channel closed; captured init at settlement: ${initAtSettle}; ` +
+        `${kind}: normal teardown settled ${ms(settledMs)} after the channel closed; captured init at settlement: ${initText}; ` +
           `reaped by ${ms(reapedMs)}; orphans_ended=${lifecycle?.orphans_ended} (process-wide count +${orphansDelta})`,
       );
       assert.deepEqual([outcome.status, outcome.reason, outcome.detail], [422, 'malformed', 'PL-26 structure probe'], `${kind}: (a) the normal outcome`);
       assert.equal(lifecycle?.kill, null, `${kind}: (b) no limit-decided kill in a normal run`);
-      assert.ok(
-        ['reaped', 'Z', 'X'].includes(initAtSettle),
-        `${kind}: (c, d) the captured init has terminated by settlement and cannot run, but it was in state ${initAtSettle}`,
-      );
-      assert.deepEqual(sandboxAtSettle, [], `${kind}: (d) when the parse settles, no process of its sandbox (launcher, namespace init, worker) is left`);
+      assert.ok(terminatedStatus(initAtSettle), `${kind}: (c) the captured init had terminated by settlement (reaped, or a zombie with one thread), but it was ${initText}`);
+      for (const { role, runnable } of runnableAtSettle) {
+        assert.deepEqual(runnable, [], `${kind}: (d) nothing of the sandbox is runnable after settlement: the captured ${role} still has runnable tasks`);
+      }
       assert.ok(settledMs < DEFAULT_WALL_MS, `${kind}: (c) the normal teardown settled within one default wall period (${ms(settledMs)}, bound ${DEFAULT_WALL_MS} ms)`);
       assert.ok(reapedMs < DEFAULT_WALL_MS, `${kind}: (c) the captured init was reaped within one default wall period of the channel closing (${ms(reapedMs)}, bound ${DEFAULT_WALL_MS} ms)`);
       assert.equal(orphansDelta, lifecycle?.orphans_ended, `${kind}: (e) the process-wide orphan count rose by exactly the lifecycle record's ended children`);
       assert.ok(lifecycle.orphans_ended <= 1, `${kind}: at most the launcher's one captured child was ended`);
     } finally {
       if (initHandle !== null) closeSync(initHandle);
+      for (const { fd } of handles) closeSync(fd);
     }
   }
   assert.ok(checked > 0, 'the structure of at least one launcher was read');

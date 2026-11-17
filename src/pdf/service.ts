@@ -27,13 +27,20 @@
 //   the launcher is the init of the sandbox's PID namespace: bwrap's, or the process unshare
 //   forks. Under bwrap, --new-session runs in that init, which leads its own session and process
 //   group; the worker is the init's child, in its namespace, session and group. The kill uses no
-//   group or session membership. It first stops the launcher (SIGSTOP). A stopped process can neither fork nor reap, so its children
-//   are then complete, and each child's pid stays allocated to that child. The kill captures
-//   and kills each child, then kills the launcher. An init's death ends every process in its
-//   namespace, and nothing can start after the decision: the stopped launcher cannot fork, and
-//   a killed child cannot either. If the launcher has not stopped within STOP_GRACE_MS, its
-//   captured children are killed through their identities all the same. Either way the
-//   launcher is killed next, so it is never left stopped.
+//   group or session membership. It first stops the launcher (SIGSTOP). A stopped process can
+//   neither fork nor reap, so its children are then complete, and each child's pid stays
+//   allocated to that child. The kill captures and kills each child, then kills the launcher.
+//   An init's death ends every process in its namespace, and nothing can start after the
+//   decision: the stopped launcher cannot fork, and a killed child cannot either.
+// - The launcher is SIGKILLed only once it is observed stopped, or after it has exited, so it
+//   is never left stopped and never killed while it could still fork unseen (A-010 request #20).
+//   If its stop is still pending after STOP_GRACE_MS (in practice, uninterruptible sleep), every
+//   poll tick captures its children again and kills each through its identity: a live launcher
+//   keeps its children capturable, because a child is reparented only when its parent exits.
+//   Such a launcher delays the kill, and so settlement, until it stops or exits (PL11-ESC-LIM
+//   (6)). parseStopsPastCap() is a read-only, process-wide count of stops still pending after
+//   the cap (A-010 request #21). While the stop is pending, the launcher can reap a child between
+//   capture and kill: the identity re-check runs immediately before each kill (PL11-ESC-LIM (1)).
 // - Ownership lease: an identity captured while ownership is proven. The launcher is signalled
 //   only while Node has not reaped it: until then its pid cannot be reused, because Linux keeps a
 //   pid while its task, live or zombie, holds it. A child of the launcher is captured only while
@@ -46,9 +53,12 @@
 //   killed first) is ended through its identity. parseOrphans() is a read-only, process-wide
 //   count of those ends (A-010 request #15).
 // - parsePdf() settles only once the sandbox is gone: the child's stdio has closed, a decided
-//   kill has sent all its signals, and every captured child has terminated (reaped, or a
-//   zombie, read through its handle). An exiting PID-namespace init first kills, and waits for,
-//   every other process of its namespace, so a terminated init means its worker is gone.
+//   kill has sent all its signals, and every captured child has terminated: reaped, or a zombie
+//   whose thread count is 1, both read through its handle (A-010 request #20). A zombie leader
+//   alone is not enough: the leader of a multithreaded process (util-linux's init is the Node
+//   worker) can be a zombie while its other threads still run. An exiting PID-namespace init
+//   first kills, and waits for, every other task of its namespace, so a terminated init means
+//   its worker is gone.
 // - Fail closed: without a launcher whose isolation the probe confirms, parsePdf() returns
 //   500 internal, reason sandbox-unavailable, and starts no child. The one exception is the
 //   explicit development opt-in OPENSIG_PARSER_ALLOW_UNSANDBOXED=1, read from the process
@@ -59,7 +69,8 @@
 //   createParseServiceForTests() exists for the tests; its options can only narrow the
 //   launchers (a narrowed set that is unusable refuses), replace the worker inside the
 //   same sandbox, or apply one test-only launch seam (PL-26: a held start-up, a launcher that
-//   ends first, or a channel to the worker), and never downgrade or relabel it.
+//   ends first, a channel to the worker, or a launcher held unstopped while it forks a late
+//   child), and never downgrade or relabel it.
 // - Every outcome carries `network_sandbox`: `netns+fs-enforced (local)` or `unavailable`.
 //   That is the locally observed capability; it never claims the production gate
 //   `parser-network-sandbox` passed (that gate needs deployment-environment evidence).
@@ -272,6 +283,18 @@ const orphanRecord = { ended: 0 };
  */
 export function parseOrphans(): { readonly orphans_ended: number } {
   return Object.freeze({ orphans_ended: orphanRecord.ended });
+}
+
+/** Decided kills whose launcher stop was still pending after STOP_GRACE_MS, over every parse child (A-010 PL11-ESC). */
+const stopRecord = { pastCap: 0 };
+
+/**
+ * The stop record (read-only; for monitoring and the tests, A-010 PL11-ESC, request #21): how many
+ * decided kills in this process found the launcher still unstopped after STOP_GRACE_MS. Each such
+ * kill counts once, exactly as its lifecycle `stop_past_cap`. A frozen copy.
+ */
+export function parseStopsPastCap(): { readonly stops_past_cap: number } {
+  return Object.freeze({ stops_past_cap: stopRecord.pastCap });
 }
 
 /** True when a parse arriving now would find every slot taken and the queue full. */
@@ -646,6 +669,17 @@ export interface ChildLifecycle {
    * was not stopped (no decided kill, or the launcher had already ended).
    */
   readonly stop_ms: number | null;
+  /** The launcher's stop was still pending after STOP_GRACE_MS (A-010 request #20). */
+  readonly stop_past_cap: boolean;
+  /**
+   * How the launcher ended after a decided kill: SIGKILLed once observed stopped ('stopped'), or
+   * it had already exited ('exited', so it was not signalled); null without a decided kill.
+   */
+  readonly launcher_kill: 'stopped' | 'exited' | null;
+  /** Every captured child the service SIGKILLed through its identity, in order. */
+  readonly killed: readonly { readonly pid: number; readonly start: string }[];
+  /** With the late-fork seam: the pid of the late child the held launcher reported, else null. */
+  readonly late_child: number | null;
 }
 
 /**
@@ -656,9 +690,14 @@ export interface ChildLifecycle {
  *   the service kills the launcher alone, so the stage outlives it as an orphan.
  * - channel: fd 3 passes through the unchanged launch into the sandbox, to the worker, so a
  *   test can synchronize with the worker.
+ * - late-fork: a held launcher that forks one child at once and waits on fd 3. On a decided
+ *   kill the service does not stop it at once: it tells it (fd 3) to fork a late child, and
+ *   waits for it to report that child; only then does the stop clock start, and the stop itself
+ *   is sent only after twice STOP_GRACE_MS. So the launcher stays unstopped past the cap with a
+ *   child the service has not captured (A-010 request #20).
  */
-export type LaunchSeam = 'hold-startup' | 'orphan-launcher' | 'channel';
-const LAUNCH_SEAMS: readonly LaunchSeam[] = Object.freeze(['hold-startup', 'orphan-launcher', 'channel']);
+export type LaunchSeam = 'hold-startup' | 'orphan-launcher' | 'channel' | 'late-fork';
+const LAUNCH_SEAMS: readonly LaunchSeam[] = Object.freeze(['hold-startup', 'orphan-launcher', 'channel', 'late-fork']);
 
 interface ChildHooks {
   readonly seam: LaunchSeam | null;
@@ -679,6 +718,15 @@ const NO_HOOKS: ChildHooks = Object.freeze({ seam: null, observe: null, channel:
  * inherits SIGINT and SIGQUIT ignored from that background job; the seams use SIGKILL only.
  */
 const HELD_STARTUP_SCRIPT = 'ulimit -t "$1" || exit 70; shift; exec 4<&0; ( read -r line <&3; exec 0<&4 3<&- 4<&- "$@" ) & exec 3<&- 4<&-; wait $!';
+
+/**
+ * The late-fork launch script. The shell forks an early child, waits for a line on fd 3, then
+ * forks a late child, reports its pid on fd 3, and waits on fd 3 again; it never exits by itself
+ * while fd 3 is open. Both children close fd 3 and sleep 80 s, a containment above the tests'
+ * hang guard: they never end within a test by themselves.
+ */
+const LATE_FORK_SCRIPT =
+  'ulimit -t "$1" || exit 70; shift; ( exec 3<&-; exec /bin/sleep 80 ) & read -r line <&3; ( exec 3<&-; exec /bin/sleep 80 ) & echo "forked $!" >&3; read -r line <&3';
 
 /** Lifecycles kept per test service (createParseServiceForTests). */
 const LIFECYCLE_RECORDS = 16;
@@ -723,8 +771,29 @@ function statByHandle(fd: number): ProcStat | null {
   }
 }
 
-/** Terminated: reaped (no stat through the handle), or a zombie that can never run again. */
-const terminated = (stat: ProcStat | null): boolean => stat === null || stat.state === 'Z' || stat.state === 'X';
+/** /proc/<pid>/status read through a captured handle, or null once that process has been reaped. */
+function statusByHandle(fd: number): string | null {
+  try {
+    return readFileSync(`/proc/self/fd/${fd}/status`, 'latin1');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The settle predicate (A-010 request #20), on /proc status text (null: reaped). Terminated means
+ * reaped, or a zombie (or a dead task being released) whose thread count is 1. A zombie leader
+ * with other threads still counted is a process that can still run. Missing fields never count.
+ */
+function terminatedFromStatus(status: string | null): boolean {
+  if (status === null) return true;
+  const state = /^State:\s+(\S)/m.exec(status)?.[1];
+  const threads = /^Threads:\s+(\d+)\s*$/m.exec(status)?.[1];
+  return (state === 'Z' || state === 'X') && threads === '1';
+}
+
+/** The settle predicate for a captured process, read through its handle. */
+const terminatedByHandle = (fd: number): boolean => terminatedFromStatus(statusByHandle(fd));
 
 /**
  * The children of `pid`, from its own /proc record; on a kernel without that record, from the
@@ -751,7 +820,7 @@ function captureIdentity(pid: number, parent: number): Identity | null {
     return null;
   }
   const stat = statByHandle(fd);
-  if (stat === null || terminated(stat) || stat.ppid !== parent) {
+  if (stat === null || terminatedByHandle(fd) || stat.ppid !== parent) {
     closeSync(fd);
     return null;
   }
@@ -763,7 +832,7 @@ function captureIdentity(pid: number, parent: number): Identity | null {
  * shows its start time. True when the signal was sent.
  */
 function killIdentity(identity: Identity): boolean {
-  if (terminated(statByHandle(identity.fd))) return false;
+  if (terminatedByHandle(identity.fd)) return false;
   if (statByPid(identity.pid)?.start !== identity.start) return false;
   try {
     process.kill(identity.pid, 'SIGKILL');
@@ -848,7 +917,7 @@ function runChild(
     const seam = hooks.seam;
     const held = seam === 'hold-startup' || seam === 'orphan-launcher';
     const stdio: StdioOptions = seam === null ? ['pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe', 'pipe'];
-    const argv = held ? ['-c', HELD_STARTUP_SCRIPT, ...args.slice(2)] : args;
+    const argv = held ? ['-c', HELD_STARTUP_SCRIPT, ...args.slice(2)] : seam === 'late-fork' ? ['-c', LATE_FORK_SCRIPT, ...args.slice(2)] : args;
     const child = spawn(file, argv, { cwd: dirname(WORKER_ENTRY), env: {}, stdio }) as ChildProcessByStdio<Writable, Readable, Readable>;
     // A seam's fd 3 (tests only). A socket error on it must never crash the service.
     const seamStream = seam === null ? null : (child.stdio[3] as Duplex | null);
@@ -867,6 +936,12 @@ function runChild(
     let killSent = false;
     let stopTimer: ReturnType<typeof setTimeout> | null = null;
     let stopMs: number | null = null;
+    let stopPastCap = false;
+    let launcherKill: 'stopped' | 'exited' | null = null;
+    /** Captured children SIGKILLed through their identity (the lifecycle record). */
+    const killed: { readonly pid: number; readonly start: string }[] = [];
+    let lateChild: number | null = null;
+    let deferredStop: ReturnType<typeof setTimeout> | null = null;
     let seamFired = false;
     const stdout: Buffer[] = [];
     let stdoutBytes = 0;
@@ -893,7 +968,7 @@ function runChild(
       const launcher = child.pid;
       if (launcher === undefined || !launcherUnreaped()) return;
       for (const pid of childrenOf(launcher)) {
-        if (owned.some((identity) => identity.pid === pid && !terminated(statByHandle(identity.fd)))) continue;
+        if (owned.some((identity) => identity.pid === pid && !terminatedByHandle(identity.fd))) continue;
         const identity = captureIdentity(pid, launcher);
         if (identity === null) continue;
         owned.push(identity);
@@ -905,7 +980,12 @@ function runChild(
       }
     };
     /** Kill every captured process still alive, each through its identity; returns how many. */
-    const killCaptured = (): number => owned.reduce((count, identity) => count + (killIdentity(identity) ? 1 : 0), 0);
+    const killCaptured = (): number =>
+      owned.reduce((count, identity) => {
+        if (!killIdentity(identity)) return count;
+        killed.push(Object.freeze({ pid: identity.pid, start: identity.start }));
+        return count + 1;
+      }, 0);
     /** The launcher has ended: kill each captured child still alive, and count it as an orphan. */
     const endOrphans = (): void => {
       const ended = killCaptured();
@@ -919,42 +999,79 @@ function runChild(
       if (seam === 'hold-startup') seamStream?.destroy();
       settleIfGone();
     };
+    /**
+     * PL-26 late-fork seam: the decided kill does not stop the launcher yet. It tells the held
+     * launcher (fd 3) to fork a late child and waits for its report; the stop clock starts then,
+     * and the stop itself is sent only after twice STOP_GRACE_MS.
+     */
+    const holdForLateFork = (stream: Duplex, awaitStop: (stopSent: number) => void): void => {
+      let reply = '';
+      stream.on('data', (chunk: Buffer) => {
+        if (lateChild !== null) return;
+        reply += chunk.toString('latin1');
+        const match = /^forked (\d+)$/m.exec(reply);
+        if (match === null) return;
+        lateChild = Number(match[1]);
+        deferredStop = setTimeout(() => {
+          deferredStop = null;
+          signalLauncher('SIGSTOP');
+        }, 2 * STOP_GRACE_MS);
+        awaitStop(Date.now());
+      });
+      stream.write('fork\n');
+    };
     const kill = (reason: NonNullable<typeof killedFor>): void => {
       if (killedFor === null) killedFor = reason;
       if (killing) return;
       killing = true;
       const launcher = child.pid;
       if (launcher === undefined || !launcherUnreaped()) {
+        launcherKill = 'exited';
         endOrphans();
         return killComplete();
       }
-      signalLauncher('SIGSTOP');
-      const stopSent = Date.now();
-      const step = (): void => {
-        stopTimer = null;
-        if (!launcherUnreaped()) {
-          // The launcher ended meanwhile: its captured children are orphans.
-          endOrphans();
-          return killComplete();
-        }
-        const state = statByPid(launcher)?.state;
-        const stopped = state === 'T' || state === 't';
-        if (!stopped && Date.now() - stopSent < STOP_GRACE_MS) {
-          stopTimer = setTimeout(step, 1);
-          return;
-        }
-        // Stopped: the launcher can neither fork nor reap, so its children are complete and
-        // each one's pid stays allocated to it. Capture them all, then kill each one. If it is
-        // not stopped within the grace, the children captured so far are killed all the same.
-        // Either way the launcher is killed next, so it is never left stopped.
-        if (stopped) captureChildren();
-        stopMs = Date.now() - stopSent;
-        killCaptured();
-        signalLauncher('SIGKILL');
-        killComplete();
+      /** Wait for the stop sent at `stopSent`; the launcher is SIGKILLed only once it is stopped. */
+      const awaitStop = (stopSent: number): void => {
+        const step = (): void => {
+          stopTimer = null;
+          const state = launcherUnreaped() ? statByPid(launcher)?.state : 'gone';
+          if (state === 'gone' || state === 'Z' || state === 'X') {
+            // The launcher exited meanwhile (reaped, or a zombie Node has not reaped yet): its
+            // children were reparented when it exited, so the captured ones still alive are orphans.
+            launcherKill = 'exited';
+            endOrphans();
+            return killComplete();
+          }
+          if (state === 'T' || state === 't') {
+            // Stopped: the launcher can neither fork nor reap, so its children are complete and
+            // each one's pid stays allocated to it. Capture them all, kill each one, then kill
+            // the launcher, so it is never left stopped.
+            captureChildren();
+            stopMs = Date.now() - stopSent;
+            killCaptured();
+            launcherKill = 'stopped';
+            signalLauncher('SIGKILL');
+            return killComplete();
+          }
+          const pastCap = Date.now() - stopSent >= STOP_GRACE_MS;
+          if (pastCap) {
+            // Not stopped yet (in practice, uninterruptible sleep). It is alive, so its children
+            // are still its own: capture any new one and kill each through its identity, on every
+            // tick until it stops or exits (PL11-ESC-LIM (6)). It can reap a child between capture
+            // and kill; the identity re-check before each kill covers that (PL11-ESC-LIM (1)).
+            if (!stopPastCap) stopRecord.pastCap += 1;
+            stopPastCap = true;
+            captureChildren();
+            killCaptured();
+          }
+          stopTimer = setTimeout(step, pastCap ? POLL_MS : 1);
+        };
+        // The stop may already have landed; otherwise check again every millisecond (a timer).
+        step();
       };
-      // The stop may already have landed; otherwise check again every millisecond (a timer).
-      step();
+      if (seam === 'late-fork' && seamStream !== null) return holdForLateFork(seamStream, awaitStop);
+      signalLauncher('SIGSTOP');
+      awaitStop(Date.now());
     };
     const poller = setInterval(() => {
       if (closed !== null) return settleIfGone();
@@ -983,14 +1100,10 @@ function runChild(
       settled = true;
       clearInterval(poller);
       clearTimeout(wall);
-      if (stopTimer !== null) {
-        // Only an unexpected settle (a child 'error') could land here with a stop pending:
-        // finish the kill rather than leave the launcher stopped.
-        clearTimeout(stopTimer);
-        stopTimer = null;
-        killCaptured();
-        signalLauncher('SIGKILL');
-      }
+      // Settling needs a decided kill to have sent all its signals, and the 'error' handler never
+      // settles while one is pending, so no stop or deferred stop can be pending here.
+      if (deferredStop !== null) clearTimeout(deferredStop);
+      if (stopTimer !== null) clearTimeout(stopTimer);
       for (const identity of owned) {
         try {
           closeSync(identity.fd);
@@ -1020,7 +1133,13 @@ function runChild(
     child.stdin.on('error', () => {
       // The child may exit before reading all input (early rejection or a kill).
     });
-    child.on('error', () => finish(failure('the parse child could not be started', label)));
+    child.on('error', () => {
+      // Node emits 'error' when the spawn fails (no pid, so no stop is ever sent), or when kill()
+      // or send() on the child object fails, which this code never calls. A pending stop is
+      // never abandoned: the kill completes and settles as usual.
+      if (killing && !killSent) return;
+      finish(failure('the parse child could not be started', label));
+    });
     child.on('exit', () => {
       // The launcher has been reaped. Without a decided kill, a captured child still alive
       // outlived it (the launcher exited or was killed first): end it through its identity.
@@ -1042,8 +1161,19 @@ function runChild(
       if (settled) return;
       const done = closed;
       if (done === null || (killing && !killSent)) return;
-      if (!owned.every((identity) => terminated(statByHandle(identity.fd)))) return;
-      hooks.observe?.(Object.freeze({ kill: killedFor, output_after_kill: outputAfterKill, orphans_ended: orphansEnded, stop_ms: stopMs }));
+      if (!owned.every((identity) => terminatedByHandle(identity.fd))) return;
+      hooks.observe?.(
+        Object.freeze({
+          kill: killedFor,
+          output_after_kill: outputAfterKill,
+          orphans_ended: orphansEnded,
+          stop_ms: stopMs,
+          stop_past_cap: stopPastCap,
+          launcher_kill: launcherKill,
+          killed: Object.freeze([...killed]),
+          late_child: lateChild,
+        }),
+      );
       finish(outcomeAfterClose(done.code, done.signal));
     };
     const outcomeAfterClose = (code: number | null, signal: NodeJS.Signals | null): ParseOutcome => {
@@ -1111,13 +1241,16 @@ export interface TestParseService {
   lifecycles(): readonly ChildLifecycle[];
   /** With the channel seam: fd 3 of the next child this service launches. */
   nextChannel(): Promise<Duplex>;
+  /** The service's settle predicate applied to /proc status text (null: reaped); A-010 request #20. */
+  terminatedForSettle(status: string | null): boolean;
 }
 
 /**
  * Tests only (PL-13, PL-17, PL-18, PL-26): the production launch with a replacement worker, a
  * narrowed launcher set, or one test-only launch seam. It cannot select an unsandboxed child,
  * change the label, or read the opt-in from anywhere but the process environment.
- * lifecycles() only observes. Production callers use parsePdf().
+ * lifecycles() only observes, and terminatedForSettle() is a pure function of its argument.
+ * Production callers use parsePdf().
  */
 export function createParseServiceForTests(options: TestServiceOptions = {}): TestParseService {
   const entry = options.workerEntry ?? WORKER_ENTRY;
@@ -1125,7 +1258,7 @@ export function createParseServiceForTests(options: TestServiceOptions = {}): Te
   const kinds = options.launchers ?? LAUNCHER_KINDS;
   if (!Array.isArray(kinds) || !kinds.every((kind) => LAUNCHER_KINDS.includes(kind))) throw new TypeError('launchers must be a subset of bwrap and util-linux');
   const seam = options.seam ?? null;
-  if (seam !== null && !LAUNCH_SEAMS.includes(seam)) throw new TypeError('seam must be hold-startup, orphan-launcher or channel');
+  if (seam !== null && !LAUNCH_SEAMS.includes(seam)) throw new TypeError('seam must be hold-startup, orphan-launcher, channel or late-fork');
   const records: ChildLifecycle[] = [];
   const observe = (lifecycle: ChildLifecycle): void => {
     records.push(lifecycle);
@@ -1149,5 +1282,6 @@ export function createParseServiceForTests(options: TestServiceOptions = {}): Te
       const stream = ready.shift();
       return stream === undefined ? new Promise<Duplex>((resolveStream) => waiting.push(resolveStream)) : Promise.resolve(stream);
     },
+    terminatedForSettle: (status: string | null): boolean => terminatedFromStatus(status),
   });
 }
