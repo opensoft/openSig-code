@@ -8,7 +8,7 @@
 
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer, request } from 'node:http';
+import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { createOperatorAuthenticator, loadOperatorAuthConfig } from '../../src/api/auth/index.ts';
 import { openDatabase } from '../../src/storage/db/index.ts';
 import { ROUTES } from '../../src/api/routes.ts';
-import { createApp } from '../../src/server/app.ts';
+import { createApp, createAppServer } from '../../src/server/app.ts';
 import { loadServerConfig } from '../../src/server/config.ts';
 import { createLogger } from '../../src/server/redact.ts';
 
@@ -131,7 +131,8 @@ export async function serveApp({ handlers = {}, origins = ['http://127.0.0.1:1']
   const authenticator = auth ? createOperatorAuthenticator(loadOperatorAuthConfig(authInput())) : null;
   const config = loadServerConfig({ OPENSIG_PORT: '0' });
   const app = createApp({ routes, config, logger, authenticator, allowedOrigins: new Set(origins) });
-  const server = createServer(app.handle);
+  // Built as the entrypoint builds it (src/server/main.ts), client-error handling included.
+  const server = createAppServer(app);
   await new Promise((resolveListen) => server.listen({ host: '127.0.0.1', port: 0 }, resolveListen));
   const { port } = server.address();
   return {

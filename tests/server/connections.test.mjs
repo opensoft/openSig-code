@@ -6,8 +6,8 @@
 // that connection is parsed or dispatched: its handler never runs, it gets no response and
 // no `request` log line. That holds for a request that arrives later, for one already
 // buffered in the same packet, and after a request that itself asked for close (there Node's
-// parser already refuses any byte after the close request, answering 400 if no response was
-// written yet); ordinary keep-alive pipelining still works.
+// parser refuses any byte after the close request; since SEC-11 the close request still gets
+// its own response, see pipelining.test.mjs); ordinary keep-alive pipelining still works.
 // SEC-10: a request body that goes idle for 10 s, or arrives below the minimum rate once the
 // 10 s grace has passed, is answered with 408 and a connection close by a per-request timer
 // (not Node's 30 s check interval); a body that pauses for less than that is accepted.

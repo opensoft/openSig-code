@@ -19,11 +19,13 @@
 // - The review shell and static assets come from src/server/static.ts (T035) when that
 //   module exists. It must export createStaticHandler({ config }) returning a
 //   StaticHandler (src/server/types.ts).
+// - Both listeners are built with createAppServer (src/server/app.ts), so a parser error after
+//   a complete request never replaces its pending response with Node's 400 (SEC-11).
 // - Logs are JSON lines through the central redactor; the first is `listening`.
 // - SIGINT and SIGTERM close both listeners, remove the socket file and exit 0.
 
 import { chmodSync, existsSync, lstatSync, readFileSync, realpathSync, unlinkSync } from 'node:fs';
-import { createServer, type Server } from 'node:http';
+import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
@@ -31,7 +33,7 @@ import { loadOperatorAuthConfig } from '../api/auth/config.ts';
 import { createOperatorAuthenticator, type OperatorAuthenticator } from '../api/auth/operator.ts';
 import { openTenantPolicy, type TenantPolicySource } from './tenants.ts';
 import { ROUTES } from '../api/routes.ts';
-import { createApp } from './app.ts';
+import { createApp, createAppServer } from './app.ts';
 import { loadServerConfig, loopbackOrigin, ServerConfigError, type ServerConfig } from './config.ts';
 import { createLogger, type LogSink, type Logger } from './redact.ts';
 import type { StaticHandler } from './types.ts';
@@ -131,7 +133,7 @@ async function listenAll(config: ServerConfig, logger: Logger, authenticator: Op
   if (config.relaySocket !== null) prepareSocketPath(config.relaySocket);
 
   const app = createApp({ routes: ROUTES, config, logger, authenticator, allowedOrigins, staticHandler });
-  const server = hardened(createServer(app.handle));
+  const server = hardened(createAppServer(app));
   await listen(server, { host: config.host, port: config.port });
   const address = server.address() as AddressInfo;
   if (config.allowedOrigins === null) allowedOrigins.add(loopbackOrigin(address.address, address.port));
@@ -140,7 +142,7 @@ async function listenAll(config: ServerConfig, logger: Logger, authenticator: Op
   if (config.relaySocket !== null) {
     try {
       const relayApp = createApp({ routes: ROUTES, config, logger: logger.child({ listener: 'relay' }), authenticator, allowedOrigins, surface: 'relay' });
-      relay = hardened(createServer(relayApp.handle));
+      relay = hardened(createAppServer(relayApp));
       await listen(relay, { path: config.relaySocket });
       chmodSync(config.relaySocket, 0o600);
     } catch (error) {

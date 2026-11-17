@@ -28,10 +28,23 @@
 // Body timing (A-010 LBR4-1, SEC-10): when the per-request body timer (src/server/body.ts)
 // fires, the server answers 408 with `Connection: close` at once, whatever the handler is
 // doing; the handler's later result is ignored.
+//
+// Parser errors (A-010 LBR5-1, SEC-11): Node answers bytes its HTTP parser rejects with its own
+// canned 400 and destroys the socket, even when a request before those bytes was complete and
+// its handler is still working, so that request's response was lost. Pipelined bytes after a
+// `Connection: close` request, or extra bytes after a complete body, did that. The server's
+// 'clientError' handling (createAppServer) now keeps the pending response instead: when the
+// parser fails on bytes after a complete request whose response is still pending, nothing is
+// written; the parser is detached so nothing more is parsed, no request queued behind the
+// pending one is dispatched (as SEC-08), the pending response is sent with `Connection: close`,
+// and then the connection closes with the lingering close. Every other client error keeps
+// Node's default handling exactly: a malformed request with no response pending, or a
+// malformed body inside the request being handled, still gets Node's 400.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createServer, STATUS_CODES, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { performance } from 'node:perf_hooks';
+import type { Duplex } from 'node:stream';
 
 import { authorize, operationScheme, type OperationId } from '../api/auth/matrix.ts';
 import type { OperatorAuthenticator, OperatorPrincipal } from '../api/auth/operator.ts';
@@ -66,6 +79,8 @@ export interface AppOptions {
 
 export interface App {
   handle(req: IncomingMessage, res: ServerResponse): void;
+  /** The server's 'clientError' listener (SEC-11); createAppServer installs it. */
+  clientError(error: Error & { code?: string }, socket: Duplex): void;
   readonly locals: Map<string, unknown>;
 }
 
@@ -100,6 +115,7 @@ const LINGER_MS = 2_000;
 const LINGER_BYTES = 64 * 1024 * 1024;
 
 const detached = new WeakSet<Socket>();
+const lingering = new WeakMap<Socket, () => void>();
 
 /**
  * Detach the HTTP parser from `socket` (SEC-08): every later byte goes to `onData` only, so
@@ -117,32 +133,65 @@ function stopParsing(socket: Socket, onData: (chunk: Buffer) => void): void {
 }
 
 /**
- * Lingering close (RFC 9112 section 9.6) after an error response to a request whose body
- * was not read. Closing a socket with unread input makes the kernel reset the connection,
- * which can destroy the response before the client reads it. So the response is followed by
- * a half-close, and the remaining input is discarded (never buffered or parsed: the parser is
- * detached) until the client closes, for at most LINGER_MS or LINGER_BYTES; then the socket
- * is destroyed.
+ * Prepare a lingering close (RFC 9112 section 9.6) of `socket`. Closing a socket with unread
+ * input makes the kernel reset the connection, which can destroy the response before the
+ * client reads it. So from now on the remaining input is discarded (never buffered or parsed:
+ * the parser is detached), at most LINGER_BYTES of it, and Node's end-of-response close
+ * becomes a half-close. Nothing is closed yet: the returned arm() starts the wait, after which
+ * the socket is destroyed when the client closes its side, or after LINGER_MS. Idempotent per
+ * socket.
  */
-function lingerAfterError(req: IncomingMessage): void {
-  const socket = req.socket as Socket & { destroySoon?: () => void };
+function prepareLinger(socket: Socket): () => void {
+  const existing = lingering.get(socket);
+  if (existing !== undefined) return existing;
   const close = (): void => {
     socket.destroy();
   };
-  const timer = setTimeout(close, LINGER_MS);
-  timer.unref();
   let discarded = 0;
+  let armed = false;
   // Node ends a non-keep-alive response with socket.destroySoon(); make that a half-close.
-  socket.destroySoon = () => {
+  (socket as Socket & { destroySoon?: () => void }).destroySoon = () => {
     socket.end();
   };
-  socket.once('end', close);
-  socket.once('close', () => clearTimeout(timer));
   stopParsing(socket, (chunk: Buffer) => {
     discarded += chunk.length;
     if (discarded > LINGER_BYTES) close();
   });
+  const arm = (): void => {
+    if (armed) return;
+    armed = true;
+    const timer = setTimeout(close, LINGER_MS);
+    timer.unref();
+    socket.once('end', close);
+    socket.once('close', () => clearTimeout(timer));
+  };
+  lingering.set(socket, arm);
+  return arm;
 }
+
+/**
+ * Lingering close after an error response to a request whose body was not read: the response
+ * is followed by a half-close, and the wait starts at once.
+ */
+function lingerAfterError(req: IncomingMessage): void {
+  prepareLinger(req.socket)();
+}
+
+// Node's own responses to client errors (node:_http_server), used unchanged whenever SEC-11
+// does not apply.
+const NODE_CLIENT_ERROR_STATUS: Readonly<Record<string, number>> = {
+  HPE_HEADER_OVERFLOW: 431,
+  HPE_CHUNK_EXTENSIONS_OVERFLOW: 413,
+  ERR_HTTP_REQUEST_TIMEOUT: 408,
+};
+
+function nodeClientErrorResponse(code: string): Buffer {
+  const status = NODE_CLIENT_ERROR_STATUS[code] ?? 400;
+  return Buffer.from(`HTTP/1.1 ${status} ${STATUS_CODES[status] ?? ''}\r\nConnection: close\r\n\r\n`, 'ascii');
+}
+
+/** The response Node has attached to the socket (node:_http_server reads the same fields). */
+type SocketWithMessage = Socket & { _httpMessage?: { _headerSent?: boolean } | null };
 
 /** Whether the request itself ends the connection (`Connection: close`, or HTTP/1.0 without keep-alive). */
 function requestsClose(req: IncomingMessage): boolean {
@@ -159,6 +208,14 @@ interface Connection {
   closing: boolean;
   /** Settles when the request being handled on this connection is done. */
   tail: Promise<void>;
+  /** Requests handed to the app, in order, whose response has not finished and that were not refused. */
+  pending: IncomingMessage[];
+  /** The request Node parsed last on this connection. */
+  latest: IncomingMessage | null;
+  /** SEC-11: the first pending request when the parser failed; it is still served while closing. */
+  lastServed: IncomingMessage | null;
+  /** Called when `pending` empties (SEC-11: close once the pending response is sent). */
+  whenIdle: (() => void) | null;
 }
 
 function hasBody(req: IncomingMessage): boolean {
@@ -186,8 +243,18 @@ export function createApp(options: AppOptions): App {
     return null;
   };
 
-  const send = (res: ServerResponse, status: number, framing: Framing, extra: Record<string, string>, body: Uint8Array | null, contentType: string | null): void => {
+  const send = (
+    res: ServerResponse,
+    connection: Connection,
+    status: number,
+    framing: Framing,
+    extra: Record<string, string>,
+    body: Uint8Array | null,
+    contentType: string | null,
+  ): void => {
     for (const [name, value] of Object.entries(extra)) if (!RESERVED_HEADERS.has(name.toLowerCase())) res.setHeader(name, value);
+    // A connection that will close says so in its last response (SEC-11).
+    if (connection.closing) res.setHeader('connection', 'close');
     for (const [name, value] of Object.entries(securityHeaders(framing))) res.setHeader(name, value);
     if (contentType !== null) res.setHeader('content-type', contentType);
     res.setHeader('content-length', String(body?.length ?? 0));
@@ -228,7 +295,7 @@ export function createApp(options: AppOptions): App {
         lingerAfterError(req);
       }
       const body = Buffer.from(JSON.stringify(errorBody(httpError.code, correlationId, httpError.details)));
-      send(res, httpError.status, 'none', headers, body, 'application/json; charset=utf-8');
+      send(res, connection, httpError.status, 'none', headers, body, 'application/json; charset=utf-8');
     };
     bodyState.onTimeout = fail;
 
@@ -258,7 +325,7 @@ export function createApp(options: AppOptions): App {
           if (served !== null && !settled) {
             settled = true;
             status = served.status;
-            return respond(res, served, null);
+            return respond(res, connection, served, null);
           }
         }
         throw new HttpError(404, 'not_found');
@@ -300,7 +367,7 @@ export function createApp(options: AppOptions): App {
       if (result === null) throw new HttpError(501, 'internal');
       settled = true;
       status = result.status;
-      respond(res, result, operation);
+      respond(res, connection, result, operation);
     } catch (error) {
       fail(error);
     } finally {
@@ -318,7 +385,7 @@ export function createApp(options: AppOptions): App {
     }
   };
 
-  const respond = (res: ServerResponse, result: HandlerResult, operation: OperationId | null): void => {
+  const respond = (res: ServerResponse, connection: Connection, result: HandlerResult, operation: OperationId | null): void => {
     let body: Uint8Array | null = null;
     let contentType = result.contentType ?? null;
     if (result.json !== undefined) {
@@ -330,19 +397,74 @@ export function createApp(options: AppOptions): App {
     }
     const framing: Framing =
       operation === 'readRecipientDocument' && result.status === 200 && contentType?.split(';')[0]?.trim() === 'application/pdf' ? 'self' : 'none';
-    send(res, result.status, framing, result.headers ?? {}, body, contentType);
+    send(res, connection, result.status, framing, result.headers ?? {}, body, contentType);
+  };
+
+  /**
+   * Node's 'clientError' (SEC-11). When the parser fails on bytes after a complete request
+   * whose response is still pending, that response is kept: nothing is written now, the
+   * parser is detached and the rest of the input discarded, and the connection is closing.
+   * The first pending request is still served (its handler may not have started yet), with
+   * Connection: close; any request queued behind it is refused, as SEC-08 refuses requests
+   * after a decided close. Once the pending responses are done, the connection half-closes and
+   * lingers. Every other client error gets Node's default handling, unchanged.
+   */
+  const clientError = (error: Error & { code?: string }, stream: Duplex): void => {
+    const socket = stream as SocketWithMessage;
+    const code = typeof error.code === 'string' ? error.code : '';
+    const connection = connections.get(socket);
+    const first = connection?.pending[0];
+    if (
+      connection !== undefined &&
+      first !== undefined &&
+      code.startsWith('HPE_') &&
+      connection.latest?.complete === true &&
+      socket.writable &&
+      !socket.destroyed
+    ) {
+      connection.closing = true;
+      connection.lastServed ??= first;
+      const arm = prepareLinger(socket);
+      connection.whenIdle = () => {
+        if (socket.destroyed) return;
+        socket.end();
+        arm();
+      };
+      logger.warn('parse_error_while_response_pending', { parser_error: code, pending_responses: connection.pending.length });
+      return;
+    }
+    // Node's default (node:_http_server socketOnError): its canned response, unless a response
+    // already started on this socket, then destroy the socket.
+    const message = socket._httpMessage;
+    if (socket.writable && (!message || !message._headerSent)) socket.write(nodeClientErrorResponse(code));
+    socket.destroy(error);
   };
 
   return {
     locals,
+    clientError,
     handle(req: IncomingMessage, res: ServerResponse): void {
       const socket = req.socket;
       let connection = connections.get(socket);
       if (connection === undefined) {
-        connection = { closing: false, tail: Promise.resolve() };
+        connection = { closing: false, tail: Promise.resolve(), pending: [], latest: null, lastServed: null, whenIdle: null };
         connections.set(socket, connection);
       }
       const current = connection;
+      // Recorded at once, while Node may still be parsing the rest of the packet (SEC-11).
+      current.pending.push(req);
+      current.latest = req;
+      let released = false;
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        // Responses finish in order, so this is almost always the first entry.
+        if (current.pending[0] === req) current.pending.shift();
+        else current.pending.splice(current.pending.indexOf(req), 1);
+        if (current.pending.length === 0) current.whenIdle?.();
+      };
+      res.once('finish', release);
+      res.once('close', release);
       const previous = current.tail;
       let done: () => void = () => {};
       current.tail = new Promise<void>((resolveTail) => {
@@ -350,9 +472,11 @@ export function createApp(options: AppOptions): App {
       });
       void previous.then(async () => {
         try {
-          if (current.closing) {
-            // SEC-08: a Connection: close response was decided before this pipelined request.
+          if (current.closing && req !== current.lastServed) {
+            // SEC-08: a Connection: close response was decided before this pipelined request
+            // (or, SEC-11, the parser failed while an earlier response was pending).
             logger.warn('pipelined_request_refused', { method: req.method ?? 'GET', path: pathOf(req.url) ?? '(invalid)' });
+            release();
             return;
           }
           await handle(req, res, current);
@@ -368,4 +492,11 @@ export function createApp(options: AppOptions): App {
       });
     },
   };
+}
+
+/** An HTTP server for `app`: its request handler and its client-error handling (SEC-11). */
+export function createAppServer(app: App): Server {
+  const server = createServer(app.handle);
+  server.on('clientError', app.clientError);
+  return server;
 }
