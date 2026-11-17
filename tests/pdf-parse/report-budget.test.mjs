@@ -9,8 +9,11 @@
 // - Honest documents at the report budget (limits.ts reportBudget, derived from maxBytes)
 //   parse; one value or a few bytes more is the parser's own 422 limit-exceeded.
 // - At most MAX_CONCURRENT_PARSES (2) parse children run at once, counted from /proc; up to
-//   MAX_WAITING_PARSES (32) more wait in FIFO order, and one more is refused at once with
-//   429 rate_limited, without its input being read.
+//   MAX_WAITING_PARSES (32) more wait, and one more is refused at once with 429 rate_limited,
+//   without its input being read. FIFO admission is proved from the gate's own read-only
+//   admission record (arrival tickets in the order slots were granted), with each call issued
+//   only once the previous one has entered the gate; completion order is never asserted,
+//   because FIFO admission does not order completions (A-010 PL24-ORC).
 //
 // Every lying child is a test-only entry module written to a mkdtemp directory and run
 // through createParseServiceForTests() in the real sandbox, exactly as the worker is.
@@ -228,13 +231,24 @@ function directChildren() {
   return count;
 }
 
-test('[PL-24] at most two parse children run at once; 32 more wait in order, and one more is a clean 429', async (t) => {
-  // A child that waits 800 ms when its input starts with "slow", then reports a rejection.
+/** Poll `check` every 2 ms until it holds; fail with `label` after `ms`. */
+async function until(check, ms, label) {
+  const deadline = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > deadline) assert.fail(`${label} within ${ms} ms`);
+    await new Promise((resolveTick) => setTimeout(resolveTick, 2));
+  }
+}
+
+test('[PL-24] at most two parse children run at once; 32 more wait and are admitted in arrival order, and one more is a clean 429', async (t) => {
+  // A child that waits 800 ms when its input starts with "slow" (5 s with "hold"), then
+  // reports a rejection.
   const entry = write(
     'slow-child.mjs',
     `let input = '';
 for await (const chunk of process.stdin) input += chunk;
 if (input.startsWith('slow')) await new Promise((resolve) => setTimeout(resolve, 800));
+if (input.startsWith('hold')) await new Promise((resolve) => setTimeout(resolve, 5000));
 process.stdout.write(JSON.stringify({ ok: false, reason: 'malformed', detail: 'synthetic ' + input.slice(0, 12) }) + '\\n');
 `,
   );
@@ -261,12 +275,25 @@ process.stdout.write(JSON.stringify({ ok: false, reason: 'malformed', detail: 's
   assert.deepEqual(service.parseCapacity(), { running: 0, waiting: 0, max_concurrent: 2, max_waiting: 32 });
   assert.deepEqual([service.MAX_CONCURRENT_PARSES, service.MAX_WAITING_PARSES], [2, 32]);
 
-  // Two slow parses hold both slots, 32 fast ones wait, and one more is refused at once,
-  // before its (streamed) input is read; the waiting ones then run in arrival order.
-  const finished = [];
-  const track = (promise, label) => promise.then((outcome) => (finished.push(label), outcome));
-  const slow = [0, 1].map((i) => track(children.parse(Buffer.from(`slow-${i}`)), `slow-${i}`));
-  const waiting = Array.from({ length: 32 }, (_, i) => track(children.parse(Buffer.from(`fast-${String(i).padStart(2, '0')}`)), `fast-${i}`));
+  // Two holding parses take both slots and 32 fast ones queue. Each call is issued only once
+  // the previous one has entered the gate (its ticket drawn, and for a queued one the waiting
+  // count grown), so the arrival order is exactly the issue order.
+  const tickets = {};
+  const pending = [];
+  const issue = async (label, admittedAtOnce) => {
+    const before = service.parseCapacity();
+    const ticket = service.parseAdmissions().next_ticket;
+    tickets[label] = ticket;
+    pending.push(children.parse(Buffer.from(label)));
+    await until(() => service.parseAdmissions().next_ticket === ticket + 1, 5000, `${label} enters the gate`);
+    const after = service.parseCapacity();
+    if (admittedAtOnce) assert.equal(after.running, before.running + 1, `${label} takes a free slot`);
+    else assert.deepEqual([after.running, after.waiting], [2, before.waiting + 1], `${label} queues behind the two slot holders`);
+  };
+  await issue('hold-0', true);
+  await issue('hold-1', true);
+  for (let i = 0; i < 32; i += 1) await issue(`fast-${String(i).padStart(2, '0')}`, false);
+  assert.deepEqual(service.parseCapacity(), { running: 2, waiting: 32, max_concurrent: 2, max_waiting: 32 });
   let pulled = 0;
   const stream = (async function* body() {
     pulled += 1;
@@ -279,13 +306,25 @@ process.stdout.write(JSON.stringify({ ok: false, reason: 'malformed', detail: 's
   assert.deepEqual([refused.ok, refused.status, refused.code, refused.reason], [false, 429, 'rate_limited', 'parse-capacity']);
   assert.equal(pulled, 0, 'the refused parse never read its input');
   assert.ok(refusedMs < 400, `refused at once, not after a slot freed (${refusedMs} ms)`);
-  const outcomes = await Promise.all([...slow, ...waiting]);
+  const outcomes = await Promise.all(pending);
   outcomes.forEach((outcome) => assert.equal(outcome.status, 422, `${outcome.reason} ${outcome.detail}`));
-  assert.deepEqual(finished.slice(0, 2).sort(), ['slow-0', 'slow-1'], 'the slot holders finish first');
-  const order = finished.slice(2).map((label) => Number(label.slice(5)));
-  assert.equal(order.length, 32);
-  // FIFO: the first waiting parses finish first and the last ones last (finish order, so a
-  // little jitter between neighbours is allowed).
-  assert.ok(order.slice(0, 4).includes(0) && order.slice(-4).includes(31), `waiting parses run in arrival order: ${order.join(',')}`);
   assert.deepEqual(service.parseCapacity(), { running: 0, waiting: 0, max_concurrent: 2, max_waiting: 32 });
+
+  // Admission order, from the gate's record (never completion order): the two holders first,
+  // then the waiting parses in exact arrival order 0..31. The refused parse drew no ticket.
+  const labels = ['hold-0', 'hold-1', ...Array.from({ length: 32 }, (_, i) => `fast-${String(i).padStart(2, '0')}`)];
+  const record = service.parseAdmissions();
+  assert.equal(record.next_ticket, tickets['hold-0'] + 34, 'one ticket per admitted parse, none for the refused one');
+  const byTicket = new Map(Object.entries(tickets).map(([label, ticket]) => [ticket, label]));
+  const admitted = record.admitted.filter((ticket) => byTicket.has(ticket)).map((ticket) => byTicket.get(ticket));
+  assert.deepEqual(admitted.slice(0, 2), ['hold-0', 'hold-1'], 'the two holders are admitted first');
+  assert.deepEqual(admitted.slice(2), labels.slice(2), 'the waiting parses are admitted in exact arrival order 0..31');
+  t.diagnostic(`admission order: ${admitted.join(',')}`);
+
+  // The record is bounded and read-only.
+  assert.equal(record.max_records, 128);
+  assert.ok(record.admitted.length <= record.max_records);
+  assert.ok(Object.isFrozen(record) && Object.isFrozen(record.admitted));
+  assert.throws(() => record.admitted.push(0), TypeError);
+  assert.deepEqual(service.parseAdmissions().admitted, record.admitted, 'a fresh read is unchanged');
 });

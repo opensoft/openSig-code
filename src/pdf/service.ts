@@ -49,7 +49,8 @@
 // - Concurrency (A-010 LBR3-1, LBR4-1). Parse slots: at most MAX_CONCURRENT_PARSES children
 //   run, and have their reports decoded, at once; up to MAX_WAITING_PARSES more parses wait
 //   for a slot in FIFO order; when that queue is full a parse is refused at once, before its
-//   input is read: 429 rate_limited, reason parse-capacity. A parse takes its slot only once
+//   input is read: 429 rate_limited, reason parse-capacity. parseAdmissions() is a read-only,
+//   bounded record of arrival tickets in admission order (PL24-ORC). A parse takes its slot only once
 //   its input is fully buffered within maxBytes, so a slow body never holds a slot and a
 //   composition (an in-memory input) never waits behind a body that is still arriving.
 //   Body reads: a streamed input is read only under one of MAX_CONCURRENT_BODY_READS read
@@ -174,28 +175,62 @@ export const MAX_CONCURRENT_PARSES = 2;
 /** Parses that may wait for a slot; one more is refused with 429 rate_limited. */
 export const MAX_WAITING_PARSES = 32;
 
-const gate = { running: 0, waiting: [] as Array<() => void> };
+/** Admissions kept in the read-only admission record (A-010 PL24-ORC). */
+export const ADMISSION_RECORD_SIZE = 128;
+
+interface Waiter {
+  readonly ticket: number;
+  readonly admit: () => void;
+}
+
+/**
+ * The parse gate. Every parse that enters it (takes a slot at once or joins the queue) draws
+ * the next arrival ticket; a refused parse draws none. `admitted` records the tickets in the
+ * order their slots were granted, keeping the last ADMISSION_RECORD_SIZE. The record only
+ * observes: it changes nothing about who gets a slot or when.
+ */
+const gate = { running: 0, waiting: [] as Waiter[], nextTicket: 0, admitted: [] as number[] };
+
+function recordAdmission(ticket: number): void {
+  gate.admitted.push(ticket);
+  if (gate.admitted.length > ADMISSION_RECORD_SIZE) gate.admitted.shift();
+}
 
 /** Take a slot, or join the FIFO queue for one; null when the queue is full. */
 function acquireSlot(): Promise<void> | null {
   if (gate.running < MAX_CONCURRENT_PARSES) {
     gate.running += 1;
+    recordAdmission(gate.nextTicket++);
     return Promise.resolve();
   }
   if (gate.waiting.length >= MAX_WAITING_PARSES) return null;
-  return new Promise<void>((resolveSlot) => gate.waiting.push(resolveSlot));
+  const ticket = gate.nextTicket++;
+  return new Promise<void>((resolveSlot) => gate.waiting.push({ ticket, admit: resolveSlot }));
 }
 
 /** Pass the slot to the oldest waiting parse, or free it. */
 function releaseSlot(): void {
   const next = gate.waiting.shift();
-  if (next !== undefined) next();
-  else gate.running -= 1;
+  if (next !== undefined) {
+    recordAdmission(next.ticket);
+    next.admit();
+  } else {
+    gate.running -= 1;
+  }
 }
 
 /** Current use of the parse slots (read-only; for monitoring and the tests). */
 export function parseCapacity(): { running: number; waiting: number; max_concurrent: number; max_waiting: number } {
   return { running: gate.running, waiting: gate.waiting.length, max_concurrent: MAX_CONCURRENT_PARSES, max_waiting: MAX_WAITING_PARSES };
+}
+
+/**
+ * The admission record (read-only; for monitoring and the tests, A-010 PL24-ORC): the ticket
+ * the next parse to enter the gate will draw, and the tickets of the last admissions in the
+ * order their slots were granted (at most ADMISSION_RECORD_SIZE). A frozen copy.
+ */
+export function parseAdmissions(): { readonly next_ticket: number; readonly admitted: readonly number[]; readonly max_records: number } {
+  return Object.freeze({ next_ticket: gate.nextTicket, admitted: Object.freeze([...gate.admitted]), max_records: ADMISSION_RECORD_SIZE });
 }
 
 /** True when a parse arriving now would find every slot taken and the queue full. */
