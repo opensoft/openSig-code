@@ -12,6 +12,10 @@
 //   readRecipientManifest   GET    /v1/recipient-session/manifest    200 exact canonical manifest bytes
 //   endRecipientSession     DELETE /v1/recipient-session             204, cookie cleared (CSRF)
 //
+// requestChallenge answers before any per-invitation work starts: the ceremony
+// validates and rate-limits, schedules the rest for after the response, and the
+// handler returns the 202 (data-model.md, "Generic 202 (A-010)").
+//
 // HEAD is served as GET without a body, and a prefetch is served without moving
 // the session's last_seen_at. The ceremony is app-scoped: the server stores one
 // RecipientCeremony under RECIPIENT_CEREMONY in its locals, and a request that
@@ -43,7 +47,7 @@ function clientAddress(ctx: RequestContext): string {
 export const requestChallenge: RouteHandler = async (ctx) => {
   const ceremony = ceremonyOf(ctx);
   const body = await ctx.json();
-  await ceremony.requestChallenge(body, clientAddress(ctx));
+  ceremony.requestChallenge(body, clientAddress(ctx), ctx.correlationId);
   return { status: 202, json: { status: 'accepted' } };
 };
 

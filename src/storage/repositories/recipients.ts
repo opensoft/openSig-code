@@ -16,7 +16,12 @@
 // The schema backs every rule here: binding columns are immutable and
 // revocation and consumption are final (0003); expiry is fixed at issue,
 // counters never decrease, supersession is final, invitation and challenge
-// rows are retained, and the CSRF secret is required and immutable (0013).
+// rows are retained, and the CSRF secret is required and immutable (0013); and
+// no row is ever replaced by an insert that repeats one of its keys (0014).
+//
+// The capability-id reads at the end serve the ceremony's audit events
+// (recipient.capabilities_revoked and recipient.locked_out, CH-06): which
+// invitations and sessions a revocation revoked, by id only.
 
 import type { CapabilityOwner, Database, Row, TenantStore } from '../db/index.ts';
 import { StorageUsageError } from '../db/index.ts';
@@ -324,4 +329,55 @@ export function getConsentInForce(store: TenantStore): ConsentText | undefined {
     textDigest: str(row, 'consent_texts', 'text_digest'),
     effectiveFrom: str(row, 'consent_texts', 'effective_from'),
   };
+}
+
+// ------------------------------------------------- revoked capabilities (CH-06)
+
+/** Ids of revoked or revocable capabilities, oldest first. */
+export interface CapabilityIds {
+  readonly invitationIds: readonly string[];
+  readonly sessionIds: readonly string[];
+}
+
+function ids(store: TenantStore, table: 'invitations' | 'recipient_sessions', where: Record<string, string | null>): string[] {
+  const out: string[] = [];
+  for (const row of store.iterate(table, where)) out.push(str(row, table, 'id'));
+  return out;
+}
+
+/** The recipient's invitations and sessions that are not revoked (what a resend revokes). */
+export function outstandingCapabilitiesOf(store: TenantStore, envelopeId: string, recipientId: string): CapabilityIds {
+  const where = { envelope_id: envelopeId, recipient_id: recipientId, revoked_at: null };
+  return { invitationIds: ids(store, 'invitations', where), sessionIds: ids(store, 'recipient_sessions', where) };
+}
+
+/** The envelope's invitations and sessions whose revoked_at is exactly `at`. */
+export function capabilitiesRevokedAt(store: TenantStore, envelopeId: string, at: string): CapabilityIds {
+  const where = { envelope_id: envelopeId, revoked_at: at };
+  return { invitationIds: ids(store, 'invitations', where), sessionIds: ids(store, 'recipient_sessions', where) };
+}
+
+/** Audit event types whose metadata names revoked invitations or sessions. */
+export const REVOCATION_EVENT_TYPES: readonly string[] = Object.freeze(['recipient.capabilities_revoked', 'recipient.locked_out']);
+
+function namedIds(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string');
+  return [];
+}
+
+/**
+ * Ids of the invitations and sessions that the envelope's earlier revocation
+ * and lockout events already name (their invitation_id, invitation_ids and
+ * session_ids members).
+ */
+export function auditedRevocationsOf(store: TenantStore, envelopeId: string): ReadonlySet<string> {
+  const named = new Set<string>();
+  for (const row of store.iterate('audit_events', { envelope_id: envelopeId, type: { op: 'in', values: [...REVOCATION_EVENT_TYPES] } })) {
+    const metadata = JSON.parse(str(row, 'audit_events', 'metadata_json')) as Record<string, unknown>;
+    for (const member of ['invitation_id', 'invitation_ids', 'session_ids']) {
+      for (const id of namedIds(metadata[member])) named.add(id);
+    }
+  }
+  return named;
 }

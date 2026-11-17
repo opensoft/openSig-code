@@ -5,6 +5,8 @@
 // CH-03 (cumulative lockout after 20 wrong codes per invitation, recovered only
 // by a resend), SC002-10 (expired challenge) and SC002-15 (the sixth wrong code
 // is 429 locked). Every response is checked against the vendored contract.
+// CH-02 compares every response header, name as sent and value, in order,
+// except date and x-correlation-id (F2).
 
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
@@ -13,6 +15,7 @@ import { test } from 'node:test';
 import {
   MINUTE,
   ORIGIN,
+  comparableHeaders,
   contractErrors,
   createSession,
   createWorld,
@@ -61,16 +64,24 @@ test('[CH-02] requestChallenge answers the same generic 202 whatever the invitat
       ['expired invitation', expired.token, 0],
     ];
     const bodies = [];
+    const headerSets = [];
     for (const [label, token, mailed] of cases) {
       const response = await requestChallenge(world, token);
       assert.equal(response.status, 202, `${label}: 202`);
       assert.deepEqual(response.json, { status: 'accepted' }, `${label}: the generic body`);
       assert.deepEqual(contractErrors('Accepted', response.json), [], `${label}: a contract Accepted body`);
       assert.equal(response.headers['set-cookie'], undefined, `${label}: no cookie`);
+      assert.ok(typeof response.headers.date === 'string' && typeof response.headers['x-correlation-id'] === 'string', `${label}: date and x-correlation-id are present (the only headers left out of the comparison)`);
       bodies.push(response.bytes.toString('utf8'));
+      headerSets.push([label, comparableHeaders(response)]);
       assert.equal(world.takeMails('recipient_challenge').length, mailed, `${label}: ${mailed} code mailed`);
     }
     assert.equal(new Set(bodies).size, 1, 'the bodies are byte-identical');
+    const [, liveHeaders] = headerSets[0];
+    assert.ok(liveHeaders.length >= 5, 'the comparison covers the full header set');
+    for (const [label, headers] of headerSets.slice(1)) {
+      assert.deepEqual(headers, liveHeaders, `${label}: every header, name and value, matches the live invitation's (except date and x-correlation-id)`);
+    }
     assert.equal(world.rows('challenges').length, 1, 'only the live invitation got a challenge');
     void live;
 
@@ -122,6 +133,7 @@ test('[CH-02] a new code supersedes the previous one, and requests are limited p
     const unknownLimited = await requestChallenge(world, unknown);
     assertError(unknownLimited, 429, 'rate_limited', 'fourth request for an unknown token');
     assert.equal(unknownLimited.headers['retry-after'], limited.headers['retry-after'], 'the same answer for a token that names nothing');
+    assert.deepEqual(comparableHeaders(unknownLimited), comparableHeaders(limited), 'every 429 header, name and value, matches (except date and x-correlation-id)');
     assert.equal(world.takeMails('recipient_challenge').length, 0, 'refused requests mail nothing');
 
     // Per client address: 6 accepted requests in the window from 127.0.0.1, whatever the token

@@ -10,6 +10,12 @@
 //   and the T008 handlers installed (withRecipientHandlers), bound to 127.0.0.1
 //   on an OS-chosen port; the T007 envelope service reports its changes to the
 //   real ceremony, and mail goes through the T032 notifier to the spool only.
+//   The server is built by createAppServer (T031), so the recipient tests run
+//   with the server's SEC-11 client-error handling.
+// requestChallenge's per-invitation work runs after its 202 (data-model.md,
+// "Generic 202 (A-010)"). The helpers below settle it through the ceremony's
+// drain() hook before they look at storage or the spool; no test sleeps. CH-07
+// holds that work with heldWork() and heldNotifier() instead.
 // Capability values (invitation tokens, codes, session values, CSRF tokens) are
 // read back from the spool or the responses, kept in memory, and never put in a
 // test name or an assertion message.
@@ -17,7 +23,7 @@
 import assert from 'node:assert/strict';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { chmodSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { createServer, request } from 'node:http';
+import { request } from 'node:http';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -25,7 +31,7 @@ import { RECIPIENT_CEREMONY, RecipientCeremony, loadChallengeKey } from '../../s
 import { ROUTES, withRecipientHandlers } from '../../src/api/routes.ts';
 import { EnvelopeService } from '../../src/domain/envelopes/index.ts';
 import { createNotifier, createSpoolTransport } from '../../src/notifications/index.ts';
-import { createApp } from '../../src/server/app.ts';
+import { createApp, createAppServer } from '../../src/server/app.ts';
 import { loadServerConfig } from '../../src/server/config.ts';
 import { createLogger } from '../../src/server/redact.ts';
 import { openBlobStore } from '../../src/storage/blobs/index.ts';
@@ -98,7 +104,7 @@ export function contractErrors(schemaName, value) {
   return validate(contractDoc, schema, value);
 }
 
-/** One HTTP request to the world's server; resolves with { status, headers, json, bytes }. */
+/** One HTTP request to the world's server; resolves with { status, headers, rawHeaders, json, bytes } once the whole response is in. */
 export function call(port, { method = 'GET', path, headers = {}, body } = {}) {
   return new Promise((resolveResponse, reject) => {
     const payload = body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body);
@@ -118,7 +124,7 @@ export function call(port, { method = 'GET', path, headers = {}, body } = {}) {
         } catch {
           json = null;
         }
-        resolveResponse({ status: res.statusCode, headers: res.headers, json, bytes });
+        resolveResponse({ status: res.statusCode, headers: res.headers, rawHeaders: [...res.rawHeaders], json, bytes });
       });
     });
     req.on('error', reject);
@@ -130,8 +136,11 @@ export function call(port, { method = 'GET', path, headers = {}, body } = {}) {
 /**
  * A synthetic world: database with one tenant and its consent text in force,
  * blob store, spool, 0600 key file, ceremony, envelope service and the real app.
+ * CH-07 passes `scheduleWork` (heldWork().schedule), `wrapNotifier`
+ * (heldNotifier().wrap) and `wrapDb` to hold or fail the ceremony's
+ * post-response work; every other test uses the defaults.
  */
-export async function createWorld({ limits, idempotencyBodyLimit } = {}) {
+export async function createWorld({ limits, idempotencyBodyLimit, scheduleWork, wrapNotifier, wrapDb } = {}) {
   const scratch = makeScratch();
   const { db, path } = openTemp(scratch);
   const tenant = sid('tenant');
@@ -161,7 +170,16 @@ export async function createWorld({ limits, idempotencyBodyLimit } = {}) {
     logger,
     now: () => time.now.getTime(),
   });
-  const ceremony = new RecipientCeremony({ db, blobs, notifier, challengeKey: loadChallengeKey({ path: keyPath }), clock: time.clock, logger, ...(limits ? { limits } : {}) });
+  const ceremony = new RecipientCeremony({
+    db: wrapDb ? wrapDb(db) : db,
+    blobs,
+    notifier: wrapNotifier ? wrapNotifier(notifier) : notifier,
+    challengeKey: loadChallengeKey({ path: keyPath }),
+    clock: time.clock,
+    logger,
+    ...(limits ? { limits } : {}),
+    ...(scheduleWork ? { scheduleWork } : {}),
+  });
   const service = new EnvelopeService({
     db,
     clock: time.clock,
@@ -171,7 +189,7 @@ export async function createWorld({ limits, idempotencyBodyLimit } = {}) {
 
   const app = createApp({ routes: withRecipientHandlers(ROUTES), config: loadServerConfig({ OPENSIG_PORT: '0' }), logger, authenticator: null, allowedOrigins: new Set([ORIGIN]) });
   app.locals.set(RECIPIENT_CEREMONY, ceremony);
-  const server = createServer(app.handle);
+  const server = createAppServer(app);
   await new Promise((resolveListen) => server.listen({ host: '127.0.0.1', port: 0 }, resolveListen));
   const { port } = server.address();
   const seen = new Set();
@@ -315,9 +333,21 @@ export async function sentEnvelope(world, { recipients = 1, expiresAt } = {}) {
   return { envelope: sent, token: tokenOf(invitations[0]), pdf };
 }
 
-/** POST requestChallenge from the allowlisted origin. */
-export function requestChallenge(world, invitation, headers = {}) {
+/** Wait until the ceremony's post-response work (requestChallenge after its 202) has settled. */
+export async function settle(world) {
+  await world.ceremony.drain();
+}
+
+/** POST requestChallenge from the allowlisted origin, without settling the work it starts (CH-07). */
+export function postChallenge(world, invitation, headers = {}) {
   return world.http({ method: 'POST', path: '/v1/recipient-session/challenges', headers: { origin: ORIGIN, ...headers }, body: { invitation } });
+}
+
+/** POST requestChallenge, then settle the per-invitation work it started (the lookup, the challenge write and the mail). */
+export async function requestChallenge(world, invitation, headers = {}) {
+  const response = await postChallenge(world, invitation, headers);
+  await settle(world);
+  return response;
 }
 
 /** requestChallenge, then the code mailed to `to` (null when nothing was mailed). */
@@ -404,8 +434,138 @@ export async function approveFirst(world, envelope) {
   return { ...result, token: mails.length === 1 ? tokenOf(mails[0]) : null };
 }
 
+/**
+ * Resend `recipient`'s invitation inside the ceremony (the invitation half of
+ * T034's resendInvitation; its old token is dead) and return the fresh token.
+ */
+export async function resend(world, envelope, recipient, actor) {
+  await world.ceremony.run(() => world.db.transaction(() => world.ceremony.resendInvitation(world.store(), envelope.id, recipient.id, actor)));
+  const mails = world.takeMails('recipient_invitation', recipient.email);
+  assert.equal(mails.length, 1, 'the resend mails one invitation');
+  return tokenOf(mails[0]);
+}
+
+/** Twenty wrong codes, five per challenge: the invitation is revoked by the cumulative lockout. */
+export async function lockOut(world, token) {
+  for (let round = 1; round <= 4; round += 1) {
+    const code = await requestCode(world, token);
+    assert.ok(code !== null, `lockout round ${round}: a code is mailed`);
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      assert.equal((await createSession(world, token, wrongCode(code, attempt))).status, 401, `lockout round ${round}: wrong code ${attempt}`);
+    }
+  }
+  assert.equal((await createSession(world, token, 'ABCDEFGHJK')).status, 429, 'the invitation is locked');
+}
+
 /** True when no capability value in `values` appears in the captured log lines. */
 export function logsFreeOf(world, values) {
   const text = world.logText();
   return values.every((value) => typeof value === 'string' && value.length > 0 && !text.includes(value));
+}
+
+/** The comparable form of a response's headers: every raw header, name as sent and value, in order, except date and x-correlation-id. */
+export function comparableHeaders(response) {
+  const pairs = [];
+  for (let index = 0; index < response.rawHeaders.length; index += 2) {
+    const name = response.rawHeaders[index];
+    if (name.toLowerCase() === 'date' || name.toLowerCase() === 'x-correlation-id') continue;
+    pairs.push([name, response.rawHeaders[index + 1]]);
+  }
+  return pairs;
+}
+
+/**
+ * A scheduler for the ceremony's post-response work (the scheduleWork option).
+ * Open, it starts each task on a later turn of the event loop, as the default
+ * does; held, it keeps the tasks, in order, until release().
+ */
+export function heldWork() {
+  const tasks = [];
+  let held = false;
+  return {
+    schedule(task) {
+      if (held) tasks.push(task);
+      else setImmediate(task);
+    },
+    hold() {
+      held = true;
+    },
+    /** Start every held task, in order, and stay held. */
+    release() {
+      for (const task of tasks.splice(0)) task();
+    },
+    /** Start every held task and stop holding. */
+    open() {
+      held = false;
+      for (const task of tasks.splice(0)) task();
+    },
+    get waiting() {
+      return tasks.length;
+    },
+  };
+}
+
+/**
+ * A notifier wrapper (the wrapNotifier option). Open, each send goes straight
+ * to the real notifier; held, each send waits, in order, until release() lets
+ * it through to the spool or fail() makes it throw. whenWaiting(n) resolves
+ * once n sends are waiting: it is settled by the sends themselves, never by
+ * time.
+ */
+export function heldNotifier() {
+  const queue = [];
+  const watchers = [];
+  let held = false;
+  let real = null;
+  const check = () => {
+    for (const watcher of [...watchers]) {
+      if (queue.length >= watcher.n) {
+        watchers.splice(watchers.indexOf(watcher), 1);
+        watcher.resolve();
+      }
+    }
+  };
+  return {
+    wrap(notifier) {
+      real = notifier;
+      return {
+        send(requestValue) {
+          if (!held) return real.send(requestValue);
+          return new Promise((resolveSend, rejectSend) => {
+            queue.push({ resolveSend, rejectSend });
+            check();
+          }).then(() => real.send(requestValue));
+        },
+      };
+    },
+    hold() {
+      held = true;
+    },
+    /** Let the oldest waiting send through. */
+    release() {
+      const next = queue.shift();
+      assert.ok(next, 'a send is waiting');
+      next.resolveSend();
+    },
+    /** Make the oldest waiting send throw `error`. */
+    fail(error) {
+      const next = queue.shift();
+      assert.ok(next, 'a send is waiting');
+      next.rejectSend(error);
+    },
+    /** Let every waiting send through and stop holding. */
+    open() {
+      held = false;
+      for (const next of queue.splice(0)) next.resolveSend();
+    },
+    whenWaiting(n) {
+      return new Promise((resolveWatch) => {
+        watchers.push({ n, resolve: resolveWatch });
+        check();
+      });
+    },
+    get waiting() {
+      return queue.length;
+    },
+  };
 }

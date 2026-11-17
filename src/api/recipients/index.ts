@@ -7,6 +7,8 @@
 //   const envelopes = new EnvelopeService({ db, clock, onChange: ceremony.onEnvelopeChange });
 //   app.locals.set(RECIPIENT_CEREMONY, ceremony);
 //   await ceremony.run(() => envelopes.send(request, id, input));  // mails after the commit
+//   ...
+//   await ceremony.drain();  // at shutdown: requestChallenge work still running after its 202
 //
 // The route handlers are installed by src/api/routes.ts (withRecipientHandlers).
 
@@ -17,9 +19,11 @@ export {
   InvitationMail,
   RecipientCeremony,
   type CeremonyLimits,
+  type ChallengeWorkStats,
   type CreatedSession,
   type DeliveryReport,
   type RecipientCeremonyOptions,
+  type WorkScheduler,
 } from './ceremony.ts';
 export {
   CHALLENGE_CODE_LENGTH,
