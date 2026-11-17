@@ -9,14 +9,22 @@
 //   texts of 80 characters outside the BMP (twelve-byte surrogate-pair escapes) still fits and
 //   is decided by the approval (422), never by the limit; only a body padded past 256 KiB is
 //   413. Fractional, negative, too large, string, boolean and null coordinates are 400.
+//   The body work the approval does under the write lock for the worst case (validation, the
+//   request digest, the approval build and the stored serialization) is timed in process and
+//   logged with t.diagnostic as a diagnostic of lock hold time, with no pass bound (A-010,
+//   request #26 (5)); the timed work is shown to be the approval's own by rebuilding the stored
+//   approval digest and field values.
 // - AP-08: the stroke, point, value, text and count caps; WinAnsiEncoding (422
 //   unsupported_characters, decided after every 400 rule); matching the recipient's frozen
 //   fields; and the server-filled UTC date.
 // Every refusal records nothing. Everything is synthetic (see support.mjs).
 
 import assert from 'node:assert/strict';
+import { loadavg } from 'node:os';
 import { test } from 'node:test';
 
+import { approvalRequestDigest, buildApproval, checkApprovalRequest } from '../../src/domain/approval/index.ts';
+import { canonicalBytes } from '../../src/domain/canonical/index.ts';
 import { JSON_BODY_LIMIT } from '../../src/server/config.ts';
 import {
   GUARD_TOUCH,
@@ -84,7 +92,7 @@ async function twentyFieldSession(world) {
   return { envelope, session: await openSession(world, token) };
 }
 
-test('[AP-01] the worst-case approval within the schema fits the 256 KiB JSON limit and is accepted; 15,001 points is 400; coordinates must be integers in 0..10000', async () => {
+test('[AP-01] the worst-case approval within the schema fits the 256 KiB JSON limit and is accepted; 15,001 points is 400; coordinates must be integers in 0..10000', async (t) => {
   const world = await createWorld();
   try {
     // 1. The worst case is accepted, end to end.
@@ -107,6 +115,38 @@ test('[AP-01] the worst-case approval within the schema fits the 256 KiB JSON li
     assert.equal(values.length, 20, 'all twenty values are stored');
     assert.equal(pointsOf(values), 15_000, 'every point is stored');
     assert.equal(values[2].text, '€'.repeat(80), 'the escaped text is stored as its characters');
+
+    // Request #26 (5): the body work the approval does inside its write transaction, timed on this
+    // worst case as a diagnostic of lock hold time. One in-process call after the end-to-end
+    // request (the code is warm); the JSON parse happens before the transaction and is not timed.
+    // No pass bound: the time is logged, never asserted.
+    const [recipient] = world.rows('recipients', 'WHERE id = ?', [stored.recipient_id]);
+    const parsed = JSON.parse(worstText);
+    const started = process.hrtime.bigint();
+    const checked = checkApprovalRequest(parsed);
+    const validated = process.hrtime.bigint();
+    approvalRequestDigest(stored.recipient_id, checked);
+    const built = buildApproval({
+      approvalId: stored.id,
+      recipient: { id: recipient.id, ordinal: recipient.ordinal, role: recipient.role, email: recipient.email },
+      consentVersion: stored.consent_version,
+      consentTextDigest: stored.consent_text_digest,
+      documentDigest: stored.document_digest,
+      manifestDigest: stored.manifest_digest,
+      priorApprovalDigest: stored.prior_approval_digest,
+      fieldValues: checked.fieldValues,
+      serverTime: stored.server_time,
+    });
+    const serialized = canonicalBytes(built.fieldValues).toString('utf8');
+    const ended = process.hrtime.bigint();
+    assert.equal(built.approvalDigest, stored.approval_digest, 'the timed work is the approval’s own: it rebuilds the stored approval digest');
+    assert.equal(serialized, stored.field_values_json, 'and the stored field values');
+    const ms = (from, to) => (Number(to - from) / 1e6).toFixed(3);
+    t.diagnostic(
+      `AP-01 worst case (${worstBytes} bytes, 15,000 points, 20 values), body work under the write lock: validation ${ms(started, validated)} ms; ` +
+        `validation, request digest, approval build and stored serialization ${ms(started, ended)} ms; one warm in-process call; ` +
+        `1-minute load average ${loadavg()[0].toFixed(2)}; no pass bound (A-010, request #26 (5))`,
+    );
 
     // 2. One point more is 400 invalid_request, though the body is still under the limit.
     const over = await twentyFieldSession(world);

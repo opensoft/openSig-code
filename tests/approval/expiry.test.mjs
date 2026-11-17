@@ -15,6 +15,10 @@
 //   as envelope.expired in the outbox exactly once, in the expiry's transaction (ruling (6)),
 //   leaves finalizing, declined and not-yet-due envelopes alone, and a second sweep changes
 //   nothing.
+// - AP-04 (extended; row SWEEP-CMPL): with more due envelopes than one run's bound
+//   (expiryBatch x maxBatches per tenant), the run expires exactly that many, oldest expiry
+//   first, and reports complete: false; the next run expires the rest, announced once each,
+//   and reports complete: true; a third run finds nothing.
 // - AP-11: an approval or decline at or past expires_at is 409 state_conflict, records no
 //   approval, and the request commits the expiry itself, announced exactly once; one
 //   millisecond before is accepted.
@@ -271,6 +275,43 @@ test('[AP-04] past expires_at a session stays readable showing closed until the 
     assert.equal(envelopeRow(world, notDue.envelope.id).state, 'expired');
     assert.equal(outboxOf(world, notDue.envelope.id, 'envelope.expired').length, 1, 'and is announced once');
     assert.equal(outboxOf(world, sent.envelope.id, 'envelope.expired').length, 1, 'earlier expiries are not announced again');
+  } finally {
+    await world.close();
+  }
+});
+
+test('[AP-04] a sweep that reaches its batch bound with due envelopes left reports complete: false, and the next sweep expires the rest and completes (row SWEEP-CMPL)', async () => {
+  const world = await createWorld();
+  try {
+    // Five due envelopes in alpha, each due one second after the previous, and one in beta. One run
+    // may expire at most expiryBatch x maxBatches = 2 x 2 = 4 per tenant.
+    const alpha = [];
+    for (let index = 0; index < 5; index += 1) {
+      alpha.push((await sentEnvelope(world, { expiresAt: new Date(BASE_TIME + 10 * MINUTE + index * 1000).toISOString() })).envelope);
+    }
+    const beta = (await sentEnvelope(world, { tenant: 'beta', expiresAt: new Date(BASE_TIME + 10 * MINUTE).toISOString() })).envelope;
+    const versions = new Map([...alpha, beta].map((envelope) => [envelope.id, envelopeRow(world, envelope.id).version]));
+    world.time.set(BASE_TIME + 11 * MINUTE);
+    const sweep = () => runExpirySweep({ db: world.db, onEnvelopeChange: world.ceremony.onEnvelopeChange, clock: world.time.clock, expiryBatch: 2, maxBatches: 2 });
+
+    // The first run stops at its bound with one alpha envelope still due, and says so.
+    const first = sweep();
+    assert.deepEqual({ expired: first.expired, purged: first.purged, tenants: first.tenants, complete: first.complete }, { expired: 4 + 1, purged: 0, tenants: 2, complete: false }, 'the first sweep stops at its bound with an envelope still due, and reports complete: false');
+    const statesAfterFirst = alpha.map((envelope) => envelopeRow(world, envelope.id).state);
+    assert.deepEqual(statesAfterFirst, ['expired', 'expired', 'expired', 'expired', 'sent'], 'oldest expiry first: the envelope due last waits for the next run');
+    assert.equal(envelopeRow(world, beta.id).state, 'expired', 'the other tenant has its own bound');
+    assert.equal(outboxOf(world, alpha[4].id, 'envelope.expired').length, 0, 'the waiting envelope is not announced');
+
+    // The next run expires the rest and completes; a third finds nothing.
+    const second = sweep();
+    assert.deepEqual({ expired: second.expired, complete: second.complete }, { expired: 1, complete: true }, 'the next sweep expires the rest and reports complete: true');
+    for (const envelope of [...alpha, beta]) {
+      const row = envelopeRow(world, envelope.id);
+      assert.deepEqual({ state: row.state, version: row.version }, { state: 'expired', version: versions.get(envelope.id) + 1 }, 'every due envelope is expired at version + 1');
+      assert.equal(outboxOf(world, envelope.id, 'envelope.expired').length, 1, 'and announced exactly once over the two runs');
+    }
+    const third = sweep();
+    assert.deepEqual({ expired: third.expired, complete: third.complete }, { expired: 0, complete: true }, 'a third sweep finds nothing');
   } finally {
     await world.close();
   }

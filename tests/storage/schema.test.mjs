@@ -463,11 +463,14 @@ test('[DB-14] data-model constraints are enforced by the schema', () => {
       'check',
       /human-operator/,
     );
-    rejects(db, () => s.insert('approvals', approvalRow(g, { env: g.env, digest: g.docDigest }, g.r1, null)), 'unique');
+    // A-010 ROWID-APJ: 0018's approvals_key_exists refuses the duplicate before the unique constraint.
+    rejects(db, () => s.insert('approvals', approvalRow(g, { env: g.env, digest: g.docDigest }, g.r1, null)), 'trigger', /^approvals key exists/);
+    // A-010 ROWID-APJ: 0018's signing_jobs_key_exists refuses the duplicate before the primary key.
     rejects(
       db,
       () => s.insert('signing_jobs', { envelope_id: g.env, reserved_version: 5, status: 'pending', max_attempts: 3, created_at: ts(1), updated_at: ts(1) }),
-      'primary-key',
+      'trigger',
+      /^signing_jobs key exists/,
     );
     rejects(
       db,
