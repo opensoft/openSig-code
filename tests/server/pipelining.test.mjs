@@ -31,8 +31,10 @@
 // A later packet is written only once the handler has its request, or once the client has a
 // whole response. Before its baselines each test waits until no handler of an earlier test is
 // still running, so nothing left over can reach its log, and fails at once if one still is at
-// the guard. Ordering never depends on host timing: the limits below are hang guards only, and
-// every test asserts that no barrier ever opened on its guard instead of its condition.
+// the guard. Ordering never depends on host timing: the limits below are hang guards only. A
+// handler that has not reached its barrier at the guard fails the exchange directly, without the
+// second packet being sent; every test asserts that no other barrier ever opened on its guard
+// instead of its condition.
 
 import assert from 'node:assert/strict';
 import { connect } from 'node:net';
@@ -192,7 +194,8 @@ function responseComplete(text) {
  * One raw loopback connection. Writes `first`; when `second` is given, writes it once the
  * handler has its request (`after: 'dispatch'`) or once the client has the whole first
  * response (`after: 'response'`). Reads until the connection closes; when the server
- * half-closes, the client closes its side too.
+ * half-closes, the client closes its side too. If no handler reaches its barrier within the
+ * guard, the second packet is never sent and the exchange rejects, failing the calling test.
  */
 function exchange(port, first, { second = null, after: trigger = 'dispatch' } = {}) {
   expectedBytes = Buffer.byteLength(first) + (second !== null && trigger === 'dispatch' ? Buffer.byteLength(second) : 0);
@@ -202,7 +205,7 @@ function exchange(port, first, { second = null, after: trigger = 'dispatch' } = 
     dispatched = true;
     if (trigger === 'dispatch') writeSecond();
   };
-  return new Promise((resolveExchange) => {
+  return new Promise((resolveExchange, rejectExchange) => {
     const socket = connect({ host: '127.0.0.1', port, allowHalfOpen: true });
     let text = '';
     let serverEnded = false;
@@ -226,16 +229,34 @@ function exchange(port, first, { second = null, after: trigger = 'dispatch' } = 
       socket.write(first);
       if (trigger === 'dispatch' && dispatched) writeSecond();
     });
-    // A request that never reaches its handler would otherwise wait for the limit below.
-    const fallback = second !== null && trigger === 'dispatch' ? setTimeout(writeSecond, HOLD_LIMIT_MS) : null;
+    // Hang guard only: a handler that has not reached its barrier in time (absent or merely
+    // late) fails the test here, and the second packet is never sent out of the order the
+    // test checks.
+    let barrierMissed = false;
+    const guard =
+      second !== null && trigger === 'dispatch'
+        ? setTimeout(() => {
+            if (secondWritten) return;
+            barrierMissed = true;
+            socket.destroy();
+          }, HOLD_LIMIT_MS)
+        : null;
     const limit = setTimeout(() => {
       closedByLimit = true;
       socket.destroy();
     }, EXCHANGE_LIMIT_MS);
     socket.on('close', () => {
       clearTimeout(limit);
-      if (fallback !== null) clearTimeout(fallback);
+      if (guard !== null) clearTimeout(guard);
       onDispatch = () => {};
+      if (barrierMissed) {
+        rejectExchange(
+          new assert.AssertionError({
+            message: `exchange: no handler reached its barrier within ${HOLD_LIMIT_MS} ms, so the second packet was never sent in the order this test checks`,
+          }),
+        );
+        return;
+      }
       // Status lines anywhere: a later response follows the previous body directly.
       resolveExchange({ text, statuses: statusesOf(text), serverEnded, closedByLimit });
     });
@@ -436,6 +457,7 @@ test('[SEC-11] control: a malformed request with no response pending still gets 
   });
   const logged = () => control.lines.map((line) => JSON.parse(line));
   const handled = () => logged().filter((record) => record.event === 'request').map((record) => record.status);
+  const guardBefore = guardHits;
   try {
     // The first bytes of a connection: nothing was dispatched.
     const fresh = await exchange(control.port, 'GARBAGE /\r\n\r\n');
@@ -473,6 +495,7 @@ test('[SEC-11] control: a malformed request with no response pending still gets 
     assert.equal(chunked.closedByLimit, false);
 
     assert.equal(logged().filter((record) => record.event === SEC11_EVENT).length, 0, 'parser errors are not suppressed globally');
+    assert.equal(guardHits, guardBefore, 'every barrier opened on its condition');
   } finally {
     await control.close();
   }
