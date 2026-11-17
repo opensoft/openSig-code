@@ -33,13 +33,16 @@
 // canned 400 and destroys the socket, even when a request before those bytes was complete and
 // its handler is still working, so that request's response was lost. Pipelined bytes after a
 // `Connection: close` request, or extra bytes after a complete body, did that. The server's
-// 'clientError' handling (createAppServer) now keeps the pending response instead: when the
-// parser fails on bytes after a complete request whose response is still pending, nothing is
-// written; the parser is detached so nothing more is parsed, no request queued behind the
-// pending one is dispatched (as SEC-08), the pending response is sent with `Connection: close`,
-// and then the connection closes with the lingering close. Every other client error keeps
-// Node's default handling exactly: a malformed request with no response pending, or a
-// malformed body inside the request being handled, still gets Node's 400.
+// 'clientError' handling (createAppServer) now keeps the pending response instead. The gate is
+// the first pending request (the oldest request whose response has not finished): when the
+// parser fails and that request is complete, the failing bytes lie after it, whichever later
+// request they belong to (junk, a pipelined request after a close, or a malformed request
+// already dispatched behind it). Then nothing is written; the parser is detached so nothing
+// more is parsed; the connection is closing, so no request behind the first pending one is
+// dispatched (as SEC-08); the first pending response is sent with `Connection: close`; and
+// the connection closes with the lingering close. Every other client error keeps Node's
+// default handling exactly: a malformed request with no response pending, or a malformed body
+// inside the first pending request itself, still gets Node's canned 400 (or 413, 431).
 
 import { createServer, STATUS_CODES, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
@@ -210,8 +213,6 @@ interface Connection {
   tail: Promise<void>;
   /** Requests handed to the app, in order, whose response has not finished and that were not refused. */
   pending: IncomingMessage[];
-  /** The request Node parsed last on this connection. */
-  latest: IncomingMessage | null;
   /** SEC-11: the first pending request when the parser failed; it is still served while closing. */
   lastServed: IncomingMessage | null;
   /** Called when `pending` empties (SEC-11: close once the pending response is sent). */
@@ -401,13 +402,16 @@ export function createApp(options: AppOptions): App {
   };
 
   /**
-   * Node's 'clientError' (SEC-11). When the parser fails on bytes after a complete request
-   * whose response is still pending, that response is kept: nothing is written now, the
-   * parser is detached and the rest of the input discarded, and the connection is closing.
-   * The first pending request is still served (its handler may not have started yet), with
-   * Connection: close; any request queued behind it is refused, as SEC-08 refuses requests
-   * after a decided close. Once the pending responses are done, the connection half-closes and
-   * lingers. Every other client error gets Node's default handling, unchanged.
+   * Node's 'clientError' (SEC-11). Gated on the first pending request, not on the request
+   * parsed last: when the parser fails and the first pending request is complete, the failing
+   * bytes come after it (junk, or a later request, even one already dispatched with a malformed
+   * body), and its response is kept. Nothing is written now, the parser is detached and the
+   * rest of the input discarded, and the connection is closing. The first pending request is
+   * still served (its handler may not have started yet), with Connection: close; every request
+   * behind it is refused, as SEC-08 refuses requests after a decided close, so a malformed
+   * request never reaches its handler. Once the pending responses are done, the connection
+   * half-closes and lingers. Every other client error gets Node's default handling, unchanged:
+   * an incomplete first pending request owns the failing bytes itself.
    */
   const clientError = (error: Error & { code?: string }, stream: Duplex): void => {
     const socket = stream as SocketWithMessage;
@@ -418,7 +422,7 @@ export function createApp(options: AppOptions): App {
       connection !== undefined &&
       first !== undefined &&
       code.startsWith('HPE_') &&
-      connection.latest?.complete === true &&
+      first.complete &&
       socket.writable &&
       !socket.destroyed
     ) {
@@ -447,13 +451,12 @@ export function createApp(options: AppOptions): App {
       const socket = req.socket;
       let connection = connections.get(socket);
       if (connection === undefined) {
-        connection = { closing: false, tail: Promise.resolve(), pending: [], latest: null, lastServed: null, whenIdle: null };
+        connection = { closing: false, tail: Promise.resolve(), pending: [], lastServed: null, whenIdle: null };
         connections.set(socket, connection);
       }
       const current = connection;
       // Recorded at once, while Node may still be parsing the rest of the packet (SEC-11).
       current.pending.push(req);
-      current.latest = req;
       let released = false;
       const release = (): void => {
         if (released) return;
