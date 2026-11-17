@@ -30,9 +30,9 @@
 // barrier always waits at least one macrotask, which runs only after that call has returned.
 // A later packet is written only once the handler has its request, or once the client has a
 // whole response. Before its baselines each test waits until no handler of an earlier test is
-// still running, so nothing left over can reach its log. Ordering never depends on host timing:
-// the limits below are hang guards only, and every test asserts that no barrier ever opened on
-// its guard instead of its condition.
+// still running, so nothing left over can reach its log, and fails at once if one still is at
+// the guard. Ordering never depends on host timing: the limits below are hang guards only, and
+// every test asserts that no barrier ever opened on its guard instead of its condition.
 
 import assert from 'node:assert/strict';
 import { connect } from 'node:net';
@@ -93,14 +93,20 @@ const counted = (handler) => async (ctx) => {
   }
 };
 
-/** Barrier: no handler is running, so nothing left over from an earlier exchange can log. */
+/**
+ * Barrier: no handler is running, so nothing left over from an earlier exchange can log. If a
+ * handler is still running at the guard, the calling test fails here and now: baselines taken
+ * with a leftover in flight would not be baselines, and no caller can skip this check.
+ */
 async function quiesce() {
   let waited = 0;
   while (inFlight > 0 && waited < HOLD_LIMIT_MS) {
     await pause(5);
     waited += 5;
   }
-  if (inFlight > 0) guardHits += 1;
+  if (inFlight > 0) {
+    assert.fail(`quiesce: ${inFlight} handler(s) from an earlier exchange still running after ${HOLD_LIMIT_MS} ms; this test's baselines would include their effects`);
+  }
   await pause(0);
 }
 
