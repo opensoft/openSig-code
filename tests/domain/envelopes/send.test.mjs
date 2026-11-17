@@ -251,3 +251,31 @@ test('[ST-14] a service principal sending a human-created envelope gets 409 conf
     ctx.db.close();
   }
 });
+
+test('[ST-14] the recipient preview requires a human confirmation when the envelope is service-created or the reader is a service; the envelope view keeps the creator rule', () => {
+  const ctx = setup(scratch);
+  try {
+    const humanCreated = preparedEnvelope(ctx, { creator: HUMAN });
+    const serviceCreated = preparedEnvelope(ctx, { creator: SERVICE });
+    for (const [envelope, reader, expected] of [
+      [humanCreated, HUMAN, false],
+      [humanCreated, SERVICE, true],
+      [serviceCreated, HUMAN, true],
+      [serviceCreated, SERVICE, true],
+    ]) {
+      const label = `${envelope.created_by.kind}-created, ${reader.kind} reader`;
+      const preview = ctx.service.preview(req(ctx.tenant, reader), envelope.id);
+      assert.deepEqual(contractErrors('RecipientPreview', preview), [], `${label}: the preview conforms to the contract`);
+      assert.equal(preview.requires_human_confirmation, expected, `${label}: requires_human_confirmation`);
+      assert.equal(preview.version, envelope.version, `${label}: a preview read leaves the version`);
+      // The contract describes send_confirmation.required as "True when created_by.kind is service" (A-010: unchanged until the next contract bump).
+      assert.equal(ctx.service.read(req(ctx.tenant, reader), envelope.id).send_confirmation.required, envelope.created_by.kind === 'service', `${label}: send_confirmation.required`);
+    }
+
+    // What the preview reports is what that principal's send needs.
+    rejectsWith(() => ctx.service.send(req(ctx.tenant, SERVICE), humanCreated.id, { expected_version: humanCreated.version }), 'confirmation_required', 409);
+    assert.equal(ctx.service.send(req(ctx.tenant, HUMAN), humanCreated.id, { expected_version: humanCreated.version }).body.state, 'sent');
+  } finally {
+    ctx.db.close();
+  }
+});

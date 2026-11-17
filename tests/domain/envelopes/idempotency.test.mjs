@@ -6,7 +6,9 @@
 // ratified response_body rules (data-model.md § IdempotencyRecord, A-010):
 // byte-identical replay after the envelope has moved on, the 256 KiB bound
 // that fails the transaction, the no-body mode for one-time secrets, and the
-// 24-hour lifetime with a bounded purge that writes no DisposalRecord.
+// 24-hour lifetime with a bounded purge that writes no DisposalRecord. The
+// schema enforces the same bound for every writer (migration 0012, A-010
+// IDEMP-B1).
 
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
@@ -31,6 +33,7 @@ import {
   HUMAN,
   makeScratch,
   OTHER_HUMAN,
+  rawConnection,
   refusedByTrigger,
   rejectsWith,
   req,
@@ -384,6 +387,119 @@ test('[ST-13] records live 24 hours: expired records are purged in bounded batch
     assert.equal(replaced.length, 1, 'the expired record is replaced');
     assert.equal(replaced[0].request_digest, idempotencyRequestDigest({ route: 'createEnvelope', target: null, request: changed }));
   } finally {
+    ctx.db.close();
+  }
+});
+
+// SQLite extended result codes: a RAISE(ABORT) in a trigger, and a STRICT table's type check.
+const SQLITE_CONSTRAINT_TRIGGER = 1811;
+const SQLITE_CONSTRAINT_DATATYPE = 3091;
+
+function thrown(fn) {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  return undefined;
+}
+
+test('[ST-13] the schema bounds response_body at 256 KiB for every writer (migration 0012): direct writes past 262,144 bytes are refused, on insert and on update', () => {
+  const ctx = setup(scratch);
+  const raw = rawConnection(ctx.path);
+  try {
+    const values = (key, body) => ({
+      route: 'syntheticRoute',
+      principal_kind: 'human-operator',
+      principal_ref: HUMAN.ref,
+      key,
+      request_digest: hex(`request-${key}`),
+      response_status: 200,
+      response_body: body,
+      response_body_digest: body === null ? null : sha256(Buffer.from(body)),
+      created_at: ctx.time.now.toISOString(),
+    });
+    const stored = (key) => raw.prepare('SELECT length(response_body) AS bytes, typeof(response_body) AS type FROM idempotency_records WHERE key = ?').get(key);
+
+    // A direct store insert (TenantStore, no repository) of 262,145 bytes: refused by the 0012 trigger.
+    refusedByTrigger(
+      ctx.db,
+      () => ctx.db.forTenant(ctx.tenant).insert('idempotency_records', values('store-over-limit-00001', Buffer.alloc(BODY_LIMIT + 1, 0x61))),
+      /response_body exceeds 262144 bytes/,
+      'a direct store insert of 262,145 bytes is refused',
+    );
+    assert.equal(stored('store-over-limit-00001'), undefined);
+
+    // Raw SQL on a second connection, bypassing the repository and the store.
+    const insert = raw.prepare(
+      'INSERT INTO idempotency_records (tenant_id, route, principal_kind, principal_ref, key, request_digest, response_status, response_body, response_body_digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    );
+    const rawInsert = (key, body) => {
+      const v = values(key, body);
+      insert.run(ctx.tenant, v.route, v.principal_kind, v.principal_ref, v.key, v.request_digest, v.response_status, v.response_body, v.response_body_digest, v.created_at);
+    };
+    const over = thrown(() => rawInsert('raw-over-limit-000001', Buffer.alloc(BODY_LIMIT + 1, 0x61)));
+    assert.equal(over?.errcode, SQLITE_CONSTRAINT_TRIGGER, `262,145 bytes: ${over}`);
+    assert.match(over.message, /response_body exceeds 262144 bytes/);
+    assert.equal(stored('raw-over-limit-000001'), undefined, 'nothing stored, nothing truncated');
+    rawInsert('raw-at-limit-00000001', Buffer.alloc(BODY_LIMIT, 0x61));
+    assert.deepEqual({ ...stored('raw-at-limit-00000001') }, { bytes: BODY_LIMIT, type: 'blob' }, 'exactly 262,144 bytes is accepted, whole');
+    raw.prepare('INSERT INTO idempotency_records (tenant_id, route, principal_kind, principal_ref, key, request_digest, response_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+      ctx.tenant,
+      'syntheticRoute',
+      'human-operator',
+      HUMAN.ref,
+      'raw-withheld-00000001',
+      hex('request-withheld'),
+      201,
+      ctx.time.now.toISOString(),
+    );
+    assert.deepEqual({ ...stored('raw-withheld-00000001') }, { bytes: null, type: 'null' }, 'a NULL body (the withheld mode) passes');
+
+    // TEXT: at most 262,144 characters but more than 262,144 bytes (87,382 three-byte characters).
+    const text = '€'.repeat(87_382);
+    assert.equal(text.length, 87_382);
+    assert.equal(Buffer.byteLength(text, 'utf8'), 262_146);
+    const textRefusal = thrown(() => rawInsert('raw-text-over-bytes01', text));
+    assert.ok(
+      textRefusal?.errcode === SQLITE_CONSTRAINT_DATATYPE || textRefusal?.errcode === SQLITE_CONSTRAINT_TRIGGER,
+      `a TEXT body over 262,144 bytes is refused (${textRefusal?.errcode} ${textRefusal?.message})`,
+    );
+    assert.equal(stored('raw-text-over-bytes01'), undefined);
+    // The table is STRICT, so its type check refuses any TEXT body first; the 0012 condition
+    // itself counts bytes, not characters, as its stored SQL shows when evaluated on the value.
+    assert.equal(raw.prepare("SELECT strict FROM pragma_table_list WHERE name = 'idempotency_records'").get().strict, 1);
+    const condition = (name) => {
+      const sql = raw.prepare("SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?").get(name)?.sql;
+      assert.ok(sql, `trigger ${name} exists`);
+      const when = /\bWHEN\b([\s\S]*?)\bBEGIN\b/i.exec(sql)?.[1];
+      assert.ok(when, `trigger ${name} has a WHEN condition`);
+      return raw.prepare(`SELECT (${when.replaceAll('NEW.response_body', '?1')}) AS fires`);
+    };
+    for (const name of ['idempotency_records_body_bound_insert', 'idempotency_records_body_bound_update']) {
+      const fires = condition(name);
+      assert.equal(raw.prepare('SELECT length(?) AS characters').get(text).characters, 87_382, 'a character count would let this value pass');
+      assert.equal(fires.get(text).fires, 1, `${name}: fires on 87,382 characters of 262,146 bytes`);
+      assert.equal(fires.get('a'.repeat(BODY_LIMIT)).fires, 0, `${name}: 262,144 one-byte characters pass`);
+      assert.equal(fires.get(Buffer.alloc(BODY_LIMIT + 1)).fires, 1, `${name}: fires on 262,145 bytes`);
+      assert.equal(fires.get(Buffer.alloc(BODY_LIMIT)).fires, 0, `${name}: 262,144 bytes pass`);
+      assert.equal(fires.get(null).fires, 0, `${name}: NULL passes`);
+    }
+
+    // UPDATE: rows are immutable (0004), and 0012 bounds the column on update too. With the
+    // immutability trigger dropped on this scratch store, only 0012 can refuse.
+    const update = raw.prepare('UPDATE idempotency_records SET response_body = ? WHERE key = ?');
+    const updateOver = thrown(() => update.run(Buffer.alloc(BODY_LIMIT + 1, 0x62), 'raw-at-limit-00000001'));
+    assert.equal(updateOver?.errcode, SQLITE_CONSTRAINT_TRIGGER, `an update to 262,145 bytes is refused: ${updateOver}`);
+    raw.exec('DROP TRIGGER idempotency_records_immutable_update');
+    const updateOnlyBound = thrown(() => update.run(Buffer.alloc(BODY_LIMIT + 1, 0x62), 'raw-at-limit-00000001'));
+    assert.equal(updateOnlyBound?.errcode, SQLITE_CONSTRAINT_TRIGGER, `${updateOnlyBound}`);
+    assert.match(updateOnlyBound.message, /response_body exceeds 262144 bytes/, 'the 0012 update trigger refuses 262,145 bytes');
+    assert.deepEqual({ ...stored('raw-at-limit-00000001') }, { bytes: BODY_LIMIT, type: 'blob' }, 'the stored body is unchanged');
+    update.run(Buffer.alloc(BODY_LIMIT, 0x62), 'raw-at-limit-00000001');
+    assert.equal(raw.prepare('SELECT response_body FROM idempotency_records WHERE key = ?').get('raw-at-limit-00000001').response_body[0], 0x62, 'an update to exactly 262,144 bytes passes the bound');
+  } finally {
+    raw.close();
     ctx.db.close();
   }
 });

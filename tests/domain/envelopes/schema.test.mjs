@@ -36,6 +36,7 @@ after(() => scratch.cleanup());
 const PINNED_T007_MIGRATIONS = Object.freeze([
   { version: 10, name: '0010-envelope-freeze-version-graph.sql', sha256: 'b52503d539f794ecfddd44d2c9638a78fa16268bfd5c5f369aa072086aeca57d' },
   { version: 11, name: '0011-idempotency-response-body.sql', sha256: 'adf11be692fe9ef40b0484334696f85c4ea5001431e7ce71d4beab3d77737c1c' },
+  { version: 12, name: '0012-idempotency-body-bound.sql', sha256: '3d5460527f5e7595122194567c79bf3cd8327002dcf403854431761a8ddf332c' },
 ]);
 
 const STATES = Object.keys(RULED_GRAPH);
@@ -319,7 +320,7 @@ test('[ST-12] the graph does not govern inserts, while domain create and reissue
   }
 });
 
-test('[ST-12] migrations 0010 and 0011 are appended after the T003 set and pinned by SHA-256', () => {
+test('[ST-12] migrations 0010, 0011 and 0012 are appended after the T003 set and pinned by SHA-256', () => {
   const migrations = loadMigrations();
   for (const pinned of PINNED_T007_MIGRATIONS) {
     const actual = migrations[pinned.version - 1];
@@ -331,7 +332,7 @@ test('[ST-12] migrations 0010 and 0011 are appended after the T003 set and pinne
     const raw = rawConnection(ctx.path);
     try {
       const applied = raw.prepare('SELECT version, name, sha256 FROM schema_migrations WHERE version >= 10 ORDER BY version').all().map((row) => ({ ...row }));
-      assert.deepEqual(applied.slice(0, 2), PINNED_T007_MIGRATIONS.map((entry) => ({ ...entry })));
+      assert.deepEqual(applied.slice(0, PINNED_T007_MIGRATIONS.length), PINNED_T007_MIGRATIONS.map((entry) => ({ ...entry })));
       const triggers = raw.prepare("SELECT name FROM sqlite_schema WHERE type = 'trigger' AND sql LIKE '%AFTER%' AND name LIKE 'envelopes_%' ORDER BY name").all().map((row) => row.name);
       assert.deepEqual(triggers, ['envelopes_frozen_columns', 'envelopes_state_graph', 'envelopes_version_step']);
     } finally {

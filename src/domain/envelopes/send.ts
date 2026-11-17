@@ -11,9 +11,11 @@
 //   earlier);
 // - is consumed by the send that uses it (single use).
 // A human operator sending a human-created envelope needs no confirmation.
-// The view field send_confirmation.required keeps the contract's creator
-// rule (true exactly when created_by.kind is service); the service-sender
-// rule is decided per send, from the sender.
+// The envelope view's send_confirmation.required keeps the contract's
+// creator rule (true exactly when created_by.kind is service); the
+// service-sender rule is decided per send, from the sender, and the recipient
+// preview's requires_human_confirmation applies it to the reading principal
+// (A-010 IDEMP-B2).
 
 import type { SendConfirmationRecord } from '../../storage/repositories/envelopes.ts';
 import type { Actor } from './validation.ts';

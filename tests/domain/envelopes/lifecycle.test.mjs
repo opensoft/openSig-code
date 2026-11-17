@@ -141,7 +141,8 @@ test('[ST-04] prepare freezes the document, the field definitions, the RFC 8785 
     assert.equal(preview.recipients_digest, canonicalDigest(recipients), 'recipients_digest = SHA-256 of canonical [{ordinal, role, email}] in ordinal order');
     assert.equal(row(ctx, 'envelopes', { id: created.id }).recipients_digest, preview.recipients_digest);
     assert.equal(preview.manifest_digest, prepared.manifest_digest);
-    assert.equal(preview.requires_human_confirmation, false);
+    // A-010 IDEMP-B2: a service reading the preview of this human-created envelope needs a human confirmation to send it.
+    assert.equal(preview.requires_human_confirmation, true);
     assert.equal(preview.version, prepared.version, 'a preview read leaves the version');
 
     const revision = row(ctx, 'document_revisions', { envelope_id: created.id });

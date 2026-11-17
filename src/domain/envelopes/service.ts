@@ -375,7 +375,7 @@ export class EnvelopeService {
     return this.#read(request, (store) => {
       const aggregate = this.#aggregate(store, envelopeId);
       this.#expectState(aggregate.envelope, ['prepared']);
-      return previewView(aggregate);
+      return previewView(aggregate, request.actor);
     });
   }
 

@@ -7,6 +7,7 @@
 import type { JsonValue } from '../../domain/canonical/index.ts';
 import type { EnvelopeAggregate, SendConfirmationRecord } from '../../storage/repositories/envelopes.ts';
 import { confirmationRequired } from './send.ts';
+import type { Actor } from './validation.ts';
 
 /** anchor_status until T021 wires the anchoring adapters. */
 const ANCHOR_STATUS = 'disabled';
@@ -108,8 +109,14 @@ export function envelopeView(aggregate: EnvelopeAggregate, openReference: string
   };
 }
 
-/** What a human confirms before sending (contract RecipientPreview); only for a prepared envelope. */
-export function previewView(aggregate: EnvelopeAggregate): JsonValue {
+/**
+ * What a human confirms before sending (contract RecipientPreview); only for a
+ * prepared envelope. requires_human_confirmation applies the send rule to the
+ * reading principal: true when the envelope is service-created or the reader
+ * is a service (A-010 IDEMP-B2). The envelope view's send_confirmation.required
+ * keeps the contract's creator rule.
+ */
+export function previewView(aggregate: EnvelopeAggregate, reader: Actor): JsonValue {
   const envelope = aggregate.envelope;
   return {
     envelope_id: envelope.id,
@@ -122,7 +129,7 @@ export function previewView(aggregate: EnvelopeAggregate): JsonValue {
     recipients_digest: envelope.recipientsDigest,
     recipients: recipientsView(aggregate),
     fields: fieldsView(aggregate),
-    requires_human_confirmation: confirmationRequired(envelope.createdBy),
+    requires_human_confirmation: confirmationRequired(envelope.createdBy, reader),
   };
 }
 
