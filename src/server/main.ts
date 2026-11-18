@@ -73,7 +73,10 @@
 // 5. the parse counts are read a last time;
 // 6. the database closes, and `closed` is logged with the work counts and the parse totals.
 // The process then exits 0. A second signal during shutdown ends the process at once (Node's
-// default handling).
+// default handling). The SIGINT and SIGTERM handlers are installed before startup begins (row
+// SIGTERM-RACE, request #54), so the `listening` line always follows them: a signal that arrives
+// during startup is held, and the server closes as soon as it is running, then exits 0. A start
+// failure still exits 1.
 //
 // Listener state (A-010 row SEC16-PROBE, request #47): each listener's view (ListenerView) also
 // reads, live, whether its server is listening and how many connections it has accepted, so a
@@ -597,17 +600,12 @@ async function listenAll(
 }
 
 async function main(): Promise<void> {
-  let running: RunningServer;
-  try {
-    running = await startServer();
-  } catch (error) {
-    const message = error instanceof Error && error.name.endsWith('ConfigError') ? error.message : 'the server could not start';
-    process.stderr.write(`opensig: ${message}\n`);
-    process.exitCode = 1;
-    return;
-  }
-  const stop = (): void => {
-    running.close().then(
+  // SIGTERM-RACE (request #54): the handlers come first, so no signal meets Node's default
+  // disposition once startup has begun. Until the server is running, a signal is only held.
+  let running: RunningServer | null = null;
+  let held = false;
+  const close = (server: RunningServer): void => {
+    server.close().then(
       () => {
         process.exitCode = 0;
       },
@@ -616,8 +614,25 @@ async function main(): Promise<void> {
       },
     );
   };
+  const stop = (): void => {
+    if (running === null) held = true;
+    else close(running);
+  };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
+  try {
+    running = await startServer();
+  } catch (error) {
+    // A start failure exits 1 as before; the handlers go, so the exit path is the old one.
+    process.off('SIGINT', stop);
+    process.off('SIGTERM', stop);
+    const message = error instanceof Error && error.name.endsWith('ConfigError') ? error.message : 'the server could not start';
+    process.stderr.write(`opensig: ${message}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  // A signal held during startup closes the server now that it is running.
+  if (held) close(running);
 }
 
 function invokedDirectly(): boolean {

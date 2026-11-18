@@ -38,6 +38,10 @@
 // /proc/self/fd. The attempt writes no byte, and nothing outside this process is inspected or
 // touched. The record (no secret, no path) goes to $OPENSIG_VERIFY_OUT/sec16-probe.json, ignored
 // output that is never committed and never evidence of a pass, and to a test diagnostic.
+// Strengthened (A-010 row SEC16-TESTS, request #54): N1, each view counts exactly its own
+// connections (the relay request raises only the relay view's count, the TCP request only the TCP
+// view's); N2, the record is read back as written and fails the case if it holds a host-absolute
+// path (the working directory, the repository root, the home directory, or any absolute path).
 // Extended (A-010 request #30):
 // - SHUTDOWN-INFLIGHT and SWEEP-SCHED: the order is the listeners, then every dispatched
 //   handler settles (a send held in the blocked notifier), then the ceremony drain, then the
@@ -52,7 +56,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, readdirSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs';
 import { ServerResponse } from 'node:http';
 import { connect } from 'node:net';
-import { endianness } from 'node:os';
+import { endianness, homedir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { after, test } from 'node:test';
@@ -190,7 +194,8 @@ function describeProbe(probe) {
 /**
  * Record the diagnostic whatever the verdict: as a test diagnostic, and as sec16-probe.json in the
  * runner's output directory (OPENSIG_VERIFY_OUT; outside the runner, the gitignored
- * .verify-out/server/). A failed write is ignored: the record never decides the case.
+ * .verify-out/server/). Returns the file written, or null when the write failed, which is
+ * ignored: the record is never evidence of a pass. Only N2 reads it back, for host paths.
  */
 function recordProbe(t, record) {
   t.diagnostic(`SEC16-PROBE ${JSON.stringify(record)}`);
@@ -198,9 +203,42 @@ function recordProbe(t, record) {
     const dir = process.env.OPENSIG_VERIFY_OUT ?? join(REPO, '.verify-out', 'server');
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'sec16-probe.json'), `${JSON.stringify(record, null, 2)}\n`);
+    return join(dir, 'sec16-probe.json');
   } catch {
     // evidence only
+    return null;
   }
+}
+
+/**
+ * N2 (row SEC16-TESTS, request #54; request #48 C1): every place where the record names a
+ * host-absolute path, as its JSON path and the rule it breaks, never the value itself. No string,
+ * key or value, may contain the working directory, the repository root or the home directory, or
+ * hold an absolute path anywhere (`/…`, `~/…`, `C:\…` or a `file:` URL), as a stack frame with a
+ * full path would; stack frames must be repo-relative.
+ */
+function hostPaths(text) {
+  const named = [
+    ['working directory', process.cwd()],
+    ['repository root', REPO],
+    ['home directory', homedir()],
+  ].filter(([, value]) => typeof value === 'string' && value.length > 1);
+  const found = [];
+  const visit = (value, at) => {
+    if (typeof value === 'string') {
+      for (const [rule, prefix] of named) if (value.includes(prefix)) found.push(`${at}: ${rule}`);
+      if (/(?:^|[\s("'=,])(?:\/|~\/|[A-Za-z]:\\)/.test(value) || value.includes('file:')) found.push(`${at}: absolute path`);
+    } else if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, `${at}[${index}]`));
+    } else if (value !== null && typeof value === 'object') {
+      for (const [key, item] of Object.entries(value)) {
+        visit(key, `${at} key`);
+        visit(item, `${at}.${key}`);
+      }
+    }
+  };
+  visit(JSON.parse(text), '$');
+  return found;
 }
 
 test('[SEC-15] on the composed server with a blocked notifier, the generic 202 is written to the socket before any background ceremony step starts', async () => {
@@ -285,11 +323,20 @@ test('[SEC-16] shutdown closes the listeners, then waits for pending background 
     // started and counts a connection made to it. Every premise has its own message (request #48, A5).
     assert.deepEqual(running.listeners.map((listener) => listener.name), ['tcp', 'relay'], 'premise: both product listeners are started');
     for (const listener of running.listeners) assert.equal(listener.listening, true, `premise: the ${listener.name} listener reports listening once started`);
+    // N1 (row SEC16-TESTS, request #54): each view counts exactly its own connections, so a view
+    // wired to the other listener's server fails here.
+    const [tcpView, relayView] = running.listeners;
+    const beforeRelay = { tcp: tcpView.acceptedConnections, relay: relayView.acceptedConnections };
     const viaRelay = await call(0, { socketPath: relaySocket, path: `/v1/envelopes/${ENVELOPE_ID}` });
     assert.equal(viaRelay.status, 401, 'premise: the relay listener serves (an operator route, no operator authentication configured)');
+    assert.equal(relayView.acceptedConnections - beforeRelay.relay, 1, `premise: the relay request raised the relay listener's count by exactly one (${relayView.acceptedConnections - beforeRelay.relay})`);
+    assert.equal(tcpView.acceptedConnections - beforeRelay.tcp, 0, `premise: the relay request left the tcp listener's count unchanged (${tcpView.acceptedConnections - beforeRelay.tcp})`);
     const { token } = await side.sentEnvelope();
+    const beforeTcp = { tcp: tcpView.acceptedConnections, relay: relayView.acceptedConnections };
     const response = await postChallenge(running.port, token);
     assert.equal(response.status, 202, `premise: the challenge request over TCP got the generic 202 (${response.status})`);
+    assert.equal(tcpView.acceptedConnections - beforeTcp.tcp, 1, `premise: the challenge request over TCP raised the tcp listener's count by exactly one (${tcpView.acceptedConnections - beforeTcp.tcp})`);
+    assert.equal(relayView.acceptedConnections - beforeTcp.relay, 0, `premise: the challenge request over TCP left the relay listener's count unchanged (${relayView.acceptedConnections - beforeTcp.relay})`);
     for (const listener of running.listeners) assert.ok(listener.acceptedConnections >= 1, `premise: the ${listener.name} listener counted the test's own connection (${listener.acceptedConnections})`);
     await guarded(relay.until((state) => state.connections === 1), 'the job reached the blocked notifier');
     assert.equal(running.composition.ceremony.challengeWorkStats().pending, 1, 'premise: one job pending');
@@ -319,7 +366,7 @@ test('[SEC-16] shutdown closes the listeners, then waits for pending background 
     const probe = await probeFormerPort(running.port);
     await turn();
     await turn();
-    recordProbe(t, {
+    const record = {
       case: 'SEC-16',
       port: running.port,
       probe,
@@ -330,7 +377,11 @@ test('[SEC-16] shutdown closes the listeners, then waits for pending background 
         work_after: { ...running.composition.ceremony.challengeWorkStats() },
         own_listeners_on_port: ownListeners(probe, running.port).length,
       },
-    });
+    };
+    const recordPath = recordProbe(t, record);
+    // N2 (row SEC16-TESTS, request #54): the record, as written to disk, holds no host-absolute path.
+    const recordText = recordPath === null ? JSON.stringify(record) : readFileSync(recordPath, 'utf8');
+    assert.deepEqual(hostPaths(recordText), [], 'the SEC16-PROBE record holds no host-absolute path');
     // Each message names its own fact and never repeats the pre-amendment probe's message.
     const where = describeProbe(probe);
     for (const listener of running.listeners) assert.equal(listener.listening, false, `during the drain the ${listener.name} listener still reports listening (${where})`);

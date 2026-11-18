@@ -11,6 +11,12 @@
 //   repository (its dist/ included).
 // - Note 2: App.routes is a read-only property, so it cannot show a registry other than the one
 //   the app was built from (dispatch uses a compiled copy made at creation).
+// - Row SIGTERM-RACE (A-010 request #54), SEC-12 extended: the entrypoint installs its SIGINT
+//   and SIGTERM handlers before startup begins. A SIGTERM sent on the entrypoint's first output
+//   line is held while start is held, and the server closes once it is running and exits 0. Start
+//   is held through the existing static seam: startup imports src/server/static.ts before either
+//   listener exists, so a stand-in written into the copy can hold it at its top level until the
+//   test releases it, after the signal was sent and before any `listening` line.
 // Waits are barriers on observable state; the only timers are hang guards.
 
 import assert from 'node:assert/strict';
@@ -51,12 +57,27 @@ export function createStaticHandler(options) {
 }
 `;
 
-/** A temporary copy of src/ with the stand-in static.ts beside the copied main.ts. */
-function copiedSource() {
+const STAND_IN_HOLD = `// SPDX-License-Identifier: Apache-2.0
+// Stand-in for T035's src/server/static.ts, written at test run time into a temporary copy of
+// src/ (SEC-12, row SIGTERM-RACE). Startup imports it before either listener exists, so its top
+// level holds start: it writes one marker line, then waits for one chunk on stdin.
+await new Promise((resolveRelease) => {
+  process.stdin.once('data', () => resolveRelease());
+  process.stdout.write('{"event":"test_start_held"}\\n');
+});
+process.stdin.destroy();
+
+export function createStaticHandler() {
+  return async () => null;
+}
+`;
+
+/** A temporary copy of src/ with a stand-in static.ts (default: the recording one) beside the copied main.ts. */
+function copiedSource(standIn = STAND_IN_STATIC) {
   const root = tempDir('static-seam');
   cpSync(join(REPO, 'src'), join(root, 'src'), { recursive: true });
   copyFileSync(join(REPO, 'package.json'), join(root, 'package.json'));
-  writeFileSync(join(root, 'src', 'server', 'static.ts'), STAND_IN_STATIC);
+  writeFileSync(join(root, 'src', 'server', 'static.ts'), standIn);
   assert.ok(readFileSync(join(root, 'src', 'server', 'main.ts')).equals(readFileSync(join(REPO, 'src', 'server', 'main.ts'))), 'premise: the copied entrypoint is byte-identical to the real one');
   return root;
 }
@@ -130,6 +151,54 @@ test('[SEC-12] the real entrypoint never sets distDir: node src/server/main.ts b
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     rmSync(received, { force: true });
+  }
+});
+
+test('[SEC-12] a SIGTERM that arrives during startup is held: node src/server/main.ts, signalled on its first output line while start is held, closes once it is running and exits 0 (row SIGTERM-RACE)', async () => {
+  const root = copiedSource(STAND_IN_HOLD);
+  const child = spawn(process.execPath, [join(root, 'src', 'server', 'main.ts')], { cwd: root, env: { PATH: process.env.PATH ?? '', ...composedEnv() }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const output = { stdout: '', stderr: '' };
+  child.stdout.setEncoding('utf8').on('data', (chunk) => (output.stdout += chunk));
+  child.stderr.setEncoding('utf8').on('data', (chunk) => (output.stderr += chunk));
+  child.stdin.on('error', () => {});
+  // 'close', not 'exit': it comes once the child has ended and its stdout and stderr are drained.
+  const exited = new Promise((resolveExit) => child.on('close', (code, signal) => resolveExit({ code, signal })));
+  /** Barrier: the first complete stdout line that `matches`, or null once the child has ended without one. */
+  const lineSeen = (matches) =>
+    new Promise((resolveLine) => {
+      const check = () => {
+        const line = output.stdout.split('\n').slice(0, -1).find(matches);
+        if (line === undefined) return;
+        child.stdout.off('data', check);
+        resolveLine(line);
+      };
+      child.stdout.on('data', check);
+      exited.then(() => {
+        check();
+        resolveLine(null);
+      });
+      check();
+    });
+  try {
+    // The first line the entrypoint writes: startup has begun, and it cannot finish before the
+    // stand-in releases it, so the signal arrives before the server is running.
+    const first = await guarded(lineSeen(() => true), 'the entrypoint\'s first output line', LISTENING_BOUND_MS);
+    assert.notEqual(first, null, `premise: the entrypoint wrote a line before it ended (stderr: ${output.stderr})`);
+    child.kill('SIGTERM');
+    const held = await guarded(lineSeen((line) => line.includes('"event":"test_start_held"')), 'start held at the static seam', LISTENING_BOUND_MS);
+    if (held !== null) {
+      assert.equal(output.stdout.includes('"event":"listening"'), false, 'premise: the SIGTERM was sent while start was held, before any listening line');
+      child.stdin.end('release');
+    }
+    const { code, signal } = await guarded(exited, 'the entrypoint exit after a SIGTERM held during startup');
+    assert.deepEqual([code, signal], [0, null], `the entrypoint holds a SIGTERM sent during startup, then closes and exits 0 (stderr: ${output.stderr})`);
+    const events = output.stdout
+      .split('\n')
+      .filter((line) => line.startsWith('{'))
+      .map((line) => JSON.parse(line).event);
+    assert.ok(events.includes('listening') && events.indexOf('closed') > events.indexOf('listening'), `the server started, then completed its close (events: ${events.join(', ')})`);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
   }
 });
 
