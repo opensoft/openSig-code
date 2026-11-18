@@ -17,8 +17,16 @@
 //                                whose tenants table owns each tenant's allowed roles
 //                                (A-008 P11); default <OPENSIG_DATA_DIR>/opensig.db. Needed
 //                                whenever OPENSIG_OPERATOR_AUTH_FILE is set (src/server/tenants.ts).
-//   OPENSIG_ENV, OPENSIG_MAIL_TRANSPORT, OPENSIG_SPOOL_DIR, OPENSIG_DATA_DIR
-//                                passed through to handlers (set by the dev launcher).
+//   OPENSIG_CHALLENGE_KEY_FILE   absolute path of the recipient challenge-HMAC key (T008;
+//                                quickstart.md § Configuration). Required: startup refuses
+//                                unless it is a regular file, not a link, owned by the
+//                                server user, with no group or other permission bit (for
+//                                example 0600 or 0400), of 32 to 4096 bytes (main.ts, T008).
+//   OPENSIG_DATA_DIR             the service data directory; the blob store (T028) is its
+//                                `blobs` subdirectory, created 0700 if absent (row WIRE-US1).
+//   OPENSIG_ENV, OPENSIG_MAIL_TRANSPORT, OPENSIG_SPOOL_DIR
+//                                passed through to handlers (set by the dev launcher); the
+//                                mail settings are read by the T032 notifier (main.ts).
 //
 // Errors name the variable, never its value.
 
@@ -39,6 +47,8 @@ export const BODY_IDLE_TIMEOUT_MS = 10_000;
 export const BODY_RATE_GRACE_MS = 10_000;
 export const BODY_MIN_BYTES_PER_SECOND = 16 * 1024;
 export const DATABASE_FILE = 'opensig.db';
+/** The blob store's directory inside OPENSIG_DATA_DIR (the backup layout uses the same name). */
+export const BLOBS_DIRECTORY = 'blobs';
 
 export interface ServerConfig {
   readonly host: string;
@@ -53,6 +63,10 @@ export interface ServerConfig {
   readonly dataDir: string | null;
   /** The SQLite database holding the tenants table, or null when none is configured. */
   readonly database: string | null;
+  /** The recipient challenge-HMAC key file (OPENSIG_CHALLENGE_KEY_FILE), or null when unset. */
+  readonly challengeKeyFile: string | null;
+  /** The blob store root, <OPENSIG_DATA_DIR>/blobs, or null without an absolute data directory. */
+  readonly blobRoot: string | null;
   readonly limits: {
     readonly jsonBytes: number;
     readonly pdfBytes: number;
@@ -103,6 +117,8 @@ export function loadServerConfig(env: Readonly<Record<string, string | undefined
   const dataDir = value(env, 'OPENSIG_DATA_DIR');
   const database = value(env, 'OPENSIG_DATABASE') ?? (dataDir !== null && isAbsolute(dataDir) ? join(dataDir, DATABASE_FILE) : null);
   if (database !== null && !isAbsolute(database)) throw new ServerConfigError('OPENSIG_DATABASE must be an absolute path');
+  const challengeKeyFile = value(env, 'OPENSIG_CHALLENGE_KEY_FILE');
+  if (challengeKeyFile !== null && !isAbsolute(challengeKeyFile)) throw new ServerConfigError('OPENSIG_CHALLENGE_KEY_FILE must be an absolute path');
   return Object.freeze({
     host,
     port,
@@ -114,6 +130,8 @@ export function loadServerConfig(env: Readonly<Record<string, string | undefined
     spoolDir: value(env, 'OPENSIG_SPOOL_DIR'),
     dataDir,
     database,
+    challengeKeyFile,
+    blobRoot: dataDir !== null && isAbsolute(dataDir) ? join(dataDir, BLOBS_DIRECTORY) : null,
     limits: Object.freeze({
       jsonBytes: JSON_BODY_LIMIT,
       pdfBytes: PDF_BODY_LIMIT,

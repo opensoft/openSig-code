@@ -41,7 +41,7 @@ import { connect } from 'node:net';
 import { after, before, test } from 'node:test';
 
 import { startServer } from '../../src/server/main.ts';
-import { bearer, cleanup, ENVELOPE_ID, serveApp } from './support.mjs';
+import { bearer, cleanup, composedEnv, ENVELOPE_ID, serveApp } from './support.mjs';
 
 const HOLD_LIMIT_MS = 3_000;
 const EXCHANGE_LIMIT_MS = 6_000;
@@ -503,7 +503,7 @@ test('[SEC-11] control: a malformed request with no response pending still gets 
 
 test('[SEC-11] the real entrypoint sends the pending response, not the parser 400', async () => {
   const lines = [];
-  const running = await startServer({ OPENSIG_PORT: '0' }, { logSink: (line) => lines.push(line) });
+  const running = await startServer(composedEnv(), { logSink: (line) => lines.push(line) });
   try {
     // No operator authentication is configured, so the GET is decided as a 401.
     const result = await exchange(running.port, read('Connection: close\r\n') + create(6));

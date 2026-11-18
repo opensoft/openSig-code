@@ -11,14 +11,22 @@
 // SEC-10: a request body that goes idle for 10 s, or arrives below the minimum rate once the
 // 10 s grace has passed, is answered with 408 and a connection close by a per-request timer
 // (not Node's 30 s check interval); a body that pauses for less than that is accepted.
+// SEC-10 (A-010 row REQ-TIMEOUT): that timer is the body bound, so Node's request timeout on
+// the entrypoint's listeners is only the outer backstop: never shorter than the longest request
+// SEC-10 admits (headers, the PDF limit at the minimum rate, and the one wait before a body read,
+// a pre-body transaction's busy timeout; the parse plan is settled at startup, A-010 request #32).
 
 import assert from 'node:assert/strict';
 import { connect } from 'node:net';
+import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { after, before, test } from 'node:test';
 
 import * as serverConfig from '../../src/server/config.ts';
-import { bearer, cleanup, ENVELOPE_ID, serveApp } from './support.mjs';
+// A namespace import, so a head without the derived timeouts fails the assertions, not the module load.
+import * as serverMain from '../../src/server/main.ts';
+import { DEFAULT_BUSY_TIMEOUT_MS } from '../../src/storage/db/index.ts';
+import { bearer, cleanup, composedEnv, ENVELOPE_ID, serveApp, tempDir } from './support.mjs';
 
 let served;
 const invoked = [];
@@ -168,4 +176,25 @@ test('[SEC-10] an idle or below-minimum-rate body gets 408 and a connection clos
   assert.ok(BODY_IDLE_TIMEOUT_MS <= 10_000 && BODY_RATE_GRACE_MS <= 10_000 && BODY_MIN_BYTES_PER_SECOND >= 1024, 'the documented limits');
   const timedOut = requestLines().filter((record) => record.status === 408);
   assert.ok(timedOut.length >= 2 && timedOut.every((record) => record.error_code === 'invalid_request'));
+});
+
+test('[SEC-10] Node\'s request timeout on both listeners is never shorter than the longest request SEC-10 admits', async () => {
+  const { PDF_BODY_LIMIT, JSON_BODY_LIMIT, BODY_MIN_BYTES_PER_SECOND } = serverConfig;
+  const { HEADERS_TIMEOUT_MS, PRE_BODY_WAIT_MS, REQUEST_TIMEOUT_MS, startServer } = serverMain;
+  const longestPdf = Math.ceil(PDF_BODY_LIMIT / BODY_MIN_BYTES_PER_SECOND) * 1000;
+  const longestJson = Math.ceil(JSON_BODY_LIMIT / BODY_MIN_BYTES_PER_SECOND) * 1000;
+  assert.equal(longestPdf, 640_000, 'premise: a 10 MiB body at the 16 KiB/s minimum rate is admitted for 640 s');
+  assert.equal(PRE_BODY_WAIT_MS, DEFAULT_BUSY_TIMEOUT_MS, 'the one wait before a body read is a pre-body transaction\'s busy timeout (the parse plan is settled at startup)');
+  assert.ok(REQUEST_TIMEOUT_MS >= HEADERS_TIMEOUT_MS + longestPdf + DEFAULT_BUSY_TIMEOUT_MS, `the backstop ${REQUEST_TIMEOUT_MS} ms covers headers + ${longestPdf} ms + the busy timeout`);
+  assert.ok(REQUEST_TIMEOUT_MS >= HEADERS_TIMEOUT_MS + longestJson + PRE_BODY_WAIT_MS, 'and so the longest JSON request too');
+  const running = await startServer(composedEnv({ OPENSIG_RELAY_SOCKET: join(tempDir('relay'), 'opensig.sock') }), { logSink: () => {} });
+  try {
+    assert.deepEqual(running.listeners.map((listener) => listener.name), ['tcp', 'relay']);
+    for (const listener of running.listeners) {
+      assert.equal(listener.timeouts.headers, HEADERS_TIMEOUT_MS, `${listener.name}: header timeout`);
+      assert.ok(listener.timeouts.request >= listener.timeouts.headers + longestPdf + DEFAULT_BUSY_TIMEOUT_MS, `${listener.name}: request timeout ${listener.timeouts.request} ms is at least ${listener.timeouts.headers + longestPdf + DEFAULT_BUSY_TIMEOUT_MS} ms`);
+    }
+  } finally {
+    await running.close();
+  }
 });

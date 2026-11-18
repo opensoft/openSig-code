@@ -2,12 +2,17 @@
 //
 // T031 server SEC-04: uniform contract Error bodies with server-generated correlation IDs,
 // routing through the registry, and the authentication gate in front of every handler.
+// Amended for the US1 composition (A-010 row WIRE-US1; § Rulings, T008 deviations D1) without
+// weakening: every registry route either has its handler from the composed maps (T008, T034,
+// T010) or stays null and answers the uniform 501 Error with a correlation ID, and no handler
+// exists outside the registry.
 
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
 import { ROLE_MATRIX } from '../../src/api/auth/index.ts';
-import { ROUTES } from '../../src/api/routes.ts';
+// A namespace import, so a head without the composed registry fails these assertions, not the module load.
+import * as registry from '../../src/api/routes.ts';
 import { bearer, cleanup, ENVELOPE_ID, send, serveApp } from './support.mjs';
 
 after(cleanup);
@@ -68,15 +73,37 @@ const CONTRACT_PATHS = {
   declineAsRecipient: 'POST /v1/recipient-session/decline',
 };
 
+/** The handler the composition installs for `operationId`: T010's over T008's, then T034's; else null. */
+const { APPROVAL_HANDLERS = {}, CONTRACT_ROUTES = [], ENVELOPE_HANDLERS = {}, RECIPIENT_HANDLERS = {}, ROUTES } = registry;
+const composedHandler = (operationId) => APPROVAL_HANDLERS[operationId] ?? ENVELOPE_HANDLERS[operationId] ?? RECIPIENT_HANDLERS[operationId] ?? null;
+const MAPS = { T008: RECIPIENT_HANDLERS, T034: ENVELOPE_HANDLERS, T010: APPROVAL_HANDLERS };
+
 test('[SEC-04] the route registry has exactly one route per contract operation', () => {
   assert.deepEqual(ROUTES.map((route) => route.operationId).sort(), Object.keys(ROLE_MATRIX).sort());
   for (const route of ROUTES) {
     assert.equal(`${route.method} ${route.path}`, CONTRACT_PATHS[route.operationId], route.operationId);
     assert.equal(route.body, route.operationId === 'uploadDocument' ? 'pdf' : route.method === 'POST' ? 'json' : 'none', `${route.operationId} body kind`);
     assert.match(route.owner, /^T0\d\d$/);
-    assert.equal(route.handler, null, `${route.operationId} has no handler until its task lands`);
+    // WIRE-US1 (was: null until its task lands): the handler from the composed maps, or null.
+    assert.equal(route.handler, composedHandler(route.operationId), `${route.operationId}: its handler from the composed maps, or null until its task lands`);
   }
   assert.ok(Object.isFrozen(ROUTES) && Object.isFrozen(ROUTES[0]));
+
+  // The contract registry the maps are installed into: the same routes, every handler null.
+  assert.deepEqual(CONTRACT_ROUTES.map((route) => `${route.operationId} ${route.method} ${route.path} ${route.body} ${route.owner}`), ROUTES.map((route) => `${route.operationId} ${route.method} ${route.path} ${route.body} ${route.owner}`));
+  assert.ok(CONTRACT_ROUTES.every((route) => route.handler === null), 'the contract registry carries no handler');
+  // No handler exists outside the registry: every map names registry operations only, and every
+  // installed handler comes from a map.
+  const registered = new Set(ROUTES.map((route) => route.operationId));
+  for (const [owner, map] of Object.entries(MAPS)) {
+    for (const operationId of Object.keys(map)) assert.ok(registered.has(operationId), `${owner}'s map names ${operationId}, a registry operation`);
+  }
+  const mapped = new Set(Object.values(MAPS).flatMap((map) => Object.values(map)));
+  for (const route of ROUTES) if (route.handler !== null) assert.ok(mapped.has(route.handler), `${route.operationId}: the installed handler comes from a composed map`);
+  // T010's approval and decline replace T008's guard-only entries.
+  for (const operationId of ['approveAsHuman', 'declineAsRecipient']) {
+    assert.notEqual(ROUTES.find((route) => route.operationId === operationId).handler, RECIPIENT_HANDLERS[operationId], `${operationId}: not T008's guard-only entry`);
+  }
 });
 
 test('[SEC-04] errors are uniform contract Error bodies with a fresh server-side correlation ID', async () => {
@@ -111,7 +138,23 @@ test('[SEC-04] errors are uniform contract Error bodies with a fresh server-side
     await check('sender on retryFinalization', { method: 'POST', path: `/v1/envelopes/${ENVELOPE_ID}/finalization/retry`, headers: { ...sender, 'content-type': 'application/json' }, body: '{}' }, 403, 'forbidden');
     await check('operator bearer on approve (SC002-18)', { method: 'POST', path: '/v1/recipient-session/approval', headers: { ...sender, 'content-type': 'application/json', origin: 'http://127.0.0.1:1' }, body: '{}' }, 401, 'unauthenticated');
     await check('service bearer on approve (SC002-17)', { method: 'POST', path: '/v1/recipient-session/approval', headers: { authorization: `Bearer ${bearer('service')}`, 'content-type': 'application/json', origin: 'http://127.0.0.1:1' }, body: '{}' }, 401, 'unauthenticated');
-    await check('authorized request to an unimplemented operation', { path: `/v1/envelopes/${ENVELOPE_ID}/preview`, headers: sender }, 501, 'internal');
+    // WIRE-US1: readRecipientPreview now has T034's handler, so this check moves to a route that
+    // is still unimplemented (readVerification, T016).
+    await check('authorized request to an unimplemented operation', { path: `/v1/envelopes/${ENVELOPE_ID}/verification`, headers: sender }, 501, 'internal');
+    // Every route still without a handler answers the uniform 501 after authentication.
+    const admin = { authorization: `Bearer ${bearer('admin')}` };
+    const unimplemented = ROUTES.filter((route) => route.handler === null);
+    assert.deepEqual(unimplemented.map((route) => route.owner).filter((owner) => ['T008', 'T010', 'T034'].includes(owner)), [], 'no US1 route is left without a handler');
+    for (const route of unimplemented) {
+      const path = route.path.replace(/\{[a-z_]+\}/g, ENVELOPE_ID);
+      const roles = ROLE_MATRIX[route.operationId].roles;
+      const headers = roles.includes('anonymous') ? {} : roles.includes('sender') ? { ...sender } : { ...admin };
+      const options = { method: route.method, path, headers };
+      if (route.body === 'json') Object.assign(options, { body: '{}', headers: { ...headers, 'content-type': 'application/json' } });
+      await check(`${route.operationId} (owner ${route.owner}) without its handler`, options, 501, 'internal');
+    }
+    // A composed handler whose app holds no composition fails closed: a uniform 500, never a 2xx.
+    await check('readRecipientPreview with no EnvelopeApi in the app', { path: `/v1/envelopes/${ENVELOPE_ID}/preview`, headers: sender }, 500, 'internal');
 
     // A handler exception is a generic 500: nothing of the exception reaches the client.
     const crashed = await check('handler exception', { path: `/v1/envelopes/${ENVELOPE_ID}`, headers: sender }, 500, 'internal');

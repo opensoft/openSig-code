@@ -14,6 +14,11 @@
 //   time. Either is a 408 (HttpError with `connection: close`), reported through
 //   state.onTimeout at once, so the server answers even if a handler is still running. Time
 //   the server itself spends not reading is not counted against the client.
+// - Abort (A-010 SEC11-Q, SEC-13 (c)): abortBody(req, error) ends a body read at once with
+//   `error`, now or at the reader's next wait, without touching the socket. The server uses it
+//   when the HTTP parser fails on a pipelined request whose body is being read behind a
+//   pending response (src/server/app.ts), so that read never waits for the idle timer and a
+//   reader that holds a body-read permit (T033) releases it at once.
 // Chunks are pulled in paused mode, so an early stop never destroys the socket before the
 // error response is written.
 
@@ -54,6 +59,18 @@ export function createBodyState(): BodyState {
   return { bytesRead: 0, consumed: false, started: false, waitedMs: 0, timedOut: false, onTimeout: null };
 }
 
+/** Requests whose body read was aborted, with the error every later read gets. */
+const aborted = new WeakMap<IncomingMessage, HttpError>();
+/** The pending read of each request, if one is waiting for bytes. */
+const waiting = new WeakMap<IncomingMessage, (error: HttpError) => void>();
+
+/** End `req`'s body read with `error`: the waiting read rejects now, and every later read at once. Idempotent. */
+export function abortBody(req: IncomingMessage, error: HttpError): void {
+  if (aborted.has(req)) return;
+  aborted.set(req, error);
+  waiting.get(req)?.(error);
+}
+
 function bodyTimeout(): HttpError {
   return new HttpError(408, 'invalid_request', { headers: { connection: 'close' } });
 }
@@ -81,6 +98,11 @@ function nextChunk(req: IncomingMessage, state: BodyState, timing: BodyTiming): 
       reject(bodyTimeout());
       return;
     }
+    const abortedWith = aborted.get(req);
+    if (abortedWith !== undefined) {
+      reject(abortedWith);
+      return;
+    }
     if (req.readableEnded) {
       resolve(null);
       return;
@@ -97,6 +119,11 @@ function nextChunk(req: IncomingMessage, state: BodyState, timing: BodyTiming): 
       req.off('end', onEnd);
       req.off('error', onError);
       req.off('aborted', onAborted);
+      if (waiting.get(req) === onAbort) waiting.delete(req);
+    };
+    const onAbort = (error: HttpError): void => {
+      cleanup();
+      reject(error);
     };
     function attempt(): boolean {
       const chunk = req.read() as Buffer | null;
@@ -123,6 +150,7 @@ function nextChunk(req: IncomingMessage, state: BodyState, timing: BodyTiming): 
     req.on('end', onEnd);
     req.on('error', onError);
     req.on('aborted', onAborted);
+    waiting.set(req, onAbort);
     if (attempt()) return;
     if (req.readableEnded) {
       cleanup();

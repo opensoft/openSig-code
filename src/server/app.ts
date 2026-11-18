@@ -43,8 +43,31 @@
 // the connection closes with the lingering close. Every other client error keeps Node's
 // default handling exactly: a malformed request with no response pending, or a malformed body
 // inside the first pending request itself, still gets Node's canned 400 (or 413, 431).
+//
+// SEC-13 (A-010 rows SEC11-D5 and SEC11-Q), the same gate:
+// (a) Node's own request timeout (ERR_HTTP_REQUEST_TIMEOUT: headers or a request still incomplete
+//     past server.headersTimeout or server.requestTimeout) on a partial request behind a complete
+//     first pending request is that later request's, not the pending one's: it is decided as
+//     SEC-11 decides a parser error (the pending response first, then the close), never with
+//     Node's 408 in place of the pending response. A first pending request that is itself
+//     incomplete still gets Node's 408.
+// (c) When the parser fails on the body of a pipelined request whose handler is already reading
+//     it (its handler entered while the first pending response was still being sent), that
+//     read ends at once (src/server/body.ts abortBody): the request is answered with the uniform
+//     400 invalid_request Error, with its correlation ID, right after the pending response, then
+//     the connection closes; never after the 10 s idle timer, and a body-read permit its reader
+//     holds (T033) is released at once. Its error response defers the lingering close to the
+//     decision's whenIdle, so the close waits for every pending response however slowly the
+//     client reads.
+// (b) A client half-close while a response is pending is a documented T024 limitation (A-010
+//     request #30 (6), row SEC11-D5): Node's server ends the socket and aborts the pending
+//     request on the client's FIN unless its undocumented httpAllowHalfOpen flag is set, and
+//     that internal is not used.
+//
+// Shutdown (row SHUTDOWN-INFLIGHT): settle() stops dispatching queued requests and settles once
+// every dispatched handler has (src/server/main.ts awaits it before the ceremony drain).
 
-import { createServer, STATUS_CODES, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, STATUS_CODES, type IncomingMessage, type Server, type ServerOptions, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { performance } from 'node:perf_hooks';
 import type { Duplex } from 'node:stream';
@@ -52,7 +75,7 @@ import type { Duplex } from 'node:stream';
 import { authorize, operationScheme, type OperationId } from '../api/auth/matrix.ts';
 import type { OperatorAuthenticator, OperatorPrincipal } from '../api/auth/operator.ts';
 import type { RouteDefinition } from '../api/routes.ts';
-import { checkDeclaredLength, createBodyState, pdfBody, readJsonBody, type BodyState } from './body.ts';
+import { abortBody, checkDeclaredLength, createBodyState, pdfBody, readJsonBody, type BodyState } from './body.ts';
 import type { ServerConfig } from './config.ts';
 import { errorBody, newCorrelationId } from './errors.ts';
 import { RESERVED_HEADERS, securityHeaders, type Framing } from './headers.ts';
@@ -85,6 +108,16 @@ export interface App {
   /** The server's 'clientError' listener (SEC-11); createAppServer installs it. */
   clientError(error: Error & { code?: string }, socket: Duplex): void;
   readonly locals: Map<string, unknown>;
+  /** The registry this app was given, read-only (the relay surface serves its operator routes only). */
+  readonly routes: readonly RouteDefinition[];
+  /**
+   * Shutdown (A-010 row SHUTDOWN-INFLIGHT): from now on no queued request is dispatched, and the
+   * promise settles once every handler already dispatched has settled. Each handler is bounded
+   * by its own deadlines (body timers, the storage busy timeout, the mail session deadline).
+   */
+  settle(): Promise<void>;
+  /** Handlers dispatched and not yet settled (monitoring and shutdown logs). */
+  inFlight(): number;
 }
 
 function compile(route: RouteDefinition): CompiledRoute {
@@ -114,7 +147,8 @@ function exceptionSummary(error: unknown): { error_name: string; error_location:
   return { error_name: error.name, error_location: location };
 }
 
-const LINGER_MS = 2_000;
+/** How long a lingering close waits for the client to close its side (exported for SEC-13). */
+export const LINGER_MS = 2_000;
 const LINGER_BYTES = 64 * 1024 * 1024;
 
 const detached = new WeakSet<Socket>();
@@ -229,6 +263,14 @@ export function createApp(options: AppOptions): App {
   const locals = new Map<string, unknown>();
   const logger = options.logger;
   const connections = new WeakMap<Socket, Connection>();
+  // SHUTDOWN-INFLIGHT: handlers dispatched and not settled, and who waits for none.
+  let running = 0;
+  let stopping = false;
+  const idleWaiters: Array<() => void> = [];
+  const settledOne = (): void => {
+    running -= 1;
+    if (running === 0) for (const resolveIdle of idleWaiters.splice(0)) resolveIdle();
+  };
 
   const match = (method: string, path: string): { route: RouteDefinition; params: Record<string, string> } | null => {
     for (const compiled of routes) {
@@ -293,7 +335,10 @@ export function createApp(options: AppOptions): App {
       if (unread) {
         headers.connection = 'close';
         connection.closing = true;
-        lingerAfterError(req);
+        // After a SEC-11/SEC-13 decision the close waits for every pending response
+        // (connection.whenIdle); otherwise the lingering close starts now.
+        if (connection.whenIdle === null) lingerAfterError(req);
+        else prepareLinger(req.socket);
       }
       const body = Buffer.from(JSON.stringify(errorBody(httpError.code, correlationId, httpError.details)));
       send(res, connection, httpError.status, 'none', headers, body, 'application/json; charset=utf-8');
@@ -421,13 +466,16 @@ export function createApp(options: AppOptions): App {
     if (
       connection !== undefined &&
       first !== undefined &&
-      code.startsWith('HPE_') &&
+      (code.startsWith('HPE_') || code === 'ERR_HTTP_REQUEST_TIMEOUT') &&
       first.complete &&
       socket.writable &&
       !socket.destroyed
     ) {
       connection.closing = true;
       connection.lastServed ??= first;
+      // SEC-13 (c): a later request whose body is still being read owns the failing bytes; its
+      // read ends now, so its handler answers 400 right after the pending response.
+      for (const later of connection.pending.slice(1)) if (!later.complete) abortBody(later, new HttpError(400, 'invalid_request'));
       const arm = prepareLinger(socket);
       connection.whenIdle = () => {
         if (socket.destroyed) return;
@@ -446,7 +494,16 @@ export function createApp(options: AppOptions): App {
 
   return {
     locals,
+    routes: options.routes,
     clientError,
+    inFlight: () => running,
+    settle(): Promise<void> {
+      stopping = true;
+      if (running === 0) return Promise.resolve();
+      return new Promise<void>((resolveIdle) => {
+        idleWaiters.push(resolveIdle);
+      });
+    },
     handle(req: IncomingMessage, res: ServerResponse): void {
       const socket = req.socket;
       let connection = connections.get(socket);
@@ -475,6 +532,12 @@ export function createApp(options: AppOptions): App {
       });
       void previous.then(async () => {
         try {
+          if (stopping) {
+            // SHUTDOWN-INFLIGHT: the listeners are closing; a request not yet dispatched never is.
+            logger.warn('request_refused_at_shutdown', { method: req.method ?? 'GET', path: pathOf(req.url) ?? '(invalid)' });
+            release();
+            return;
+          }
           if (current.closing && req !== current.lastServed) {
             // SEC-08: a Connection: close response was decided before this pipelined request
             // (or, SEC-11, the parser failed while an earlier response was pending).
@@ -482,7 +545,12 @@ export function createApp(options: AppOptions): App {
             release();
             return;
           }
-          await handle(req, res, current);
+          running += 1;
+          try {
+            await handle(req, res, current);
+          } finally {
+            settledOne();
+          }
           if (!current.closing && requestsClose(req)) {
             current.closing = true;
             stopParsing(socket, () => {});
@@ -497,9 +565,16 @@ export function createApp(options: AppOptions): App {
   };
 }
 
-/** An HTTP server for `app`: its request handler and its client-error handling (SEC-11). */
-export function createAppServer(app: App): Server {
-  const server = createServer(app.handle);
+/**
+ * Node server options a caller may set: the request-timeout pair and the interval at which Node
+ * checks it (SEC-13 (a) shortens them in its own test server; production keeps Node's defaults
+ * and src/server/main.ts sets the timeouts on the server it builds).
+ */
+export type AppServerOptions = Pick<ServerOptions, 'connectionsCheckingInterval' | 'headersTimeout' | 'requestTimeout'>;
+
+/** An HTTP server for `app`: its request handler and its client-error handling (SEC-11, SEC-13). */
+export function createAppServer(app: App, options: AppServerOptions = {}): Server {
+  const server = createServer({ ...options }, app.handle);
   server.on('clientError', app.clientError);
   return server;
 }

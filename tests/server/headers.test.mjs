@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
 import { startServer } from '../../src/server/main.ts';
-import { bearer, cleanup, ENVELOPE_ID, send, serveApp } from './support.mjs';
+import { bearer, cleanup, composedEnv, ENVELOPE_ID, send, serveApp } from './support.mjs';
 
 after(cleanup);
 
@@ -76,7 +76,7 @@ test('[SEC-01] every response carries the security headers, and handlers cannot 
 
 test('[SEC-01] the real entrypoint on its loopback default serves the same headers', async () => {
   const lines = [];
-  const running = await startServer({ OPENSIG_PORT: '0' }, { logSink: (line) => lines.push(line) });
+  const running = await startServer(composedEnv(), { logSink: (line) => lines.push(line) });
   try {
     for (const path of ['/sign', `/v1/envelopes/${ENVELOPE_ID}`, '/v1/recipient-session', '/missing']) {
       assertSecurityHeaders(await send(running.port, { path }), 'none', `entrypoint ${path}`);

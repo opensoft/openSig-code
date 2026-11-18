@@ -5,9 +5,13 @@
 // directory removed by cleanup(). Servers bind 127.0.0.1 with an OS-chosen port. The tenants
 // table the server checks the configuration against (SEC-07) is a migrated SQLite database
 // created in a mkdtemp directory at test runtime with the synthetic alpha tenant.
+// Since the US1 composition (row WIRE-US1) the entrypoint always composes the database, the
+// blob store (<OPENSIG_DATA_DIR>/blobs), the T032 notifier and the 0600 challenge-HMAC key
+// file: composedEnv() builds that environment, each file in its own mkdtemp directory, with
+// mail to a mkdtemp spool only.
 
-import { generateKeyPairSync, sign } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -97,6 +101,64 @@ export function tenantDatabase(rows = { [ALPHA.id]: alphaTenantRow() }, { migrat
   return path;
 }
 
+export const CONSENT_WORDING = 'I have reviewed this synthetic document and I approve it as shown.';
+
+/** Give the alpha tenant of the database at `path` a consent text in force (the recipient session state needs one). */
+export function seedConsent(path, tenantId = ALPHA.id) {
+  const db = openDatabase({ path });
+  try {
+    const id = `consent_${randomBytes(9).toString('base64url')}`;
+    const now = new Date(Date.UTC(2026, 10, 16, 12, 0, 0)).toISOString();
+    db.transaction(() => {
+      const store = db.forTenant(tenantId);
+      store.insert('consent_texts', {
+        id,
+        version: '2026.11-synthetic',
+        locale: 'en',
+        text: CONSENT_WORDING,
+        text_digest: createHash('sha256').update(CONSENT_WORDING, 'utf8').digest('hex'),
+        effective_from: now,
+        created_at: now,
+      });
+      store.update('tenants', {}, { consent_text_id: id });
+    });
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * A challenge-HMAC key file in its own mkdtemp directory: `bytes` (default 32 random bytes,
+ * generated now and never printed) with `mode` (default 0600). Returns its path.
+ */
+export function keyFile({ bytes = randomBytes(32), mode = 0o600 } = {}) {
+  const path = join(tempDir('key'), 'challenge-hmac.key');
+  writeFileSync(path, bytes, { mode: 0o600 });
+  chmodSync(path, mode);
+  return path;
+}
+
+/**
+ * The environment of a composed server (WIRE-US1) on 127.0.0.1 with an OS-chosen port: a data
+ * directory, a migrated database (default: the alpha tenant agreeing with authInput()), the
+ * 0600 key file and a mkdtemp mail spool. `overrides` replace or add settings; a value of
+ * undefined removes one.
+ */
+export function composedEnv(overrides = {}) {
+  const dataDir = tempDir('data');
+  const env = {
+    OPENSIG_PORT: '0',
+    OPENSIG_DATA_DIR: dataDir,
+    OPENSIG_DATABASE: tenantDatabase(),
+    OPENSIG_CHALLENGE_KEY_FILE: keyFile(),
+    OPENSIG_MAIL_TRANSPORT: 'spool',
+    OPENSIG_SPOOL_DIR: join(tempDir('spool'), 'spool'),
+    ...overrides,
+  };
+  for (const [name, value] of Object.entries(env)) if (value === undefined) delete env[name];
+  return env;
+}
+
 /** A bearer token for the synthetic alpha operator `who` (sender, admin or service). */
 export function bearer(who = 'sender', overrides = {}) {
   const now = Math.floor(Date.now() / 1000);
@@ -124,7 +186,7 @@ export function bearer(who = 'sender', overrides = {}) {
  * operations in a copy of the production registry (the policy under test is the server's;
  * the handlers only produce a response to apply it to).
  */
-export async function serveApp({ handlers = {}, origins = ['http://127.0.0.1:1'], auth = true } = {}) {
+export async function serveApp({ handlers = {}, origins = ['http://127.0.0.1:1'], auth = true, serverOptions = {} } = {}) {
   const lines = [];
   const logger = createLogger((line) => lines.push(line));
   const routes = ROUTES.map((route) => (handlers[route.operationId] ? { ...route, handler: handlers[route.operationId] } : route));
@@ -132,11 +194,12 @@ export async function serveApp({ handlers = {}, origins = ['http://127.0.0.1:1']
   const config = loadServerConfig({ OPENSIG_PORT: '0' });
   const app = createApp({ routes, config, logger, authenticator, allowedOrigins: new Set(origins) });
   // Built as the entrypoint builds it (src/server/main.ts), client-error handling included.
-  const server = createAppServer(app);
+  const server = createAppServer(app, serverOptions);
   await new Promise((resolveListen) => server.listen({ host: '127.0.0.1', port: 0 }, resolveListen));
   const { port } = server.address();
   return {
     port,
+    server,
     lines,
     logText: () => lines.join('\n'),
     close: () =>

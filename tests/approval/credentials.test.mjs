@@ -16,7 +16,7 @@
 //   (ApprovalService re-reads the session first).
 // - AP-15 (ruling (7)): T010's handlers are its own map. T008's RECIPIENT_HANDLERS keeps its
 //   guard-only entries (501 after the guard, even with an ApprovalApi composed) and ROUTES
-//   keeps null; withApprovalHandlers() installs T010's handlers over T008's.
+//   carries T010's handlers (WIRE-US1); withApprovalHandlers() installs T010's handlers over T008's.
 // - AP-03 (row SC002-16-POS): a valid session with its valid CSRF token and a valid approval
 //   succeeds end to end; so does a valid decline.
 // Every refusal here changes nothing at all, last_seen_at included. Everything is synthetic.
@@ -236,7 +236,7 @@ test('[AP-09] the recipient scheme guards approval and decline: 401 without a li
   }
 });
 
-test('[AP-15] T010’s handlers are its own map: T008’s map keeps its guard-only entries even with an ApprovalApi composed, ROUTES keeps null, and withApprovalHandlers installs T010’s handlers', async () => {
+test('[AP-15] T010’s handlers are its own map: T008’s map keeps its guard-only entries even with an ApprovalApi composed, ROUTES carries T010’s handlers (WIRE-US1), and withApprovalHandlers installs T010’s handlers', async () => {
   // The maps themselves.
   assert.deepEqual(Object.keys(APPROVAL_HANDLERS).sort(), ['approveAsHuman', 'declineAsRecipient']);
   assert.equal(APPROVAL_HANDLERS.approveAsHuman, approveAsHuman);
@@ -244,7 +244,8 @@ test('[AP-15] T010’s handlers are its own map: T008’s map keeps its guard-on
   for (const operation of ['approveAsHuman', 'declineAsRecipient']) {
     assert.equal(typeof RECIPIENT_HANDLERS[operation], 'function', `T008's map keeps its ${operation} entry`);
     assert.notEqual(RECIPIENT_HANDLERS[operation], APPROVAL_HANDLERS[operation], `T008's ${operation} entry is not T010's handler`);
-    assert.equal(ROUTES.find((route) => route.operationId === operation).handler, null, `ROUTES keeps null for ${operation} until WIRE-US1`);
+    // A-010 WIRE-US1: the US1 composition sets ROUTES from the handler maps, T010's over T008's.
+    assert.equal(ROUTES.find((route) => route.operationId === operation).handler, APPROVAL_HANDLERS[operation], `ROUTES carries T010's ${operation} (WIRE-US1)`);
     assert.equal(withApprovalHandlers(withRecipientHandlers(ROUTES)).find((route) => route.operationId === operation).handler, APPROVAL_HANDLERS[operation], `withApprovalHandlers installs T010's ${operation} over T008's`);
     assert.equal(withRecipientHandlers(ROUTES).find((route) => route.operationId === operation).handler, RECIPIENT_HANDLERS[operation], `withRecipientHandlers installs T008's own ${operation}`);
   }

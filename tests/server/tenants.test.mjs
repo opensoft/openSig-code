@@ -9,6 +9,12 @@
 // SEC-09: startup logs the authenticator's policy state, and never a key, token or secret.
 //
 // Every database is created at test runtime in a mkdtemp directory with synthetic tenants.
+// Since the US1 composition (row WIRE-US1) startup also needs the 0600 challenge-HMAC key file
+// (checked first), and a started server composes the database, a data directory and a spool
+// (composedEnv). An allowed role now reaches readEnvelope's real handler (404 for an envelope
+// absent from the tenant, shown to be the handler's by its request log line) where it used to
+// reach the 501 of a missing handler (A-010 request #30 (3)); the tenant_admin retry keeps 501,
+// because retryFinalization (T038) has no handler yet.
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -18,7 +24,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { after, test } from 'node:test';
 
 import { startServer } from '../../src/server/main.ts';
-import { ALPHA, alphaTenantRow, authFile, authInput, bearer, cleanup, ENVELOPE_ID, REPO, send, tempDir, tenantDatabase } from './support.mjs';
+import { ALPHA, alphaTenantRow, authFile, authInput, bearer, cleanup, composedEnv, ENVELOPE_ID, keyFile, REPO, send, tempDir, tenantDatabase } from './support.mjs';
 
 after(cleanup);
 
@@ -41,13 +47,17 @@ function setAllowedRoles(path, value) {
 
 test('[SEC-07] the tenant role policy comes from the tenants table, read on every request', async () => {
   const database = tenantDatabase({ [ALPHA.id]: alphaTenantRow(['sender', 'service']) });
-  const running = await startServer({ OPENSIG_PORT: '0', OPENSIG_OPERATOR_AUTH_FILE: authFile(), OPENSIG_DATABASE: database }, { logSink: () => {} });
+  const lines = [];
+  const running = await startServer(composedEnv({ OPENSIG_OPERATOR_AUTH_FILE: authFile(), OPENSIG_DATABASE: database }), { logSink: (line) => lines.push(line) });
+  const lastRequest = () => lines.map((line) => JSON.parse(line)).filter((record) => record.event === 'request').map((record) => `${record.operation}:${record.status}`).pop();
   try {
     // tenant_admin is not an allowed role of the tenant: the role grants nothing.
     const denied = await retry(running.port, 'admin');
     assert.deepEqual([denied.status, denied.json?.code], [403, 'forbidden'], 'a role outside allowed_roles is removed');
     const read = await send(running.port, { path: `/v1/envelopes/${ENVELOPE_ID}`, headers: { authorization: `Bearer ${bearer('sender')}` } });
-    assert.equal(read.status, 501, 'an allowed role reaches the (not yet implemented) handler');
+    // WIRE-US1 (was 501): the allowed role reaches readEnvelope's real handler.
+    assert.deepEqual([read.status, read.json?.code], [404, 'not_found'], 'an allowed role reaches the handler (an envelope absent from the tenant)');
+    assert.equal(lastRequest(), 'readEnvelope:404', 'the 404 is the handler\'s (its request line names the operation), so the role passed authorization');
 
     // The table is read per request: allowing tenant_admin applies without a restart ...
     setAllowedRoles(database, JSON.stringify(['sender', 'tenant_admin', 'service']));
@@ -62,7 +72,11 @@ test('[SEC-07] the tenant role policy comes from the tenants table, read on ever
 });
 
 test('[SEC-07] the server refuses to start when the configuration and the tenants table disagree', async () => {
-  const start = (env) => startServer({ OPENSIG_PORT: '0', OPENSIG_OPERATOR_AUTH_FILE: authFile(), ...env }, { logSink: () => {} });
+  const start = (env) =>
+    startServer(
+      { OPENSIG_PORT: '0', OPENSIG_OPERATOR_AUTH_FILE: authFile(), OPENSIG_CHALLENGE_KEY_FILE: keyFile(), OPENSIG_SPOOL_DIR: join(tempDir('spool'), 'spool'), ...env },
+      { logSink: () => {} },
+    );
   const row = (changes) => ({ [ALPHA.id]: { ...alphaTenantRow(), ...changes } });
   const second = 'tenant_beta_synthetic001';
   const cases = {
@@ -107,7 +121,7 @@ test('[SEC-07] the server refuses to start when the configuration and the tenant
   // node src/server/main.ts exits 1 with the refusal and never listens.
   const child = spawn(process.execPath, [join(REPO, 'src', 'server', 'main.ts')], {
     cwd: REPO,
-    env: { PATH: process.env.PATH ?? '', OPENSIG_PORT: '0', OPENSIG_OPERATOR_AUTH_FILE: authFile(), OPENSIG_DATABASE: tenantDatabase(row({ oidc_audience: 'opensig-other' })) },
+    env: { PATH: process.env.PATH ?? '', OPENSIG_PORT: '0', OPENSIG_OPERATOR_AUTH_FILE: authFile(), OPENSIG_CHALLENGE_KEY_FILE: keyFile(), OPENSIG_DATABASE: tenantDatabase(row({ oidc_audience: 'opensig-other' })) },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -122,10 +136,7 @@ test('[SEC-07] the server refuses to start when the configuration and the tenant
 
 test('[SEC-09] startup logs the authenticator policy state and never a key, token or secret', async () => {
   const lines = [];
-  const running = await startServer(
-    { OPENSIG_PORT: '0', OPENSIG_OPERATOR_AUTH_FILE: authFile(), OPENSIG_DATABASE: tenantDatabase() },
-    { logSink: (line) => lines.push(line) },
-  );
+  const running = await startServer(composedEnv({ OPENSIG_OPERATOR_AUTH_FILE: authFile() }), { logSink: (line) => lines.push(line) });
   const token = bearer('sender');
   try {
     await send(running.port, { path: `/v1/envelopes/${ENVELOPE_ID}`, headers: { authorization: `Bearer ${token}` } });
@@ -150,7 +161,7 @@ test('[SEC-09] startup logs the authenticator policy state and never a key, toke
 
   // Without operator authentication the state is logged as not configured.
   const bare = [];
-  const unconfigured = await startServer({ OPENSIG_PORT: '0' }, { logSink: (line) => bare.push(line) });
+  const unconfigured = await startServer(composedEnv(), { logSink: (line) => bare.push(line) });
   await unconfigured.close();
   const bareRecords = bare.map((line) => JSON.parse(line));
   assert.deepEqual(

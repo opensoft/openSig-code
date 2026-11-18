@@ -10,40 +10,30 @@
 // - body limits.
 // A route whose handler is still null answers 501 after those checks.
 //
-// Owning tasks replace `handler: null` with their implementation in this file:
-//   T034 envelope operations, T038 retryFinalization, T016 artifacts, T019 webhooks,
-//   T008 recipient session, challenge, document and manifest, T010 approval and decline.
-// openReviewShell (GET /sign) is served by src/server/static.ts (T035) when that module
-// exists; see src/server/main.ts.
+// The contract registry (CONTRACT_ROUTES) carries `handler: null` for every operation. ROUTES,
+// the registry the server serves (src/server/main.ts), is set from the handler maps the owning
+// tasks export (A-010 row WIRE-US1, T031's US1 composition slot):
+//   ROUTES = withApprovalHandlers(withEnvelopeHandlers(withRecipientHandlers(CONTRACT_ROUTES)))
+// - T008 RECIPIENT_HANDLERS: requestChallenge, createRecipientSession, readRecipientSession,
+//   endRecipientSession, readRecipientDocument and readRecipientManifest, plus guard-only
+//   entries (the recipient session and CSRF guard, then 501) for approval and decline;
+// - T034 ENVELOPE_HANDLERS: createEnvelope, readEnvelope, uploadDocument, prepareEnvelope,
+//   readRecipientPreview, confirmSend, sendEnvelope, voidEnvelope, reissueEnvelope and
+//   resendInvitation;
+// - T010 APPROVAL_HANDLERS: approveAsHuman and declineAsRecipient, installed last, over T008's
+//   guard-only entries (A-010 request #24, ruling (7)).
+// Every other route keeps `handler: null` and answers the uniform 501 until its owner lands
+// (T038 retryFinalization, T016 artifacts, T019 webhooks); openReviewShell (GET /sign) is
+// served by src/server/static.ts (T035) when that module exists. No handler exists outside
+// this registry: each map names only registry operations, and the server dispatches only
+// through the registry it is given (T031 SEC-04, as amended by § Rulings D1).
 //
-// Recipient ceremony (T008): RECIPIENT_HANDLERS holds the handlers of requestChallenge,
-// createRecipientSession, readRecipientSession, endRecipientSession, readRecipientDocument
-// and readRecipientManifest, plus the recipient session and CSRF guard in front of
-// approveAsHuman and declineAsRecipient, whose handlers T010 supplies (until then they
-// answer 501 after the guard). withRecipientHandlers() installs them into a registry. ROUTES
-// itself still carries `handler: null` for these operations: T031's server tests assert that
-// (SEC-04, and SEC-05's 501 for GET /v1/recipient-session on the entrypoint), and the
-// production ceremony (database, blob store, notifier, challenge key) is built in
-// src/server/main.ts; both lie outside T008's files, so switching ROUTES to the installed
-// handlers is left to the T031 follow-up that changes those tests and main.ts.
-//
-// Approval and decline (T010): APPROVAL_HANDLERS is T010's own handler map, with
-// approveAsHuman (src/api/recipients/approval.ts) and declineAsRecipient
-// (src/api/recipients/decline.ts). Each refuses any operator or service credential with
-// 401, then runs the same recipient session and CSRF guard, then the domain step, finding
-// the app's ApprovalApi under APPROVAL_API in the server locals. withApprovalHandlers()
-// installs them into a registry, over T008's guard-only entries. RECIPIENT_HANDLERS is left
-// as T008 made it, and ROUTES keeps `handler: null` for both operations, until T031's US1
-// composition slot (row WIRE-US1) composes the maps (A-010, request #24, ruling (7)).
-//
-// Operator envelope operations (T034): ENVELOPE_HANDLERS holds the handlers of
-// createEnvelope, readEnvelope, uploadDocument, prepareEnvelope, readRecipientPreview,
-// confirmSend, sendEnvelope, voidEnvelope, reissueEnvelope and resendInvitation (each finds
-// the app's EnvelopeApi under ENVELOPE_API in the server locals). withEnvelopeHandlers()
-// installs them into a registry, as withRecipientHandlers() does for T008. ROUTES itself
-// keeps `handler: null` for these operations until T031's US1 composition slot (row
-// WIRE-US1) sets ROUTES from the handler maps and composes their dependencies in
-// src/server/main.ts.
+// The handlers find their app-scoped dependencies in the server locals: the T008
+// RecipientCeremony under RECIPIENT_CEREMONY, the T034 EnvelopeApi under ENVELOPE_API and the
+// T010 ApprovalApi under APPROVAL_API. src/server/main.ts composes them once per process and
+// installs the same instances into every listener's app; a request whose app has none is a
+// 500 (fail closed). withRecipientHandlers() and its peers stay exported so each owner tests
+// through its own map (T008, T034 and T010 worlds).
 
 import { withRecipientMutation } from './auth/recipient-session.ts';
 import type { OperationId } from './auth/matrix.ts';
@@ -71,7 +61,8 @@ function route(operationId: OperationId, method: HttpMethod, path: string, body:
   return Object.freeze({ operationId, method, path, body, owner, handler });
 }
 
-export const ROUTES: readonly RouteDefinition[] = Object.freeze([
+/** One entry per contract operation, every handler null: the registry before any map is installed. */
+export const CONTRACT_ROUTES: readonly RouteDefinition[] = Object.freeze([
   route('createEnvelope', 'POST', '/v1/envelopes', 'json', 'T034'),
   route('readEnvelope', 'GET', '/v1/envelopes/{envelope_id}', 'none', 'T034'),
   route('uploadDocument', 'PUT', '/v1/envelopes/{envelope_id}/document', 'pdf', 'T034'),
@@ -104,8 +95,8 @@ export const ROUTES: readonly RouteDefinition[] = Object.freeze([
 
 /**
  * The recipient routes' handlers (T008). Approval and decline get the recipient session and
- * CSRF guard now (a live session, then its X-CSRF-Token, else 401 or 403 csrf_failed);
- * T010 replaces each `null` with its handler.
+ * CSRF guard only (a live session, then its X-CSRF-Token, else 401 or 403 csrf_failed, then
+ * 501); ROUTES installs T010's APPROVAL_HANDLERS over them.
  */
 export const RECIPIENT_HANDLERS: Readonly<Partial<Record<OperationId, RouteHandler>>> = Object.freeze({
   ...CEREMONY_HANDLERS,
@@ -154,3 +145,10 @@ export function withEnvelopeHandlers(routes: readonly RouteDefinition[] = ROUTES
     }),
   );
 }
+
+/**
+ * The registry the server serves (WIRE-US1): the contract registry with T008's, T034's and
+ * T010's handler maps installed, in that order, so T010's approval and decline replace T008's
+ * guard-only entries. Frozen, like every entry.
+ */
+export const ROUTES: readonly RouteDefinition[] = withApprovalHandlers(withEnvelopeHandlers(withRecipientHandlers(CONTRACT_ROUTES)));
