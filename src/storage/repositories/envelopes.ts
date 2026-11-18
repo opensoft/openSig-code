@@ -540,7 +540,7 @@ export function getFinalArtifact(store: TenantStore, envelopeId: string): FinalA
   };
 }
 
-/** Everything the envelope views need, read in the caller's transaction or snapshot. */
+/** Everything the envelope views need, read in the caller's transaction, or with none on a read-only path (data-model.md § Persistence). */
 export function loadEnvelope(store: TenantStore, envelopeId: string): EnvelopeAggregate | undefined {
   const envelope = getEnvelope(store, envelopeId);
   if (envelope === undefined) return undefined;

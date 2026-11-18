@@ -51,9 +51,12 @@ export function testClock(start = BASE_TIME) {
   };
 }
 
-/** A migrated database with one tenant and an envelope service on a test clock. */
-export function setup(scratch, { onChange, tenants = 1 } = {}) {
-  const { db, path } = openTemp(scratch);
+/**
+ * A migrated database with one tenant and an envelope service on a test clock.
+ * `busyTimeoutMs` overrides the scratch database's bounded wait for the write lock.
+ */
+export function setup(scratch, { onChange, tenants = 1, busyTimeoutMs } = {}) {
+  const { db, path } = openTemp(scratch, busyTimeoutMs === undefined ? {} : { busyTimeoutMs });
   const ids = [];
   for (let i = 0; i < tenants; i += 1) {
     const tenant = sid('tenant');

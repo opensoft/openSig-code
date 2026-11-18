@@ -15,6 +15,9 @@
 // envelope's state or content moves the version by exactly one; a refused
 // request, a read, a send confirmation and an idempotent replay leave it.
 //
+// A read (read, preview) opens no transaction and takes no write lock
+// (data-model.md § Persistence; A-010 READ-LOCK-ENV, ST-17).
+//
 // Order of checks in a mutation: idempotency replay or conflict, then the
 // request's own rules, then the envelope's existence in the tenant, then
 // expiry (a pre-reservation envelope whose expires_at has passed is expired
@@ -334,10 +337,19 @@ export class EnvelopeService {
     return { status: settled.status, body: parseJson(settled.bytes.toString('utf8')), bytes: settled.bytes, replayed: settled.kind === 'replay' };
   }
 
+  /**
+   * A read path opens no transaction, so it takes no write lock: node:sqlite is
+   * synchronous, and a read waiting for the lock would stall the whole process
+   * for up to the busy timeout (data-model.md § Persistence; A-010
+   * READ-LOCK-ENV, request #30). Its statements cannot interleave with this
+   * process's own writes, which all run synchronously, and every mutation
+   * re-checks state, version and digests under the write lock. The store
+   * refuses any write outside a transaction, so a read can never write.
+   */
   #read<T>(request: { readonly tenantId: string; readonly actor: Actor }, fn: (store: TenantStore, now: Date) => T): T {
     checkActor(request?.actor);
     const now = this.#now();
-    return this.#db.transaction(() => fn(this.#db.forTenant(request.tenantId), now));
+    return fn(this.#db.forTenant(request.tenantId), now);
   }
 
   /** createEnvelope: a draft at version 1 with its recipients (ordinals 1, or 1 and 2). */
