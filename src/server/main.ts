@@ -74,6 +74,11 @@
 // 6. the database closes, and `closed` is logged with the work counts and the parse totals.
 // The process then exits 0. A second signal during shutdown ends the process at once (Node's
 // default handling).
+//
+// Listener state (A-010 row SEC16-PROBE, request #47): each listener's view (ListenerView) also
+// reads, live, whether its server is listening and how many connections it has accepted, so a
+// test can see from the product itself that no listener accepts anything after step 1. Reading
+// them changes nothing: no listener is added, no timing changes, and the close order is as above.
 
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, type Stats } from 'node:fs';
 import type { Server } from 'node:http';
@@ -125,7 +130,7 @@ export interface Composition {
   readonly uploadCap: { readonly scope: 'process'; readonly perTenant: number };
 }
 
-/** What one listener serves: read-only, for monitoring and SEC-12. */
+/** What one listener serves, and its state: read-only, for monitoring, SEC-12 and SEC-16. */
 export interface ListenerView {
   readonly name: 'tcp' | 'relay';
   readonly routes: readonly RouteDefinition[];
@@ -133,6 +138,13 @@ export interface ListenerView {
   readonly services: { readonly ceremony: unknown; readonly envelopes: unknown; readonly approvals: unknown };
   /** Node's timeouts on this listener's server (REQ-TIMEOUT). */
   readonly timeouts: { readonly headers: number; readonly request: number };
+  /** Whether this listener's server is listening now (Node's `server.listening`, read live; row SEC16-PROBE). */
+  readonly listening: boolean;
+  /**
+   * The connections this listener has accepted since it was built: its server's 'connection'
+   * events, read live (row SEC16-PROBE). Counted from before the listener binds, so none is missed.
+   */
+  readonly acceptedConnections: number;
 }
 
 export interface StartOptions {
@@ -402,12 +414,28 @@ function install(app: App, composition: Composition): void {
   app.locals.set(APPROVAL_API, composition.approvals);
 }
 
+/**
+ * The read-only view of one listener. listenAll() builds it before that listener's listen(), for
+ * the TCP listener and for the relay socket's, so the count sees every connection either ever
+ * accepts. The count is an extra 'connection' listener that only adds one; Node's own HTTP
+ * connection handling, registered when the server was created, runs first and is unchanged.
+ */
 function viewOf(name: 'tcp' | 'relay', app: App, server: Server): ListenerView {
+  let accepted = 0;
+  server.on('connection', () => {
+    accepted += 1;
+  });
   return Object.freeze({
     name,
     routes: app.routes,
     timeouts: Object.freeze({ headers: server.headersTimeout, request: server.requestTimeout }),
     services: Object.freeze({ ceremony: app.locals.get(RECIPIENT_CEREMONY), envelopes: app.locals.get(ENVELOPE_API), approvals: app.locals.get(APPROVAL_API) }),
+    get listening(): boolean {
+      return server.listening;
+    },
+    get acceptedConnections(): number {
+      return accepted;
+    },
   });
 }
 

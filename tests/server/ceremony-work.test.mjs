@@ -15,7 +15,30 @@
 // SEC-16: shutdown waits for that background work. With a job held in the blocked notifier,
 // close() closes the listeners and then does not settle while the job is pending; once the
 // relay is released the job's mail is delivered, and only then does close() settle, logging
-// `closed` with no pending work. Extended (A-010 request #30):
+// `closed` with no pending work. Amended without weakening (A-010 row SEC16-PROBE, requests #47
+// and #48): that the listeners are closed while the drain waits, and that no new work can start,
+// is read from the product itself, not from the host's port table. Both product listeners (TCP and
+// the relay socket) are started, and each one's read-only state (ListenerView `listening` and
+// `acceptedConnections`) is first checked against connections of the test's own, each premise
+// with its own message. While the drain waits, a fresh connection attempt to the product's former
+// TCP port follows, and the case fails on product facts only:
+// - a listener reports `listening: true`;
+// - a listener's accepted-connection count rises (checked again after close() settles);
+// - a request or refusal line (`request`, `request_refused_at_shutdown`,
+//   `pipelined_request_refused`) is logged after `draining` (checked again after close() settles);
+// - the ceremony's work statistics change;
+// - the owned-port snapshot shows a LISTEN socket on the former port whose inode is one of this
+//   process's own file descriptors, whatever the attempt's outcome and whatever in the process
+//   holds it: the product runs here, so it is an untracked product listener or a test helper on
+//   the product's port, and either is a fault.
+// Where the attempt went is recorded as a diagnostic, never as a pass or a fail: refused, or
+// connected to another process's listener, with its endpoints and whether it was a self-connect
+// (local endpoint equal to the remote one). The owned-port snapshot is the /proc/net/tcp and tcp6
+// rows on that port only, each marked owned only by matching its inode against this process's own
+// /proc/self/fd. The attempt writes no byte, and nothing outside this process is inspected or
+// touched. The record (no secret, no path) goes to $OPENSIG_VERIFY_OUT/sec16-probe.json, ignored
+// output that is never committed and never evidence of a pass, and to a test diagnostic.
+// Extended (A-010 request #30):
 // - SHUTDOWN-INFLIGHT and SWEEP-SCHED: the order is the listeners, then every dispatched
 //   handler settles (a send held in the blocked notifier), then the ceremony drain, then the
 //   sweeper stops, then the database closes, then `closed`; recorded as an event sequence
@@ -26,8 +49,11 @@
 // a few check intervals.
 
 import assert from 'node:assert/strict';
+import { mkdirSync, readdirSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs';
 import { ServerResponse } from 'node:http';
 import { connect } from 'node:net';
+import { endianness } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { after, test } from 'node:test';
 
@@ -40,7 +66,7 @@ import * as serverMain from '../../src/server/main.ts';
 const { PARSE_COUNT_INTERVAL_MS, startServer } = serverMain;
 import { Database } from '../../src/storage/db/index.ts';
 import { call, FIELDS, guarded, ORIGIN, smtpRelay, testSide, turn } from './composed-support.mjs';
-import { authFile, bearer, cleanup, composedEnv, seedConsent } from './support.mjs';
+import { authFile, bearer, cleanup, composedEnv, ENVELOPE_ID, REPO, seedConsent, tempDir } from './support.mjs';
 
 after(cleanup);
 
@@ -55,6 +81,127 @@ function smtpEnv(port, overrides = {}) {
 }
 
 const postChallenge = (port, invitation) => call(port, { method: 'POST', path: CHALLENGES, headers: { origin: ORIGIN }, body: { invitation } });
+
+// SEC16-PROBE (A-010 request #47): the fresh connection attempt to the product's former port, and
+// its diagnostic record. Nothing here is a verdict; the case judges product facts only.
+
+/** App log events that mean a request reached the product's app: dispatched, or refused there. */
+const REACHED_APP = new Set(['request', 'request_refused_at_shutdown', 'pipelined_request_refused']);
+
+/** Linux TCP state numbers as /proc/net/tcp prints them (hex), by name. */
+const TCP_STATES = Object.freeze({ '01': 'ESTABLISHED', '02': 'SYN_SENT', '03': 'SYN_RECV', '04': 'FIN_WAIT1', '05': 'FIN_WAIT2', '06': 'TIME_WAIT', '07': 'CLOSE', '08': 'CLOSE_WAIT', '09': 'LAST_ACK', '0A': 'LISTEN', '0B': 'CLOSING', '0C': 'NEW_SYN_RECV' });
+
+/** One /proc/net/tcp{,6} endpoint, "ADDRESS:PORT" in hex, as text. The address is in host byte order per 32-bit word; the port is exact. */
+function endpoint(field) {
+  const [hexAddress = '', hexPort = '0'] = field.split(':');
+  const bytes = Buffer.from(hexAddress, 'hex');
+  if (endianness() === 'LE') for (let at = 0; at + 4 <= bytes.length; at += 4) bytes.subarray(at, at + 4).reverse();
+  const port = Number.parseInt(hexPort, 16);
+  if (bytes.length === 4) return `${[...bytes].join('.')}:${port}`;
+  const groups = [];
+  for (let at = 0; at + 2 <= bytes.length; at += 2) groups.push(bytes.readUInt16BE(at).toString(16));
+  return `[${groups.join(':')}]:${port}`;
+}
+
+/**
+ * The owned-port snapshot: the rows of /proc/net/tcp and /proc/net/tcp6 whose local or remote
+ * port is `port`, and no other row. A row is `owned` when its socket inode is one of this test
+ * process's own file descriptors (/proc/self/fd); no other process's descriptors are read. A read
+ * that fails is recorded by source name and error code (no path), never thrown.
+ */
+function ownedPortSnapshot(port) {
+  const snapshot = { port, rows: [], errors: [] };
+  const own = new Set();
+  try {
+    for (const fd of readdirSync('/proc/self/fd')) {
+      try {
+        const inode = /^socket:\[(\d+)\]$/.exec(readlinkSync(join('/proc/self/fd', fd)))?.[1];
+        if (inode !== undefined) own.add(inode);
+      } catch {
+        // that descriptor closed meanwhile
+      }
+    }
+  } catch (error) {
+    snapshot.errors.push({ source: 'own-fds', code: error?.code ?? 'unreadable' });
+  }
+  for (const family of ['tcp', 'tcp6']) {
+    let table;
+    try {
+      table = readFileSync(join('/proc/net', family), 'latin1');
+    } catch (error) {
+      snapshot.errors.push({ source: family, code: error?.code ?? 'unreadable' });
+      continue;
+    }
+    for (const line of table.split('\n').slice(1)) {
+      const field = line.trim().split(/\s+/);
+      if (field.length < 10) continue;
+      const [, local, remote, state] = field;
+      if (Number.parseInt(local.split(':')[1], 16) !== port && Number.parseInt(remote.split(':')[1], 16) !== port) continue;
+      snapshot.rows.push({ family, local: endpoint(local), remote: endpoint(remote), state: TCP_STATES[state] ?? state, uid: Number(field[7]), owned: field[9] !== '0' && own.has(field[9]) });
+    }
+  }
+  return snapshot;
+}
+
+/**
+ * One fresh connection attempt to 127.0.0.1:`port`, the product's former port. It resolves with
+ * where the attempt went, and the owned-port snapshot in either case: not connected (refused, or
+ * any other error; the snapshot is taken then), or connected, with its endpoints and whether it is
+ * a self-connect, all taken while the socket is still open. The socket is then destroyed; no byte
+ * is ever written to it.
+ */
+function probeFormerPort(port) {
+  return new Promise((resolveProbe) => {
+    let settled = false;
+    const socket = connect({ host: '127.0.0.1', port });
+    socket.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      resolveProbe({ outcome: 'not-connected', code: error?.code ?? 'error', snapshot: ownedPortSnapshot(port) });
+    });
+    socket.once('connect', () => {
+      settled = true;
+      const local = { address: socket.localAddress, port: socket.localPort };
+      const remote = { address: socket.remoteAddress, port: socket.remotePort };
+      const probe = { outcome: 'connected', local, remote, self_connect: local.port === remote.port && local.address === remote.address, snapshot: ownedPortSnapshot(port) };
+      socket.destroy();
+      resolveProbe(probe);
+    });
+  });
+}
+
+/**
+ * The own-listener rule (A-010 request #48, A2): the snapshot's LISTEN sockets on `port` whose inode
+ * is one of this process's own descriptors, whatever the probe's outcome and whatever in the
+ * process holds them. The product runs in this process, so any is an untracked product listener or
+ * a test helper on the product's port; either is a fault.
+ */
+function ownListeners(probe, port) {
+  return probe.snapshot.rows.filter((row) => row.owned && row.state === 'LISTEN' && row.local.endsWith(`:${port}`));
+}
+
+/** One line on where the attempt went, for assertion messages (the full record is sec16-probe.json). */
+function describeProbe(probe) {
+  const rows = `${probe.snapshot.rows.length} row(s) on the port`;
+  if (probe.outcome !== 'connected') return `the probe did not connect: ${probe.code}; ${rows}`;
+  return `the probe connected ${probe.local.address}:${probe.local.port} to ${probe.remote.address}:${probe.remote.port}, self-connect ${probe.self_connect}; ${rows}`;
+}
+
+/**
+ * Record the diagnostic whatever the verdict: as a test diagnostic, and as sec16-probe.json in the
+ * runner's output directory (OPENSIG_VERIFY_OUT; outside the runner, the gitignored
+ * .verify-out/server/). A failed write is ignored: the record never decides the case.
+ */
+function recordProbe(t, record) {
+  t.diagnostic(`SEC16-PROBE ${JSON.stringify(record)}`);
+  try {
+    const dir = process.env.OPENSIG_VERIFY_OUT ?? join(REPO, '.verify-out', 'server');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'sec16-probe.json'), `${JSON.stringify(record, null, 2)}\n`);
+  } catch {
+    // evidence only
+  }
+}
 
 test('[SEC-15] on the composed server with a blocked notifier, the generic 202 is written to the socket before any background ceremony step starts', async () => {
   const relay = await smtpRelay({ held: true });
@@ -118,18 +265,32 @@ test('[SEC-15] on the composed server with a blocked notifier, the generic 202 i
   }
 });
 
-test('[SEC-16] shutdown closes the listeners, then waits for pending background ceremony jobs, so none is dropped', async () => {
+test('[SEC-16] shutdown closes the listeners, then waits for pending background ceremony jobs, so none is dropped', async (t) => {
   const relay = await smtpRelay({ held: true });
   const lines = [];
-  const env = smtpEnv(relay.port);
+  // Both product listeners (SEC16-PROBE): the TCP listener and the relay socket's.
+  const relaySocket = join(tempDir('relay'), 'opensig.sock');
+  const env = smtpEnv(relay.port, { OPENSIG_RELAY_SOCKET: relaySocket });
   const running = await guarded(startServer(env, { logSink: (line) => lines.push(line) }), 'startServer');
   const side = testSide(env);
   const records = () => lines.map((line) => JSON.parse(line));
+  // Request or refusal lines the product logged after its `draining` line (A-010 request #48, A3).
+  const reachedSinceDrain = () => {
+    const all = records();
+    return all.slice(all.findIndex((record) => record.event === 'draining') + 1).filter((record) => REACHED_APP.has(record.event)).length;
+  };
   let closing = null;
   try {
+    // The listener state, first against the test's own connections: each listener listens once
+    // started and counts a connection made to it. Every premise has its own message (request #48, A5).
+    assert.deepEqual(running.listeners.map((listener) => listener.name), ['tcp', 'relay'], 'premise: both product listeners are started');
+    for (const listener of running.listeners) assert.equal(listener.listening, true, `premise: the ${listener.name} listener reports listening once started`);
+    const viaRelay = await call(0, { socketPath: relaySocket, path: `/v1/envelopes/${ENVELOPE_ID}` });
+    assert.equal(viaRelay.status, 401, 'premise: the relay listener serves (an operator route, no operator authentication configured)');
     const { token } = await side.sentEnvelope();
     const response = await postChallenge(running.port, token);
-    assert.equal(response.status, 202);
+    assert.equal(response.status, 202, `premise: the challenge request over TCP got the generic 202 (${response.status})`);
+    for (const listener of running.listeners) assert.ok(listener.acceptedConnections >= 1, `premise: the ${listener.name} listener counted the test's own connection (${listener.acceptedConnections})`);
     await guarded(relay.until((state) => state.connections === 1), 'the job reached the blocked notifier');
     assert.equal(running.composition.ceremony.challengeWorkStats().pending, 1, 'premise: one job pending');
 
@@ -149,15 +310,34 @@ test('[SEC-16] shutdown closes the listeners, then waits for pending background 
     assert.equal(settled, false, 'close() does not settle while a background job is pending');
     assert.equal(running.composition.ceremony.challengeWorkStats().pending, 1, 'the job is still pending, not dropped');
     assert.equal(records().find((record) => record.event === 'draining')?.challenge_work_pending, 1, 'the drain names the pending job');
-    const refused = await new Promise((resolveConnect) => {
-      const socket = connect({ host: '127.0.0.1', port: running.port });
-      socket.on('connect', () => {
-        socket.destroy();
-        resolveConnect(false);
-      });
-      socket.on('error', () => resolveConnect(true));
+
+    // SEC16-PROBE: the product's own state, then a fresh connection attempt to its former port,
+    // then two macrotask turns (an accept the attempt caused has been delivered by then), then
+    // the record, and only then the verdict, from product facts alone. Where the attempt went
+    // decides nothing.
+    const before = { accepted: running.listeners.map((listener) => listener.acceptedConnections), work: { ...running.composition.ceremony.challengeWorkStats() } };
+    const probe = await probeFormerPort(running.port);
+    await turn();
+    await turn();
+    recordProbe(t, {
+      case: 'SEC-16',
+      port: running.port,
+      probe,
+      product: {
+        listeners: running.listeners.map((listener, index) => ({ name: listener.name, listening: listener.listening, accepted_before: before.accepted[index], accepted_after: listener.acceptedConnections })),
+        reached_app_since_drain: reachedSinceDrain(),
+        work_before: before.work,
+        work_after: { ...running.composition.ceremony.challengeWorkStats() },
+        own_listeners_on_port: ownListeners(probe, running.port).length,
+      },
     });
-    assert.equal(refused, true, 'the listeners are closed while the drain waits: no new work can start');
+    // Each message names its own fact and never repeats the pre-amendment probe's message.
+    const where = describeProbe(probe);
+    for (const listener of running.listeners) assert.equal(listener.listening, false, `during the drain the ${listener.name} listener still reports listening (${where})`);
+    running.listeners.forEach((listener, index) => assert.equal(listener.acceptedConnections, before.accepted[index], `the probe reached the product: the ${listener.name} listener's accepted-connection count rose during the drain (${where})`));
+    assert.equal(reachedSinceDrain(), 0, `the probe reached the product: a request or refusal line was logged during the drain (${where})`);
+    assert.deepEqual({ ...running.composition.ceremony.challengeWorkStats() }, before.work, `the probe reached the product: the work statistics changed during the drain (${where})`);
+    assert.deepEqual(ownListeners(probe, running.port), [], `a LISTEN socket of this test process holds the product's former port during the drain (${where})`);
 
     relay.release();
     await guarded(closing, 'close() settles once the job is done');
@@ -166,6 +346,10 @@ test('[SEC-16] shutdown closes the listeners, then waits for pending background 
     const closed = records().find((record) => record.event === 'closed');
     assert.deepEqual({ ...closed?.challenge_work }, { pending: 0, completed: 1, failed: 0 }, 'closed is logged with no pending work');
     assert.ok(events.lastIndexOf('notification_accepted') < events.indexOf('closed'), 'the mail was accepted before the server closed');
+    // SEC16-PROBE, once close() settled: no listener accepted anything after its close, and no
+    // request reached the app after the drain began.
+    running.listeners.forEach((listener, index) => assert.equal(listener.acceptedConnections, before.accepted[index], `after close() settled, the ${listener.name} listener's accepted-connection count had risen since the drain began (${where})`));
+    assert.equal(reachedSinceDrain(), 0, `after close() settled, a request or refusal line had been logged since the drain began (${where})`);
   } finally {
     relay.release();
     if (closing !== null) await guarded(closing, 'final close');
