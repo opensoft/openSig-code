@@ -138,11 +138,12 @@ export function call(port, { method = 'GET', path, headers = {}, body } = {}) {
  * blob store, spool, 0600 key file, ceremony, envelope service and the real app.
  * CH-07 passes `scheduleWork` (heldWork().schedule), `wrapNotifier`
  * (heldNotifier().wrap) and `wrapDb` to hold or fail the ceremony's
- * post-response work; every other test uses the defaults.
+ * post-response work; CH-09 passes a short `busyTimeoutMs` (the database's
+ * bounded wait for the write lock); every other test uses the defaults.
  */
-export async function createWorld({ limits, idempotencyBodyLimit, scheduleWork, wrapNotifier, wrapDb } = {}) {
+export async function createWorld({ limits, idempotencyBodyLimit, scheduleWork, wrapNotifier, wrapDb, busyTimeoutMs } = {}) {
   const scratch = makeScratch();
-  const { db, path } = openTemp(scratch);
+  const { db, path } = openTemp(scratch, busyTimeoutMs === undefined ? {} : { busyTimeoutMs });
   const tenant = sid('tenant');
   createTenant(db, tenant);
   const consent = { id: sid('consent'), version: '2026.11-synthetic', text: CONSENT_WORDING, digest: sha256(Buffer.from(CONSENT_WORDING, 'utf8')) };

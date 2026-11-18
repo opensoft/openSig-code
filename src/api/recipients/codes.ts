@@ -125,6 +125,11 @@ function keyFrom(key: KeyObject): ChallengeKey {
  * Load the challenge-HMAC key from a 0600 file (absolute path, never followed
  * through a symbolic link) or from an inherited file descriptor, which stays
  * open and is read from offset 0. Any other way of passing a key is refused.
+ *
+ * A path is opened with O_NONBLOCK too (A-010 KEY-FIFO, request #30): a FIFO
+ * or a device swapped in at the path after the server's own lstat check then
+ * opens at once instead of blocking startup, and the fstat check below refuses
+ * it as not a regular file. O_NONBLOCK changes nothing for a regular file.
  */
 export function loadChallengeKey(source: ChallengeKeySource): ChallengeKey {
   const checked = checkSource(source);
@@ -132,7 +137,7 @@ export function loadChallengeKey(source: ChallengeKeySource): ChallengeKey {
   let owned = false;
   if ('path' in checked) {
     try {
-      fd = openSync(checked.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NOCTTY);
+      fd = openSync(checked.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NOCTTY | constants.O_NONBLOCK);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code === 'ELOOP') throw new ChallengeKeyError('the challenge key path must not be a symbolic link');

@@ -3,11 +3,19 @@
 // T008 recipient ceremony: invitation issuance (RC-01) and the challenge code,
 // its HMAC storage and the 0600 key file (CH-01). Capability values are read
 // from the spool and compared as booleans; none appears in a name or message.
+// CH-01 (extended, A-010 KEY-FIFO): a FIFO at the key path is refused at once;
+// a worker thread (fifo-rescue-worker.mjs) bounds a regression's blocking open.
 
 import assert from 'node:assert/strict';
-import { closeSync, mkdirSync, openSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { closeSync, lstatSync, mkdirSync, mkdtempSync, openSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { Worker } from 'node:worker_threads';
 
 import { ChallengeKeyError, loadChallengeKey, newChallengeCode, newInvitationToken, RecipientCeremony } from '../../src/api/recipients/index.ts';
 import {
@@ -200,5 +208,46 @@ test('[CH-01] the challenge key comes only from a 0600 file or an inherited desc
     );
   } finally {
     await world.close();
+  }
+});
+
+/** The FIFO rescuer: opens the FIFO's other end if the load has not returned in FIFO_RESCUE_AFTER_MS. */
+const FIFO_RESCUE_WORKER = fileURLToPath(new URL('./fifo-rescue-worker.mjs', import.meta.url));
+const FIFO_RESCUE_AFTER_MS = 2_000;
+
+test('[CH-01] a FIFO swapped in at the key path after the server\'s own check is refused at once as not a regular file: the loader\'s open never blocks (A-010 KEY-FIFO, request #30)', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'opensig-key-fifo-'));
+  // [0]: the load returned; [1]: the rescuer had to open the FIFO's other end.
+  const flags = new Int32Array(new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT));
+  let worker;
+  try {
+    // The server's lstat check (src/server/main.ts) refuses a FIFO that is already there. This is
+    // the race it cannot see: the loader itself meets a FIFO at the path it opens.
+    const fifo = join(dir, 'challenge-hmac.key');
+    assert.equal(spawnSync('mkfifo', ['-m', '600', fifo]).status, 0, 'premise: a FIFO was created at the key path');
+    assert.ok(lstatSync(fifo).isFIFO(), 'premise: the key path names a FIFO, with no writer');
+    worker = new Worker(FIFO_RESCUE_WORKER, { workerData: { path: fifo, afterMs: FIFO_RESCUE_AFTER_MS, flags: flags.buffer } });
+    const [armed] = await once(worker, 'message');
+    assert.equal(armed, 'armed', 'premise: the rescuer is armed before the load');
+
+    const started = performance.now();
+    let refused;
+    try {
+      loadChallengeKey({ path: fifo });
+    } catch (error) {
+      refused = error;
+    }
+    Atomics.store(flags, 0, 1);
+    const elapsed = performance.now() - started;
+    const rescued = Atomics.load(flags, 1) === 1;
+    t.diagnostic(`a FIFO at the key path was refused in ${Math.round(elapsed)} ms (rescue armed at ${FIFO_RESCUE_AFTER_MS} ms; rescued: ${rescued})`);
+
+    assert.equal(rescued, false, `the loader's open of the FIFO did not block: it returned before the test opened the FIFO's other end (${Math.round(elapsed)} ms)`);
+    assert.ok(refused instanceof ChallengeKeyError && /regular file/.test(refused.message), `the FIFO is refused as not a regular file (got ${refused})`);
+    assert.ok(elapsed < FIFO_RESCUE_AFTER_MS / 2, `refused promptly: ${Math.round(elapsed)} ms, against a rescue at ${FIFO_RESCUE_AFTER_MS} ms`);
+  } finally {
+    Atomics.store(flags, 0, 1);
+    await worker?.terminate();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

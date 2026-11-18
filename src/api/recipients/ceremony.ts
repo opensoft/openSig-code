@@ -53,7 +53,10 @@
 //
 // Reads (readRecipientSession, readRecipientDocument, readRecipientManifest)
 // never consume, approve or change the envelope: at most a session's
-// last_seen_at moves, and a prefetch moves nothing. The document is the exact
+// last_seen_at moves, and a prefetch moves nothing. They open no transaction,
+// and neither does a session lookup that does not refresh, so none of them
+// takes the write lock (data-model.md § Persistence; A-010 READ-LOCK-CER):
+// only moving last_seen_at is a write. The document is the exact
 // frozen bytes, read from the content-addressed blob store and re-checked
 // against the revision's digest and size; the manifest is the exact canonical
 // bytes frozen at prepare, re-checked against the manifest digest.
@@ -747,19 +750,27 @@ export class RecipientCeremony implements RecipientSessionAuthority {
     return this.#session(store.tenantId, record, seen);
   }
 
+  /**
+   * A lookup that refreshes moves last_seen_at, a write, so it runs in one
+   * transaction. A lookup that does not refresh (a prefetch, or the first step
+   * of a mutation's guard) only reads, so it opens no transaction and takes no
+   * write lock (data-model.md § Persistence; A-010 READ-LOCK-CER, CH-09).
+   */
   authenticate(request: RequestLike, options: { readonly refresh: boolean }): RecipientSession | null {
     const value = readSessionCookie(request.headers);
     if (value === null) return null;
     const hash = capabilityHash(value);
     const now = this.#now();
-    return this.#db.transaction(() => {
+    const refresh = options.refresh;
+    const lookup = (): RecipientSession | null => {
       const owner = resolveSession(this.#db, hash);
       if (owner === undefined) return null;
       const store = this.#db.forTenant(owner.tenantId);
       const record = getSession(store, owner.id);
       if (record === undefined || !this.#live(store, record, now)) return null;
-      return options.refresh ? this.#touch(store, record, now) : this.#session(owner.tenantId, record, record.lastSeenAt);
-    });
+      return refresh ? this.#touch(store, record, now) : this.#session(owner.tenantId, record, record.lastSeenAt);
+    };
+    return refresh ? this.#db.transaction(lookup) : lookup();
   }
 
   refresh(session: RecipientSession): RecipientSession | null {
@@ -806,15 +817,20 @@ export class RecipientCeremony implements RecipientSessionAuthority {
     });
   }
 
+  // The three reads below open no transaction, so they take no write lock
+  // (data-model.md § Persistence; A-010 READ-LOCK-CER, CH-09). Their statements
+  // cannot interleave with this process's own writes, which all run
+  // synchronously, and the store refuses any write outside a transaction.
+
   /** readRecipientSession: every approval input of the session's recipient. */
   readState(session: RecipientSession): JsonValue {
     const now = this.#now();
-    return this.#db.transaction(() => this.#state(this.#db.forTenant(session.tenantId), session, now));
+    return this.#state(this.#db.forTenant(session.tenantId), session, now);
   }
 
   /** readRecipientDocument: the exact frozen PDF bytes of the session's revision. */
   readDocument(session: RecipientSession): Buffer {
-    const revision = this.#db.transaction(() => getRevision(this.#db.forTenant(session.tenantId), session.envelopeId, session.revisionId));
+    const revision = getRevision(this.#db.forTenant(session.tenantId), session.envelopeId, session.revisionId);
     if (revision === undefined) throw internal();
     let bytes: Buffer;
     try {
@@ -828,7 +844,7 @@ export class RecipientCeremony implements RecipientSessionAuthority {
 
   /** readRecipientManifest: the exact canonical manifest bytes frozen at prepare. */
   readManifest(session: RecipientSession): Buffer {
-    const manifest = this.#db.transaction(() => getManifest(this.#db.forTenant(session.tenantId), session.envelopeId));
+    const manifest = getManifest(this.#db.forTenant(session.tenantId), session.envelopeId);
     if (manifest === undefined || manifest.digest !== session.manifestDigest || sha256(manifest.bytes) !== session.manifestDigest) throw internal();
     return Buffer.from(manifest.bytes);
   }
