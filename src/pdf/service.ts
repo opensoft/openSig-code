@@ -552,7 +552,8 @@ function validObjects(report: Record<string, unknown>, pages: PageReport[], size
   const objects = report.objects;
   if (!isObject(objects)) return null;
   const entries = Object.entries(objects);
-  if (entries.length > 3 + 2 * pages.length) return null;
+  // The catalog, the AcroForm, its /Fields and an indirect /SigFlags integer, plus a page and its /Annots per page.
+  if (entries.length > 4 + 2 * pages.length) return null;
   const converted = new Map<number, { gen: number; value: PdfValue }>();
   const budget = { nodes: maxNodes };
   for (const [key, entry] of entries) {

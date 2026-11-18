@@ -79,7 +79,12 @@ export interface ParseReport {
   pages: PageReport[];
   xref: { kind: 'table' | 'stream'; sections: number; startxref: number; size: number; hybrid: boolean };
   trailer: { root: [number, number]; info: [number, number] | null; id: [string, string] | null };
-  /** Only the objects the composer rewrites: the catalog, the pages, and the AcroForm, its /Fields and page /Annots when indirect. */
+  /**
+   * Only the objects the composer rewrites: the catalog, the pages, and the AcroForm, its /Fields
+   * and page /Annots when indirect; plus, when the AcroForm's /SigFlags is indirect and names a
+   * non-negative integer object, that object (its integer value only), which the composer reads
+   * to combine the flags with 3 (request #44, T036-FIXES). No other object is reported.
+   */
   objects: Record<string, { gen: number; value: JsonValue }>;
   features: string[];
   stats: { objects: number; object_streams: number; max_depth: number; inflated_bytes: number };
@@ -224,6 +229,14 @@ class DocumentParser {
       if (isDict(form)) {
         const fields = form.map.get('Fields');
         if (isRef(fields)) include(fields);
+        // An indirect /SigFlags: report its target only when it is a non-negative integer
+        // object (one node, a few bytes), never a dictionary, array, stream or dangling
+        // reference, so no document that parsed before is refused now.
+        const sigFlags = form.map.get('SigFlags');
+        if (isRef(sigFlags)) {
+          const target = this.objects.get(sigFlags.num);
+          if (target !== undefined && target.gen === sigFlags.gen && target.stream === null && isNonNegativeInteger(target.value)) include(sigFlags);
+        }
       }
     }
     if (this.sections > 1) this.features.add('incremental-updates');
