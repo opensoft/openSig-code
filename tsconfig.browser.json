@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["es2024", "dom", "dom.iterable"],
+    "types": [],
+    "rootDir": "src/autograph",
+    "outDir": "dist/autograph"
+  },
+  "include": ["src/autograph"]
+}
