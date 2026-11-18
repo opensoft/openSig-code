@@ -5,9 +5,13 @@
 //   AG-06  no sideways scrolling at any step, touch targets of at least 44 by 44 pixels, the
 //          drawing surface takes real touch strokes (CDP touch input, not synthetic events)
 //          without scrolling the page, and taps alone take the flow to the receipt, in the
-//          normal order: draw, then consent, then Approve. From the drawing on, every touch goes
-//          through one CDP touch path with every touch ended (browser.mjs touchInput; dispatch
-//          Addendum 6). After the drawing the test records and asserts that the consent target
+//          normal order: draw, then consent, then Approve. Each stroke's finger rests before it
+//          lifts (browser.mjs FINGER_REST_MS), and that rest is what lets the tap after the
+//          drawing click: run04 and run05, without it, gave no click, and the recheck's R15 and
+//          R16 showed the rest, not the touch path, to be the cure (dispatch Addendum 8; the
+//          cause of the dropped click is unproven). From the drawing on, every touch goes through
+//          one CDP touch path with every touch ended, for consistency (browser.mjs touchInput).
+//          After the drawing the test records and asserts that the consent target
 //          is in the viewport and hit at its tap point, and records the touch, pointer and click
 //          events the page received, in order.
 
@@ -92,7 +96,9 @@ test('[AG-06] at 360 px with touch: no sideways scrolling at any step, 44 px tar
     assert.ok(box && box.x >= 0 && box.x + box.width <= 360 && box.height >= 40, 'the drawing surface fits and is usable');
     const scrolled = await page.evaluate(() => [window.scrollX, window.scrollY]);
     const events = await touchLog(page);
-    // From here every touch goes through one CDP touch path: draw, then consent, then Approve.
+    // From here every touch goes through one CDP touch path, for consistency: draw, then consent,
+    // then Approve. The finger rest at the end of each stroke (touch.draw) is what lets the taps
+    // after the drawing click (dispatch Addendum 8).
     const touch = await touchInput(page);
     let response;
     let preview;

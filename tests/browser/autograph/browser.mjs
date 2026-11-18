@@ -303,16 +303,26 @@ export async function drawWithMouse(page, key, strokes) {
   }
 }
 
-/** How long a finger rests on the surface before it lifts at the end of a stroke. */
+/**
+ * How long a finger rests on the surface before it lifts at the end of a stroke. This rest is
+ * what makes the next tap's click arrive (dispatch Addendum 8). Without it, the tap after a
+ * drawing produced no click in run04 and run05. The recheck separated the two changes, each run
+ * once: R15, this one CDP touch path WITHOUT the rest, failed (no trusted click on the consent
+ * label); R16, a Playwright locator.tap() after CDP strokes WITH the rest, passed. So the rest
+ * is the cure, not the touch path. Why an instant lift drops the next tap's click is unproven.
+ * The reviewer's hypothesis, not established: Chromium reads an instant lift after movement as
+ * a fling and suppresses the next tap's click.
+ */
 const FINGER_REST_MS = 120;
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Real touch input on `page` through ONE CDP session (Input.dispatchTouchEvent, the same events
  * page.touchscreen.tap sends): draw() strokes on a pad and tap() controls, every touch ended,
- * then detach(). From a drawing on, every touch of a flow goes through this one path: a
- * Playwright locator.tap() after strokes dispatched by a separate CDP session produced no click
- * (run04, run05; dispatch Addendum 6). A finger rests before it lifts, as a person's does.
+ * then detach(). From a drawing on, every touch of a flow goes through this one path for
+ * consistency, not as the cure: the recheck's R16 passed with a Playwright tap after these
+ * strokes. What lets the tap after a drawing click is the finger rest before each lift
+ * (FINGER_REST_MS above: run04, run05, R15, R16; dispatch Addendum 8).
  */
 export async function touchInput(page) {
   const cdp = await page.context().newCDPSession(page);
