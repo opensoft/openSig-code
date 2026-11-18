@@ -77,7 +77,18 @@ node scripts/dev.mjs [--port <n>] [--check]
   Development mail goes only to the gitignored file spool `var/spool/`.
 - Refuses any Node version other than `.node-version`.
 - Starts `src/server/main.ts` once it exists (T031); until then it exits 3 and starts nothing.
-  `--check` validates the configuration without starting anything.
+  `--check` validates the configuration without starting or creating anything.
+- Provides what the composed server requires before it starts it (A-010 row DEV-COMPOSE):
+  - The database at `OPENSIG_DATABASE` (default `var/data/opensig.db`) is created and migrated
+    through the storage layer's migration API when it is absent or behind the code's migrations.
+    One it cannot open or migrate (newer than the code, an applied migration that differs, not a
+    database, a group- or other-accessible file) is refused, left unchanged, and nothing starts.
+    The server itself never creates or migrates a database.
+  - Unless `OPENSIG_CHALLENGE_KEY_FILE` is set, the recipient challenge-HMAC key is 32 random
+    bytes generated for each run in a fresh `mkdtemp` directory under the OS temporary directory,
+    outside the tree (directory 0700, file 0600). Its path is passed to the server, its bytes are
+    never printed, and the directory is removed when the launcher exits (a launcher killed with
+    SIGKILL cannot remove it). A configured key file is passed through unchanged and never removed.
 
 The server receives a cleared environment: `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `TMPDIR`,
 `TERM`, `LC_*`, every `OPENSIG_*` setting without a secret-like name, and these launcher-set values:
@@ -89,6 +100,8 @@ The server receives a cleared environment: `PATH`, `HOME`, `LANG`, `LANGUAGE`, `
 | `OPENSIG_ENV`, `NODE_ENV` | `development` |
 | `OPENSIG_MAIL_TRANSPORT` | `spool` |
 | `OPENSIG_SPOOL_DIR`, `OPENSIG_DATA_DIR` | `var/spool`, `var/data` (absolute paths, created with mode 0700) |
+| `OPENSIG_DATABASE` | the prepared database: `OPENSIG_DATABASE` if set (an absolute path), else `var/data/opensig.db` |
+| `OPENSIG_CHALLENGE_KEY_FILE` | the per-run key file, or the configured one (an absolute path) |
 
 Secrets are passed by 0600 file path or inherited descriptor, never through the environment. A
 container composition is deferred, so there is no `compose.yaml`.

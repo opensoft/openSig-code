@@ -7,10 +7,13 @@
 // repository layout, so they do not depend on whether the real src/server/main.ts exists
 // yet. The server entrypoints written there are test doubles that record what the
 // launcher handed them; they stand in for T031's server, not for the launcher under test.
+// Since DEV-COMPOSE (DV-04) the launcher prepares the database through the storage layer
+// before it starts a server, so a layout with an entrypoint links the real src/storage/,
+// and the launcher's temporary directory (its per-run key) is a scratch directory here.
 
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -22,6 +25,9 @@ import { DEFAULT_PORT, LOOPBACK_HOST, resolveDevConfig, serverEnv } from '../../
 const REPO = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const DEV = join(REPO, 'scripts', 'dev.mjs');
 const temps = [];
+/** The launchers' TMPDIR, so a per-run key directory never lands outside this test's scratch. */
+const LAUNCHER_TMP = mkdtempSync(join(tmpdir(), 'opensig-dv03-tmp-'));
+temps.push(LAUNCHER_TMP);
 
 after(() => {
   for (const dir of temps) rmSync(dir, { recursive: true, force: true });
@@ -53,12 +59,14 @@ function layout(serverSource) {
   if (serverSource) {
     mkdirSync(join(root, 'src', 'server'), { recursive: true });
     writeFileSync(join(root, 'src', 'server', 'main.ts'), serverSource);
+    // The real storage layer: the launcher creates and migrates the database through it (DV-04).
+    symlinkSync(join(REPO, 'src', 'storage'), join(root, 'src', 'storage'), 'dir');
   }
   return root;
 }
 
 function baseEnv(extra = {}) {
-  return { PATH: process.env.PATH ?? '', HOME: tmpdir(), LANG: 'C', ...extra };
+  return { PATH: process.env.PATH ?? '', HOME: tmpdir(), LANG: 'C', TMPDIR: LAUNCHER_TMP, ...extra };
 }
 
 function runDev(root, args, extraEnv = {}) {
@@ -102,10 +110,12 @@ test('[DV-03] the resolved configuration binds only 127.0.0.1 and hands the serv
     NODE_OPTIONS: '--max-old-space-size=64',
     CLOUD_PROVIDER_CREDENTIAL_ID: 'synthetic-value',
   });
+  // OPENSIG_DATABASE is launcher-set since DEV-COMPOSE; the key file only once a run has one (DV-04).
   assert.deepEqual(Object.keys(env).sort(), [
     'HOME',
     'LC_ALL',
     'NODE_ENV',
+    'OPENSIG_DATABASE',
     'OPENSIG_DATA_DIR',
     'OPENSIG_ENV',
     'OPENSIG_HOST',

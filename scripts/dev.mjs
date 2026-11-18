@@ -18,6 +18,19 @@
 //   does not look like a secret, and the launcher-controlled variables below. Secrets
 //   are passed by 0600 file path or inherited descriptor, never through the environment.
 //   Termination signals are forwarded to the server and its exit status is returned.
+// - Provides what the composed server requires (A-010 row DEV-COMPOSE, request #30), only
+//   when it starts the server, never for --check or --help:
+//   - the database at OPENSIG_DATABASE (default var/data/opensig.db) is created and migrated
+//     through the storage layer's migration API (src/storage/db: openDatabase, checkSchema,
+//     migrate) when it is absent or behind. One it cannot open or migrate (newer than the
+//     code, an applied migration that differs, not a database, a loose file mode) is refused
+//     and nothing starts. The server itself never creates or migrates a database.
+//   - unless OPENSIG_CHALLENGE_KEY_FILE is set, the challenge-HMAC key is 32 random bytes
+//     generated for this run in a fresh mkdtemp directory outside the tree (directory 0700,
+//     file 0600; data-model.md § Keys and secrets). Its path is passed as
+//     OPENSIG_CHALLENGE_KEY_FILE, and the directory is removed when the launcher exits. The
+//     key bytes are never printed. A configured OPENSIG_CHALLENGE_KEY_FILE is passed through
+//     unchanged, and the server checks it.
 // - No container composition exists; this script is the whole dev launcher.
 //
 // Environment contract for src/server/main.ts (always set by this launcher):
@@ -27,6 +40,8 @@
 //   OPENSIG_MAIL_TRANSPORT=spool   file spool only
 //   OPENSIG_SPOOL_DIR=<root>/var/spool
 //   OPENSIG_DATA_DIR=<root>/var/data
+//   OPENSIG_DATABASE=<database>    the prepared database (default <root>/var/data/opensig.db)
+//   OPENSIG_CHALLENGE_KEY_FILE=<f> the per-run key file, or the configured one
 //   NODE_ENV=development
 //
 // Exit status: 0 server exited 0 (or --check/--help succeeded), 1 configuration refused,
@@ -34,16 +49,22 @@
 // number when it was killed by a signal).
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
-import { constants as osConstants } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { constants as osConstants, tmpdir } from 'node:os';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const LOOPBACK_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 8443;
 export const SERVER_ENTRY = 'src/server/main.ts';
 export const STATUS = Object.freeze({ OK: 0, REFUSED: 1, USAGE: 2, NO_SERVER: 3 });
+/** The per-run challenge-HMAC key: 32 random bytes (data-model.md § Keys and secrets). */
+export const CHALLENGE_KEY_BYTES = 32;
+/** The prefix of the per-run key directory, created with mkdtemp in the OS temporary directory. */
+export const KEY_DIR_PREFIX = 'opensig-dev-key-';
+export const KEY_FILE_NAME = 'challenge-hmac.key';
 
 const BASE_ENV = Object.freeze(['PATH', 'HOME', 'LANG', 'LANGUAGE', 'TZ', 'TMPDIR', 'TERM']);
 const CONTROLLED = Object.freeze([
@@ -53,11 +74,21 @@ const CONTROLLED = Object.freeze([
   'OPENSIG_MAIL_TRANSPORT',
   'OPENSIG_SPOOL_DIR',
   'OPENSIG_DATA_DIR',
+  'OPENSIG_DATABASE',
+  'OPENSIG_CHALLENGE_KEY_FILE',
 ]);
 const SECRET_NAME = /(?:SECRET|PASSWORD|PASSWD|PASSPHRASE|TOKEN|CREDENTIALS?|_KEY|_PEM|COOKIE)$/i;
 const MAIL_RELAY_NAME = /^(?:OPENSIG_)?(?:MAIL|MAILER|EMAIL)_(?:URL|DSN|HOST|SERVER|RELAY|PORT|USER|USERNAME|PASS|PASSWORD)$/i;
 
 class UsageError extends Error {}
+
+/** A refusal while preparing what the server needs; its message names settings, never values or paths. */
+export class LauncherRefusal extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'LauncherRefusal';
+  }
+}
 
 function isLoopbackAlias(host) {
   const bare = host.replace(/^\[(.*)\]$/, '$1').toLowerCase();
@@ -121,6 +152,13 @@ export function mailSettingProblems(env) {
   return problems;
 }
 
+/** A set, non-empty setting that must be an absolute path: { value } or { problem }; null when unset. */
+function absoluteSetting(env, name) {
+  const value = env[name];
+  if (value === undefined || value === '') return null;
+  return isAbsolute(value) ? { value } : { problem: `${name} must be an absolute path` };
+}
+
 /**
  * Resolve the launcher configuration.
  * Returns { ok: true, config } or { ok: false, status, problems }.
@@ -165,6 +203,12 @@ export function resolveDevConfig({ argv = [], env = {}, root = ROOT, version = p
 
   problems.push(...mailSettingProblems(env));
 
+  const dataDir = join(root, 'var', 'data');
+  const database = absoluteSetting(env, 'OPENSIG_DATABASE');
+  if (database?.problem) problems.push(database.problem);
+  const keyFile = absoluteSetting(env, 'OPENSIG_CHALLENGE_KEY_FILE');
+  if (keyFile?.problem) problems.push(keyFile.problem);
+
   if (problems.length > 0) return { ok: false, status: STATUS.REFUSED, problems };
   return {
     ok: true,
@@ -176,14 +220,22 @@ export function resolveDevConfig({ argv = [], env = {}, root = ROOT, version = p
       help: options.help,
       mailTransport: 'spool',
       spoolDir: join(root, 'var', 'spool'),
-      dataDir: join(root, 'var', 'data'),
+      dataDir,
+      /** The database the launcher prepares and passes as OPENSIG_DATABASE. */
+      database: database?.value ?? join(dataDir, 'opensig.db'),
+      databaseConfigured: database !== null,
+      /** The configured key file, or null: a key is then generated for the run. */
+      challengeKeyFile: keyFile?.value ?? null,
       entry: join(root, SERVER_ENTRY),
     },
   };
 }
 
-/** The server environment: base allowlist, non-secret OPENSIG_* settings, controlled values. */
-export function serverEnv(config, env) {
+/**
+ * The server environment: base allowlist, non-secret OPENSIG_* settings, controlled values.
+ * `challengeKeyFile` is the run's key file (generated, or the configured one).
+ */
+export function serverEnv(config, env, { challengeKeyFile = config.challengeKeyFile } = {}) {
   const child = {};
   for (const name of BASE_ENV) if (env[name] !== undefined) child[name] = env[name];
   for (const name of Object.keys(env).sort()) if (name.startsWith('LC_')) child[name] = env[name];
@@ -200,9 +252,91 @@ export function serverEnv(config, env) {
     OPENSIG_MAIL_TRANSPORT: config.mailTransport,
     OPENSIG_SPOOL_DIR: config.spoolDir,
     OPENSIG_DATA_DIR: config.dataDir,
+    OPENSIG_DATABASE: config.database,
     NODE_ENV: 'development',
   });
+  if (challengeKeyFile !== null) child.OPENSIG_CHALLENGE_KEY_FILE = challengeKeyFile;
   return { env: child, dropped };
+}
+
+function inside(parent, child) {
+  const path = relative(parent, child);
+  return path === '' || (!path.startsWith('..') && !isAbsolute(path));
+}
+
+/**
+ * The run's challenge-HMAC key (data-model.md § Keys and secrets): 32 random bytes in a fresh
+ * mkdtemp directory under `base` (the OS temporary directory), which must lie outside the tree
+ * at `root`; directory 0700, file 0600, created exclusively. The bytes are zeroed after the
+ * write and never printed. Returns { dir, path, remove }; remove() deletes the directory and
+ * is idempotent. Throws LauncherRefusal.
+ */
+export function createRunKey(root, base = tmpdir()) {
+  let dir;
+  try {
+    dir = mkdtempSync(join(base, KEY_DIR_PREFIX));
+  } catch {
+    throw new LauncherRefusal('the per-run challenge key directory cannot be created in the temporary directory (TMPDIR)');
+  }
+  const remove = () => rmSync(dir, { recursive: true, force: true });
+  try {
+    chmodSync(dir, 0o700);
+    if (inside(realpathSync(root), realpathSync(dir))) {
+      throw new LauncherRefusal('the temporary directory (TMPDIR) is inside the repository; the per-run challenge key must be generated outside the tree');
+    }
+    const path = join(dir, KEY_FILE_NAME);
+    const bytes = randomBytes(CHALLENGE_KEY_BYTES);
+    try {
+      writeFileSync(path, bytes, { mode: 0o600, flag: 'wx' });
+    } finally {
+      bytes.fill(0);
+    }
+    chmodSync(path, 0o600);
+    return Object.freeze({ dir, path, remove });
+  } catch (error) {
+    remove();
+    if (error instanceof LauncherRefusal) throw error;
+    throw new LauncherRefusal('the per-run challenge key cannot be written');
+  }
+}
+
+/**
+ * Create and migrate the development database through the storage layer's migration API
+ * (src/storage/db: openDatabase, checkSchema, migrate) when it is absent or behind the code's
+ * migrations; a current one is left as it is. One that cannot be opened or migrated is
+ * refused (LauncherRefusal) and left unchanged. The storage layer is loaded from `root` only
+ * here, so --check and the refusals above need nothing but this script.
+ * Returns { created, from, to } (schema versions before and after).
+ */
+export async function prepareDatabase(config) {
+  const storage = await import(pathToFileURL(join(config.root, 'src', 'storage', 'db', 'index.ts')).href);
+  const schema = await import(pathToFileURL(join(config.root, 'src', 'storage', 'schema', 'migrations.ts')).href);
+  // The storage layer's own message, or SQLite's fixed text for its error code (for example
+  // "file is not a database", which the storage layer passes through); never a path.
+  const reason = (error) => {
+    if (error instanceof storage.StorageError) return error.message;
+    if (error?.code === 'ERR_SQLITE_ERROR' && typeof error.errstr === 'string') return error.errstr;
+    return 'an unexpected error';
+  };
+  const created = !existsSync(config.database);
+  let db;
+  try {
+    db = storage.openDatabase({ path: config.database });
+  } catch (error) {
+    throw new LauncherRefusal(`the database at OPENSIG_DATABASE cannot be opened: ${reason(error)}`);
+  }
+  try {
+    const expected = schema.loadMigrations().length;
+    const from = db.checkSchema();
+    if (from < expected) db.migrate();
+    const to = db.checkSchema();
+    if (to !== expected) throw new storage.MigrationError(`the schema is at version ${to}, not ${expected}`);
+    return { created, from, to };
+  } catch (error) {
+    throw new LauncherRefusal(`the database at OPENSIG_DATABASE cannot be migrated: ${reason(error)}`);
+  } finally {
+    db.close();
+  }
 }
 
 const USAGE = 'usage: node scripts/dev.mjs [--port <n>] [--host 127.0.0.1] [--check]';
@@ -215,7 +349,12 @@ function err(line) {
   process.stderr.write(`dev: ${line}\n`);
 }
 
-export function main(argv = process.argv.slice(2), env = process.env) {
+function refuse(problem) {
+  err(`refused: ${problem}`);
+  process.exitCode = STATUS.REFUSED;
+}
+
+export async function main(argv = process.argv.slice(2), env = process.env) {
   const resolved = resolveDevConfig({ argv, env });
   if (!resolved.ok) {
     for (const problem of resolved.problems) err(`${resolved.status === STATUS.USAGE ? 'usage error' : 'refused'}: ${problem}`);
@@ -233,6 +372,8 @@ export function main(argv = process.argv.slice(2), env = process.env) {
   if (config.check) {
     out(`bind ${config.host}:${config.port}`);
     out('mail transport spool -> var/spool');
+    out(`database ${config.databaseConfigured ? 'OPENSIG_DATABASE' : 'var/data/opensig.db'} (created or migrated at start when absent or behind)`);
+    out(`challenge key ${config.challengeKeyFile === null ? 'generated per run outside the tree (removed at exit)' : 'OPENSIG_CHALLENGE_KEY_FILE'}`);
     out(`server entrypoint ${SERVER_ENTRY} ${present ? 'present' : 'absent (created by T031)'}`);
     out('CHECK OK');
     process.exitCode = STATUS.OK;
@@ -244,11 +385,37 @@ export function main(argv = process.argv.slice(2), env = process.env) {
     return;
   }
 
-  const { env: childEnv, dropped } = serverEnv(config, env);
+  const { dropped } = serverEnv(config, env);
   for (const name of dropped) err(`not passed to the server (secret-like name; use a 0600 file path instead): ${name}`);
   mkdirSync(config.spoolDir, { recursive: true, mode: 0o700 });
   mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
 
+  // DEV-COMPOSE: the database first, so a refusal leaves no key behind; then the run's key.
+  let database;
+  try {
+    database = await prepareDatabase(config);
+  } catch (error) {
+    if (error instanceof LauncherRefusal) return refuse(error.message);
+    throw error;
+  }
+  out(`database ${database.created ? 'created' : database.from < database.to ? `migrated from version ${database.from}` : 'current'} at schema version ${database.to}`);
+  let key = null;
+  if (config.challengeKeyFile === null) {
+    try {
+      key = createRunKey(config.root);
+    } catch (error) {
+      if (error instanceof LauncherRefusal) return refuse(error.message);
+      throw error;
+    }
+    out(`challenge key generated for this run (${CHALLENGE_KEY_BYTES} bytes, mode 0600, outside the tree; removed at exit)`);
+  } else {
+    out('challenge key from OPENSIG_CHALLENGE_KEY_FILE');
+  }
+  // The key directory goes when the launcher exits, however the server ended.
+  const removeKey = () => key?.remove();
+  process.once('exit', removeKey);
+
+  const { env: childEnv } = serverEnv(config, env, { challengeKeyFile: key?.path ?? config.challengeKeyFile });
   out(`starting ${SERVER_ENTRY} on ${config.host}:${config.port} (mail: spool)`);
   const child = spawn(process.execPath, [config.entry], { cwd: config.root, env: childEnv, stdio: 'inherit' });
   const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
@@ -258,6 +425,7 @@ export function main(argv = process.argv.slice(2), env = process.env) {
   for (const signal of signals) process.on(signal, forward);
   const release = () => {
     for (const signal of signals) process.off(signal, forward);
+    removeKey();
   };
   child.on('error', (error) => {
     release();
@@ -279,4 +447,9 @@ function invokedDirectly() {
   }
 }
 
-if (invokedDirectly()) main();
+if (invokedDirectly()) {
+  main().catch((error) => {
+    err(`failed: ${error instanceof Error ? error.name : typeof error}`);
+    process.exitCode = STATUS.REFUSED;
+  });
+}
