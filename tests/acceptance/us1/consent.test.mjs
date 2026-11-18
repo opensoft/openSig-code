@@ -14,11 +14,13 @@
 // lies inside the viewport with a non-zero box; the element at its centre is itself or a
 // descendant (nothing covers it); opaque; and it comes before the Approve button. The approval
 // then binds the consent version and digest the browser saw, in the server's own record.
+// Row US1-MASK (request #48): the part with the page open runs under browser.mjs whilePagesOpen
+// (first error recorded before any close, each close guarded), and after() uses closeAll.
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 
-import { approveTyped, assertFullyApprovedNotCompleted, launchLocked, openPage, openSession, recordEvidence } from './browser.mjs';
+import { approveTyped, assertFullyApprovedNotCompleted, closeAll, launchLocked, openPage, openSession, recordEvidence, whilePagesOpen } from './browser.mjs';
 import { ASSURANCE, CONSENT_TEXT, CONSENT_VERSION, SEAL_NOTICE, sha256, startWorld } from './harness.mjs';
 
 let world;
@@ -30,10 +32,7 @@ before(async () => {
   ({ browser, locked } = await launchLocked());
 });
 
-after(async () => {
-  await browser?.close();
-  await world?.close();
-});
+after(() => closeAll([() => browser?.close(), () => world?.close()]));
 
 async function assertShown(page, selector, exact, label) {
   const element = page.locator(selector);
@@ -60,7 +59,7 @@ test('[SC004-03] the exact consent text with its version, the assurance statemen
   const recipient = world.address('consent');
   const sent = await world.sentEnvelope({ recipients: [recipient] });
   const { page, requests, close } = await openPage(browser);
-  try {
+  await whilePagesOpen({ caseId: 'SC004-03', section: 'recipient', browser, pages: { page }, closers: [close] }, async () => {
     const state = await openSession(page, world, sent.invitation, recipient);
     assert.deepEqual(state.consent, { version: CONSENT_VERSION, text_digest: sha256(Buffer.from(CONSENT_TEXT, 'utf8')), text: CONSENT_TEXT }, 'the session carries the tenant consent text in force');
     assert.equal(state.assurance.statement, ASSURANCE.statement, 'the session carries the exact assurance statement');
@@ -76,9 +75,7 @@ test('[SC004-03] the exact consent text with its version, the assurance statemen
     assert.equal(body.consent_text_digest, world.consent.digest);
     await assertFullyApprovedNotCompleted(page);
     assert.match((await page.locator('#approval-outcome').textContent()) ?? '', /organization seal/, 'the receipt names the organization seal');
-  } finally {
-    await close();
-  }
+  });
   const [approval] = world.rows('approvals', sent.envelope.id);
   assert.ok(approval, 'the approval is recorded');
   assert.equal(approval.consent_version, CONSENT_VERSION, "the server's record binds the consent version shown");

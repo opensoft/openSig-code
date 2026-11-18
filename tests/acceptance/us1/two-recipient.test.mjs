@@ -22,6 +22,14 @@
 // application/pdf, inline, with frame-ancestors 'self', and its body's SHA-256 equals the
 // session's document digest (request #37 (a)); whether the viewer draws the PDF is not
 // observable headless and is recorded as not observed.
+// Row US1-MASK (A-010 requests #47 and #48; US1-01 amended without weakening): at all six places
+// where this flow waits for its own request's answer (recipient 1's approval here; the challenge
+// and the session in each of the two openSession() calls; recipient 2's approveTyped()), the wait
+// and the action start together (browser.mjs respondedTo), so the first rejection surfaces and no
+// wait is left unhandled. While the two pages are open, the first error, browser.isConnected()
+// and both pages' state are recorded before anything is closed, each close runs in its own
+// guard, and the first error is rethrown (browser.mjs whilePagesOpen). Every assertion is kept,
+// and no timeout changes.
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
@@ -32,6 +40,7 @@ import {
   approveTyped,
   assertFullyApprovedNotCompleted,
   assertRealCookie,
+  closeAll,
   cookieHeader,
   drawWithMouse,
   launchLocked,
@@ -39,9 +48,10 @@ import {
   openSession,
   proveCookieSent,
   recordEvidence,
-  responseTo,
+  respondedTo,
   step,
   watchFrameDocument,
+  whilePagesOpen,
 } from './browser.mjs';
 import { changedTables, PATHS, startWorld } from './harness.mjs';
 
@@ -54,10 +64,7 @@ before(async () => {
   ({ browser, locked } = await launchLocked());
 });
 
-after(async () => {
-  await browser?.close();
-  await world?.close();
-});
+after(() => closeAll([() => browser?.close(), () => world?.close()]));
 
 const NOTHING = Object.freeze({ invitations: 0, challenges: 0, sessions: 0 });
 const pick = (entry) => entry && { method: entry.method, path: entry.path, operation: entry.operation, status: entry.status, error: entry.error };
@@ -86,7 +93,8 @@ test('[US1-01] two sequential recipients: recipient 2 has no invitation, challen
   let cookie;
   let frame;
   let frameWatch = null;
-  try {
+  const closers = [() => frameWatch?.stop(), two.close, one.close];
+  await whilePagesOpen({ caseId: 'US1-01', section: 'recipients one and two', browser, pages: { one: one.page, two: two.page }, closers }, async () => {
     // Recipient 1 opens a session and reaches the review step, without approving yet.
     frameWatch = await watchFrameDocument(one.page);
     const state = await openSession(one.page, world, sent.invitation, first);
@@ -161,9 +169,7 @@ test('[US1-01] two sequential recipients: recipient 2 has no invitation, challen
       ],
     ]);
     await one.page.getByRole('checkbox', { name: 'I have read the consent text above and I agree to it.' }).check();
-    const answer = responseTo(one.page, world.origin, PATHS.approval, 'POST');
-    await one.page.getByRole('button', { name: 'Approve the document' }).click();
-    const response = await answer;
+    const response = await respondedTo(one.page, world.origin, PATHS.approval, 'POST', () => one.page.getByRole('button', { name: 'Approve the document' }).click());
     assert.equal(response.status(), 200, 'recipient 1 approval answers 200');
     firstReceipt = await response.json();
     assert.equal(firstReceipt.envelope_state, 'in-progress');
@@ -212,11 +218,7 @@ test('[US1-01] two sequential recipients: recipient 2 has no invitation, challen
     assert.equal(body.prior_approval_digest, firstReceipt.approval_digest);
     assert.equal(receipt.envelope_state, 'finalizing');
     await assertFullyApprovedNotCompleted(two.page);
-  } finally {
-    await frameWatch?.stop();
-    await two.close();
-    await one.close();
-  }
+  });
 
   const final = await world.readEnvelope(id);
   assert.equal(final.state, 'finalizing', 'readEnvelope: fully approved is the finalizing state, never completed');

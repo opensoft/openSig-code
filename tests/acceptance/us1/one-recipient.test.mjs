@@ -14,6 +14,9 @@
 //   contract answers 401 unauthenticated (an Authorization header on a recipient route is
 //   refused, app.ts:411-412, and approveAsHuman's own check, src/api/recipients/approval.ts:143),
 //   each refusal is in the server's request log, and there is no approval and no version change.
+// Row US1-MASK (request #48): in both tests the part with the page open runs under browser.mjs
+// whilePagesOpen (first error recorded before any close, each close guarded), and after() uses
+// closeAll.
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
@@ -23,12 +26,14 @@ import {
   approveTyped,
   assertFullyApprovedNotCompleted,
   assertRealCookie,
+  closeAll,
   cookieHeader,
   launchLocked,
   openPage,
   openSession,
   proveCookieSent,
   recordEvidence,
+  whilePagesOpen,
 } from './browser.mjs';
 import { changedTables, PATHS, startWorld } from './harness.mjs';
 
@@ -41,17 +46,14 @@ before(async () => {
   ({ browser, locked } = await launchLocked());
 });
 
-after(async () => {
-  await browser?.close();
-  await world?.close();
-});
+after(() => closeAll([() => browser?.close(), () => world?.close()]));
 
 test('[US1-02] one recipient: approval makes the envelope fully approved at once, shown distinct from completed', async () => {
   const recipient = world.address('only');
   const sent = await world.sentEnvelope({ recipients: [recipient] });
   const { page, context, requests, close } = await openPage(browser);
   let cookie;
-  try {
+  await whilePagesOpen({ caseId: 'US1-02', section: 'recipient approves', browser, pages: { page }, closers: [close] }, async () => {
     const state = await openSession(page, world, sent.invitation, recipient);
     cookie = await assertRealCookie(context, world);
     await proveCookieSent(page, world);
@@ -65,9 +67,7 @@ test('[US1-02] one recipient: approval makes the envelope fully approved at once
     );
     assert.equal(receipt.envelope_state, 'finalizing');
     await assertFullyApprovedNotCompleted(page);
-  } finally {
-    await close();
-  }
+  });
   const final = await world.readEnvelope(sent.envelope.id);
   assert.equal(final.state, 'finalizing', 'readEnvelope: fully approved is the finalizing state, never completed');
   assert.equal(final.approvals_complete, true);
@@ -79,7 +79,7 @@ test('[US1-02] neither the sender nor the service principal can approve as the r
   const sent = await world.sentEnvelope({ recipients: [recipient] });
   const id = sent.envelope.id;
   const { page, context, requests, close } = await openPage(browser);
-  try {
+  await whilePagesOpen({ caseId: 'US1-02', section: 'operator refusals', browser, pages: { page }, closers: [close] }, async () => {
     const state = await openSession(page, world, sent.invitation, recipient);
     await assertRealCookie(context, world);
     const baseline = { envelope: await world.readEnvelope(id), snapshot: world.snapshot() };
@@ -113,8 +113,6 @@ test('[US1-02] neither the sender nor the service principal can approve as the r
     const { receipt } = await approveTyped(page, world, requests, 'sig_1', 'Ada Example');
     assert.equal(receipt.envelope_state, 'finalizing');
     assert.equal(world.rows('approvals', id).length, 1);
-  } finally {
-    await close();
-  }
+  });
   recordEvidence({ browser, locked, caseId: 'US1-02' });
 });

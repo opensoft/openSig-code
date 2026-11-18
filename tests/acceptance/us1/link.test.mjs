@@ -23,11 +23,15 @@
 // request log, which holds no mutating request in the window and none after any browser action.
 // A POSITIVE CONTROL then shows that the same comparison sees a change: an explicit request
 // for a code (requestChallenge, found in the log) changes the challenges table.
+// Row US1-MASK (request #48): the positive control starts its response wait and its click
+// together (browser.mjs respondedTo), so the first rejection surfaces and no wait is left
+// unhandled. Each part with a context or page open runs under whilePagesOpen (first error
+// recorded before any close, each close guarded), and after() uses closeAll.
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 
-import { launchLocked, openPage, recordEvidence, responseTo, step } from './browser.mjs';
+import { closeAll, launchLocked, openPage, recordEvidence, respondedTo, step, whilePagesOpen } from './browser.mjs';
 import { changedTables, CORRELATION_HEADER, PATHS, startWorld } from './harness.mjs';
 
 let world;
@@ -39,10 +43,7 @@ before(async () => {
   ({ browser, locked } = await launchLocked());
 });
 
-after(async () => {
-  await browser?.close();
-  await world?.close();
-});
+after(() => closeAll([() => browser?.close(), () => world?.close()]));
 
 const READ_ONLY = new Set(['GET', 'HEAD']);
 const PREFETCH_HEADERS = Object.freeze({ 'Sec-Purpose': 'prefetch', Purpose: 'prefetch' });
@@ -84,7 +85,7 @@ test('[SC004-04] opening, reloading and prefetching the link, each seen in the s
 
   // 1. A mail scanner, outside any page.
   const scanner = await browser.newContext();
-  try {
+  await whilePagesOpen({ caseId: 'SC004-04', section: 'mail scanner (a context, no page)', browser, closers: [() => scanner.close()] }, async () => {
     for (const method of ['GET', 'HEAD']) {
       const response = await scanner.request.fetch(sent.invitation.url, { method, headers: PREFETCH_HEADERS, maxRedirects: 0 });
       assert.equal(response.status(), 200, `scanner ${method} with prefetch headers: 200`);
@@ -93,14 +94,12 @@ test('[SC004-04] opening, reloading and prefetching the link, each seen in the s
     const copied = await scanner.request.get(`${world.origin}${PATHS.shell}?i=${sent.invitation.token}`, { headers: PREFETCH_HEADERS, maxRedirects: 0 });
     assert.equal(copied.status(), 200, 'scanner GET with the token in a query string: 200');
     await count('scanner GET with the token in a query string', copied.headers()[CORRELATION_HEADER], 'GET');
-  } finally {
-    await scanner.close();
-  }
+  });
 
   // 2. Chromium's own prefetch, from a blank page: observed at the server, or not.
   let prefetch = 'not observed';
   const prefetching = await openPage(browser);
-  try {
+  await whilePagesOpen({ caseId: 'SC004-04', section: 'browser prefetch', browser, pages: { prefetching: prefetching.page }, closers: [prefetching.close] }, async () => {
     const mark = world.lines.length;
     await prefetching.page.setContent(`<!doctype html><link rel="prefetch" href="${sent.invitation.url}">`);
     const line = await world.nextRequest(mark, (entry) => entry.path === PATHS.shell, PREFETCH_WAIT_MS);
@@ -109,15 +108,13 @@ test('[SC004-04] opening, reloading and prefetching the link, each seen in the s
       await count('browser <link rel=prefetch>', line.correlation, 'GET');
     }
     noMutation('browser prefetch', mark);
-  } finally {
-    await prefetching.close();
-  }
+  });
 
   // 3. Chromium opens the link, reloads it, and opens it again in a fresh context. Each waits
   // for the network to settle, so anything the shell would send on load has reached the server
   // before the log is read.
   const opener = await openPage(browser);
-  try {
+  await whilePagesOpen({ caseId: 'SC004-04', section: 'browser open and reload', browser, pages: { opener: opener.page }, closers: [opener.close] }, async () => {
     let mark = world.lines.length;
     const opened = await opener.page.goto(sent.invitation.url, { waitUntil: 'networkidle' });
     assert.ok(opened !== null, 'the open is a navigation with a response');
@@ -130,20 +127,16 @@ test('[SC004-04] opening, reloading and prefetching the link, each seen in the s
     await count('browser reload', reloaded.headers()[CORRELATION_HEADER], 'GET');
     noMutation('browser reload', mark);
     await step(opener.page, 'no-invitation');
-  } finally {
-    await opener.close();
-  }
+  });
   const again = await openPage(browser);
-  try {
+  await whilePagesOpen({ caseId: 'SC004-04', section: 'browser open in a fresh context', browser, pages: { again: again.page }, closers: [again.close] }, async () => {
     const mark = world.lines.length;
     const opened = await again.page.goto(sent.invitation.url, { waitUntil: 'networkidle' });
     assert.ok(opened !== null, 'the open in a fresh context is a navigation with a response');
     await count('browser open in a fresh context', opened.headers()[CORRELATION_HEADER], 'GET');
     noMutation('browser open in a fresh context', mark);
     await step(again.page, 'invitation');
-  } finally {
-    await again.close();
-  }
+  });
 
   // 4. Before the comparison: every counted request is in the server's request log, and the
   // window holds read operations only.
@@ -170,17 +163,13 @@ test('[SC004-04] opening, reloading and prefetching the link, each seen in the s
   // 6. Positive control: an explicit request for a code, seen at the server, is a change the same comparison sees.
   const actor = await openPage(browser);
   let control;
-  try {
+  await whilePagesOpen({ caseId: 'SC004-04', section: 'positive control', browser, pages: { actor: actor.page }, closers: [actor.close] }, async () => {
     await actor.page.goto(sent.invitation.url);
     await step(actor.page, 'invitation');
-    const challenge = responseTo(actor.page, world.origin, PATHS.challenge, 'POST');
-    await actor.page.getByRole('button', { name: 'Email me a code' }).click();
-    const answered = await challenge;
+    const answered = await respondedTo(actor.page, world.origin, PATHS.challenge, 'POST', () => actor.page.getByRole('button', { name: 'Email me a code' }).click());
     assert.equal(answered.status(), 202, 'the positive control: requestChallenge answers 202');
     control = answered.headers()[CORRELATION_HEADER];
-  } finally {
-    await actor.close();
-  }
+  });
   const logged = await world.loggedRequest(control);
   assert.deepEqual(
     logged && { method: logged.method, path: logged.path, operation: logged.operation, status: logged.status },

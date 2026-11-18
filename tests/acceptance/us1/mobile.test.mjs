@@ -15,13 +15,17 @@
 // three of: the document and the body are no wider than the viewport's client width; no
 // rendered element (the off-screen skip link aside, src/autograph/review.css:61-73) ends past
 // the right edge; and a sideways scroll leaves window.scrollX at 0.
+// Row US1-MASK (request #48): the approval, the challenge and the session each start their
+// response wait and their tap together (browser.mjs respondedTo), so the first rejection surfaces
+// and no wait is left unhandled. Each device's part with the page open runs under whilePagesOpen
+// (first error recorded before any close, each close guarded), and after() uses closeAll.
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 
 import { devices } from 'playwright';
 
-import { assertFullyApprovedNotCompleted, assertNoHorizontalOverflow, inputCounts, launchLocked, openPage, recordEvidence, responseTo, step, touchInput, verified } from './browser.mjs';
+import { assertFullyApprovedNotCompleted, assertNoHorizontalOverflow, closeAll, inputCounts, launchLocked, openPage, recordEvidence, respondedTo, step, touchInput, verified, whilePagesOpen } from './browser.mjs';
 import { PATHS, startWorld } from './harness.mjs';
 
 let world;
@@ -33,10 +37,7 @@ before(async () => {
   ({ browser, locked } = await launchLocked());
 });
 
-after(async () => {
-  await browser?.close();
-  await world?.close();
-});
+after(() => closeAll([() => browser?.close(), () => world?.close()]));
 
 test('[SC004-02] on Galaxy S9+ (320 px) and Pixel 7 (412 px) emulation, every step fits the viewport with no horizontal overflow, and touch alone, through one touch path, completes the approval', async () => {
   for (const name of ['Galaxy S9+', 'Pixel 7']) {
@@ -46,7 +47,7 @@ test('[SC004-02] on Galaxy S9+ (320 px) and Pixel 7 (412 px) emulation, every st
     const sent = await world.sentEnvelope({ recipients: [recipient] });
     const { page, close } = await openPage(browser, { ...device });
     let touch = null;
-    try {
+    await whilePagesOpen({ caseId: 'SC004-02', section: name, browser, pages: { page }, closers: [() => touch?.detach(), close] }, async () => {
       touch = await touchInput(page);
       const overflow = (where) => assertNoHorizontalOverflow(page, `${name} ${where}`);
       await page.goto(sent.invitation.url);
@@ -67,18 +68,14 @@ test('[SC004-02] on Galaxy S9+ (320 px) and Pixel 7 (412 px) emulation, every st
       await overflow('review after drawing');
       await touch.tap(page.locator('label[for="consent"]'));
       await page.locator('#consent:checked').waitFor();
-      const answer = responseTo(page, world.origin, PATHS.approval, 'POST');
-      await touch.tap(page.getByRole('button', { name: 'Approve the document' }));
+      const answer = await respondedTo(page, world.origin, PATHS.approval, 'POST', () => touch.tap(page.getByRole('button', { name: 'Approve the document' })));
       assert.equal((await answer).status(), 200, `${name}: the approval is recorded`);
       await assertFullyApprovedNotCompleted(page);
       await overflow('receipt');
       const counts = await inputCounts(page);
       assert.deepEqual(counts.pointerTypes, ['touch'], `${name}: every pointer the page saw was a touch`);
       assert.ok(counts.touchstart >= 6, `${name}: the flow was driven by touch (${counts.touchstart} touches)`);
-    } finally {
-      await touch?.detach();
-      await close();
-    }
+    });
     assert.equal((await world.readEnvelope(sent.envelope.id)).state, 'finalizing', `${name}: the server recorded the approval`);
   }
   recordEvidence({ browser, locked, caseId: 'SC004-02' });
@@ -90,14 +87,12 @@ test('[SC004-02] on Galaxy S9+ (320 px) and Pixel 7 (412 px) emulation, every st
  * session, plus an overflow check on the code step.
  */
 async function openSessionFromInvitation(page, recipient, touch, overflow) {
-  const challenge = responseTo(page, world.origin, PATHS.challenge, 'POST');
-  await touch.tap(page.getByRole('button', { name: 'Email me a code' }));
+  const challenge = await respondedTo(page, world.origin, PATHS.challenge, 'POST', () => touch.tap(page.getByRole('button', { name: 'Email me a code' })));
   assert.equal((await challenge).status(), 202, 'requestChallenge answers 202');
   await step(page, 'code');
   await overflow('code');
   await page.getByRole('textbox', { name: 'One-time code' }).fill(await world.code(recipient));
-  const created = responseTo(page, world.origin, PATHS.session, 'POST');
-  await touch.tap(page.getByRole('button', { name: 'Continue' }));
+  const created = await respondedTo(page, world.origin, PATHS.session, 'POST', () => touch.tap(page.getByRole('button', { name: 'Continue' })));
   assert.equal((await created).status(), 201, 'createRecipientSession answers 201');
   await step(page, 'review');
   await verified(page);

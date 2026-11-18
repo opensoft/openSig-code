@@ -10,11 +10,13 @@
 // this session (#end-session, flow.ts:122), Tab leaves it and Shift+Tab walks back, so focus is
 // never trapped. Each step change focuses its heading (#step-title, flow.ts:116). The counters
 // of trusted pointerdown, mousedown and touchstart stay at zero.
+// Row US1-MASK (request #48): the part with the page open runs under browser.mjs whilePagesOpen
+// (first error recorded before any close, each close guarded), and after() uses closeAll.
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 
-import { approveTyped, assertFullyApprovedNotCompleted, focused, inputCounts, launchLocked, openPage, openSession, recordEvidence, tabTo } from './browser.mjs';
+import { approveTyped, assertFullyApprovedNotCompleted, closeAll, focused, inputCounts, launchLocked, openPage, openSession, recordEvidence, tabTo, whilePagesOpen } from './browser.mjs';
 import { startWorld } from './harness.mjs';
 
 let world;
@@ -26,16 +28,13 @@ before(async () => {
   ({ browser, locked } = await launchLocked());
 });
 
-after(async () => {
-  await browser?.close();
-  await world?.close();
-});
+after(() => closeAll([() => browser?.close(), () => world?.close()]));
 
 test('[SC004-01] keyboard only, invitation to receipt, zero pointer events: Tab reaches the document links, then signature and consent, never the viewer iframe, never trapped', async () => {
   const recipient = world.address('keys');
   const sent = await world.sentEnvelope({ recipients: [recipient] });
   const { page, requests, close } = await openPage(browser);
-  try {
+  await whilePagesOpen({ caseId: 'SC004-01', section: 'recipient (keyboard)', browser, pages: { page }, closers: [close] }, async () => {
     await openSession(page, world, sent.invitation, recipient, { keyboard: true });
     assert.equal(await focused(page), 'h2#step-title', 'the review heading takes focus');
     assert.equal(await page.locator('#document-frame').getAttribute('tabindex'), '-1', 'the viewer iframe is not a tab stop');
@@ -70,9 +69,7 @@ test('[SC004-01] keyboard only, invitation to receipt, zero pointer events: Tab 
     assert.equal(await focused(page), 'h2#step-title', 'the receipt heading takes focus');
     const counts = await inputCounts(page);
     assert.deepEqual({ pointerdown: counts.pointerdown, mousedown: counts.mousedown, touchstart: counts.touchstart }, { pointerdown: 0, mousedown: 0, touchstart: 0 }, 'zero pointer events');
-  } finally {
-    await close();
-  }
+  });
   assert.equal((await world.readEnvelope(sent.envelope.id)).state, 'finalizing', 'the server recorded the keyboard approval');
   recordEvidence({ browser, locked, caseId: 'SC004-01' });
 });

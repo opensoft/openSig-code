@@ -28,11 +28,27 @@
 //
 // Every page gets a request log and counters of trusted pointer, mouse and touch input,
 // installed before any page script.
+//
+// Response waits and first errors (row US1-MASK, A-010 requests #47 and #48).
+// - Where a step waits for the server's answer to a request its own action causes,
+//   respondedTo() starts the wait and the action together and awaits them as one, at all ten
+//   places in these files. A wait started and then awaited only after its action can be
+//   rejected later, when cleanup closes the page, and that later "Target page, context or
+//   browser has been closed" then hides the action's own error.
+// - whilePagesOpen() runs the part of a test where pages are open. It records the first error,
+//   with browser.isConnected() and the state of the pages, before any close runs. It then runs
+//   each close in its own guard: a failing close joins the record and never replaces the first
+//   error, which is rethrown.
+// - closeAll() closes what the before() hook opened, each close in its own guard, so a failing
+//   close cannot leave a browser or server behind (row T011-NOTES (3)).
+// The record is a diagnostic in the runner's per-mode output, never committed and never evidence
+// of a PASS (request #48 C1). masking.test.mjs guards these helpers in every us1 run.
 
 import assert from 'node:assert/strict';
 import { accessSync, constants, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { chromium } from 'playwright';
 
@@ -147,6 +163,26 @@ export function responseTo(page, origin, path, method) {
   return page.waitForResponse((response) => response.url() === `${origin}${path}` && response.request().method() === method);
 }
 
+/**
+ * The response to `method` `path` that `action` causes, with the wait and the action started
+ * together (row US1-MASK). The wait is created first, so it is listening before the action can
+ * send the request, exactly as before; `action` is then called at once, and the two are awaited
+ * as one. The first of them to fail is the error thrown, so a failing action is never hidden
+ * behind the wait's later rejection, and the wait always has a handler, so it never becomes an
+ * unhandled rejection. An action that throws synchronously is turned into a rejection first, so
+ * that case leaves no wait unhandled either. No timeout changes: the wait keeps the page's
+ * default timeout from its creation, and each step of the action keeps its own. Callers keep
+ * their original assert lines byte-identical: where a line reads `(await challenge).status()`,
+ * `challenge` now holds the settled Response, and awaiting a value that is not a promise
+ * returns that value itself.
+ */
+export async function respondedTo(page, origin, path, method, action) {
+  const waiting = responseTo(page, origin, path, method);
+  const acting = (async () => action())();
+  const [response] = await Promise.all([waiting, acting]);
+  return response;
+}
+
 export function focused(page) {
   return page.evaluate(() => {
     const element = document.activeElement;
@@ -171,25 +207,26 @@ export async function tabTo(page, selector, { key = 'Tab', max = 80 } = {}) {
 export async function openSession(page, world, invitation, to, { keyboard = false } = {}) {
   await page.goto(invitation.url);
   await step(page, 'invitation');
-  const challenge = responseTo(page, world.origin, PATHS.challenge, 'POST');
   const requestCode = page.getByRole('button', { name: 'Email me a code' });
-  if (keyboard) {
-    await tabTo(page, '#request-code');
-    await page.keyboard.press('Enter');
-  } else await requestCode.click();
+  const challenge = await respondedTo(page, world.origin, PATHS.challenge, 'POST', async () => {
+    if (keyboard) {
+      await tabTo(page, '#request-code');
+      await page.keyboard.press('Enter');
+    } else await requestCode.click();
+  });
   assert.equal((await challenge).status(), 202, 'requestChallenge answers 202');
   await step(page, 'code');
   const code = await world.code(to);
-  const created = responseTo(page, world.origin, PATHS.session, 'POST');
-  if (keyboard) {
-    await tabTo(page, '#code');
-    await page.keyboard.type(code);
-    await page.keyboard.press('Enter');
-  } else {
-    await page.getByRole('textbox', { name: 'One-time code' }).fill(code);
-    await page.getByRole('button', { name: 'Continue' }).click();
-  }
-  const response = await created;
+  const response = await respondedTo(page, world.origin, PATHS.session, 'POST', async () => {
+    if (keyboard) {
+      await tabTo(page, '#code');
+      await page.keyboard.type(code);
+      await page.keyboard.press('Enter');
+    } else {
+      await page.getByRole('textbox', { name: 'One-time code' }).fill(code);
+      await page.getByRole('button', { name: 'Continue' }).click();
+    }
+  });
   assert.equal(response.status(), 201, 'createRecipientSession answers 201');
   const state = await response.json();
   await step(page, 'review');
@@ -301,20 +338,20 @@ export function approvalFromState(state, signatureKey, name) {
 
 /** Approve from the review step with a typed name (pointer or keyboard); returns { body, receipt }. */
 export async function approveTyped(page, world, requests, key, name, { keyboard = false } = {}) {
-  const answer = responseTo(page, world.origin, PATHS.approval, 'POST');
-  if (keyboard) {
-    await tabTo(page, `#typed-${key}`);
-    await page.keyboard.type(name);
-    await tabTo(page, '#consent');
-    await page.keyboard.press('Space');
-    await tabTo(page, '#approve');
-    await page.keyboard.press('Enter');
-  } else {
-    await page.locator(`#typed-${key}`).fill(name);
-    await page.getByRole('checkbox', { name: 'I have read the consent text above and I agree to it.' }).check();
-    await page.getByRole('button', { name: 'Approve the document' }).click();
-  }
-  const response = await answer;
+  const response = await respondedTo(page, world.origin, PATHS.approval, 'POST', async () => {
+    if (keyboard) {
+      await tabTo(page, `#typed-${key}`);
+      await page.keyboard.type(name);
+      await tabTo(page, '#consent');
+      await page.keyboard.press('Space');
+      await tabTo(page, '#approve');
+      await page.keyboard.press('Enter');
+    } else {
+      await page.locator(`#typed-${key}`).fill(name);
+      await page.getByRole('checkbox', { name: 'I have read the consent text above and I agree to it.' }).check();
+      await page.getByRole('button', { name: 'Approve the document' }).click();
+    }
+  });
   assert.equal(response.status(), 200, 'approveAsHuman answers 200');
   const sent = requests.filter((entry) => entry.url === `${world.origin}${PATHS.approval}`);
   return { body: JSON.parse(sent[sent.length - 1].body), receipt: await response.json() };
@@ -533,4 +570,240 @@ export function recordEvidence({ browser, locked, caseId, cookie = null, prefetc
   };
   mkdirSync(out, { recursive: true });
   writeFileSync(path, `${JSON.stringify(evidence, null, 2)}\n`);
+}
+
+/**
+ * Host-absolute prefixes a record never holds, longest first, each with the word that replaces
+ * it: the repository, the browsers directory, the temporary directory and the home directory,
+ * each also as a file: URL.
+ */
+const HOST_PREFIXES = (() => {
+  const named = [
+    [REPO, '<repo>'],
+    [tmpdir(), '<tmp>'],
+    [homedir(), '<home>'],
+  ];
+  const browsers = process.env.PLAYWRIGHT_BROWSERS_PATH;
+  if (browsers && browsers !== '0') named.push([resolve(browsers), '<browsers>']);
+  const pairs = [];
+  for (const [path, word] of named) {
+    if (typeof path === 'string' && path.length > 1) pairs.push([pathToFileURL(path).href, word], [path, word]);
+  }
+  return pairs.sort((a, b) => b[0].length - a[0].length);
+})();
+
+/** URL paths of this application, which a record may name: the review shell and the API. */
+const APP_PATH = /^\/(?:v1(?:\/|$)|sign(?:[/?#]|$))/;
+
+/**
+ * Text as a record may hold it (request #48 B4 and C1): no invitation link, token, cookie value
+ * or host path, and no URL query or fragment. In order:
+ * - the query or fragment of every http(s) URL, and any bare invitation (i=...), is redacted;
+ * - the session cookie's value is redacted;
+ * - the four known host prefixes become <repo>, <browsers>, <tmp> or <home>;
+ * - then a catch-all: any remaining file: URL, and any remaining absolute path that is not one of
+ *   this application's URL paths (APP_PATH), becomes <abs>;
+ * - compact JWTs, and any run of 40 or more base64url characters that is not plain lower-case
+ *   hex (a digest stays readable), are redacted.
+ */
+function scrub(value) {
+  let text = String(value);
+  text = text.replace(/(\bhttps?:\/\/[^\s?#'"`<>()]*)([?#])[^\s'"`<>()]*/g, '$1$2<redacted>');
+  text = text.replace(/([#?&]i=)[A-Za-z0-9_-]+/g, '$1<redacted>');
+  text = text.replace(new RegExp(`(${COOKIE}=)[^;\\s"']+`, 'g'), '$1<redacted>');
+  for (const [prefix, word] of HOST_PREFIXES) text = text.split(prefix).join(word);
+  text = text.replace(/\bfile:\/\/[^\s'"`()<>,;]*/g, '<abs>');
+  text = text.replace(/(?<![\w.~%>/-])\/[\w.~%@+-][^\s'"`()<>,;]*/g, (path) => (APP_PATH.test(path) ? path : '<abs>'));
+  text = text.replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '<redacted>');
+  return text.replace(/(?<![A-Za-z0-9_-])(?![0-9a-f]+(?![A-Za-z0-9_-]))[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])/g, '<redacted>');
+}
+
+/** The stack frames of T011's own files, repository-relative (everything before tests/acceptance/us1/ removed). */
+function ownFrames(error) {
+  const stack = typeof error?.stack === 'string' ? error.stack : '';
+  return stack
+    .split('\n')
+    .filter((line) => line.includes('tests/acceptance/us1/'))
+    .slice(0, 8)
+    .map((line) => scrub(line.trim().replace(/(?:file:\/\/)?\/\S*?(?=tests\/acceptance\/us1\/)/g, '')));
+}
+
+/** An error as a record holds it: its name, its scrubbed message and its own frames. */
+function describeError(error) {
+  return {
+    name: typeof error?.name === 'string' ? error.name : typeof error,
+    message: scrub(error?.message ?? error).slice(0, 2000),
+    frames: ownFrames(error),
+  };
+}
+
+/**
+ * A page as a record states it: closed or not, and its location as the pathname only, never a
+ * query or a fragment. An http(s) page gives its scrubbed pathname, about:blank stays
+ * about:blank, and any other scheme (file:, data:, ...) gives the scheme alone.
+ */
+function pageState(page) {
+  let path = null;
+  try {
+    const url = new URL(page.url());
+    if (url.protocol === 'http:' || url.protocol === 'https:') path = scrub(url.pathname);
+    else if (url.protocol === 'about:') path = `about:${scrub(url.pathname)}`;
+    else path = `${url.protocol} (location not recorded)`;
+  } catch {
+    path = null;
+  }
+  let closed = null;
+  try {
+    closed = page.isClosed();
+  } catch {
+    closed = null;
+  }
+  return { closed, path };
+}
+
+/** The one line a record adds to its error's message. */
+function recordLine(record) {
+  const pages = Object.entries(record.pages).map(([label, state]) => `page ${label} ${state.closed ? 'closed' : 'open'} at ${state.path}`);
+  const cleanup = record.cleanup_errors.map((entry) => `${entry.name}: ${entry.message.split('\n')[0]}`.slice(0, 160));
+  const where = record.raised_by === 'cleanup' ? `raised by the cleanup of "${record.section}"` : `recorded before cleanup in "${record.section}"`;
+  const parts = [`browser.isConnected()=${record.browser_connected}`, ...pages, `cleanup errors: ${cleanup.length === 0 ? 'none' : `${cleanup.length} (${cleanup.join('; ')})`}`];
+  return `[${record.case} first error, ${where}: ${parts.join('; ')}]`.replace(/[\r\n]+/g, ' ');
+}
+
+/** first-error-<case>.json in `out`: one record per failing test of the case, in order. */
+function saveRecord(out, record) {
+  if (!out || !/^[A-Za-z0-9._-]+$/.test(record.case)) return;
+  const path = join(out, `first-error-${record.case}.json`);
+  let records = [];
+  try {
+    const read = JSON.parse(readFileSync(path, 'utf8'));
+    if (Array.isArray(read)) records = read;
+  } catch {
+    records = [];
+  }
+  const at = records.findIndex((entry) => entry.id === record.id);
+  if (at === -1) records.push(record);
+  else records[at] = record;
+  mkdirSync(out, { recursive: true });
+  writeFileSync(path, `${JSON.stringify(records, null, 2)}\n`);
+}
+
+/** Put the record's line after the error's unchanged original message, and save the record. Never throws. */
+function publish(holder) {
+  if (holder.record === null) return;
+  try {
+    if (holder.original !== null) holder.error.message = `${holder.original}\n${recordLine(holder.record)}`;
+  } catch {
+    // A read-only message keeps the record in the file only.
+  }
+  try {
+    saveRecord(holder.out, holder.record);
+  } catch {
+    // The message still carries the line.
+  }
+}
+
+let recordCount = 0;
+
+/** Record `error` now, synchronously, with the browser's and the pages' state at this moment. Never throws. */
+function captureFirstError({ caseId, section, error, raisedBy, browser, pages, out }) {
+  const holder = { error, original: error instanceof Error ? error.message : null, record: null, out };
+  try {
+    let states = {};
+    try {
+      states = Object.fromEntries(Object.entries(pages).map(([label, page]) => [label, pageState(page)]));
+    } catch {
+      states = {};
+    }
+    let connected = null;
+    try {
+      connected = browser.isConnected();
+    } catch {
+      connected = null;
+    }
+    recordCount += 1;
+    holder.record = {
+      id: `${process.pid}.${recordCount}`,
+      case: caseId,
+      section: scrub(section),
+      raised_by: raisedBy,
+      recorded_at: new Date().toISOString(),
+      error: describeError(error),
+      browser_connected: connected,
+      pages: states,
+      cleanup_errors: [],
+    };
+    publish(holder);
+  } catch {
+    // Recording never replaces the error it records.
+  }
+  return holder;
+}
+
+/** Add failed closes to a record: to its line and to its file. Never throws. */
+function joinCleanupErrors(holder, failed) {
+  if (holder.record === null || failed.length === 0) return;
+  try {
+    for (const error of failed) holder.record.cleanup_errors.push(describeError(error));
+  } catch {
+    // Keep what was added.
+  }
+  publish(holder);
+}
+
+/** Run each closer in order, each in its own guard; returns the errors, never throws. */
+async function closeEach(closers) {
+  const failed = [];
+  for (const close of closers) {
+    try {
+      await close();
+    } catch (error) {
+      failed.push(error);
+    }
+  }
+  return failed;
+}
+
+/**
+ * The part of a test where pages are open (row US1-MASK; request #48 B3 and B6). `section` runs,
+ * then every function in `closers`, in order, each in its own guard.
+ * - If the section throws, that error is the first error. It is recorded at once, before any
+ *   closer runs, and the same error is rethrown after every closer has run. A closer that fails
+ *   joins the record and never replaces the first error.
+ * - If the section succeeds but a closer fails, that failure is the first error: it is recorded
+ *   (raised by the cleanup), any further failures join it, and it is thrown after every closer.
+ * The record holds the error's name, its scrubbed message and own frames, browser.isConnected(),
+ * each page in `pages` ({ label: page }) as closed or open with its path, and the cleanup errors.
+ * It goes to two places: one line appended to the error's message, after the original message,
+ * which stays first and unchanged; and first-error-<case>.json in `out`, the runner's per-mode
+ * output directory (OPENSIG_VERIFY_OUT) unless a caller names another. The frozen evidence
+ * labels and evidence.json are untouched.
+ */
+export async function whilePagesOpen({ caseId, section, browser, pages = {}, closers = [], out = process.env.OPENSIG_VERIFY_OUT }, body) {
+  let result;
+  try {
+    result = await body();
+  } catch (error) {
+    const first = captureFirstError({ caseId, section, error, raisedBy: 'section', browser, pages, out });
+    joinCleanupErrors(first, await closeEach(closers));
+    throw error;
+  }
+  const failed = await closeEach(closers);
+  if (failed.length > 0) {
+    const [error, ...rest] = failed;
+    joinCleanupErrors(captureFirstError({ caseId, section, error, raisedBy: 'cleanup', browser, pages, out }), rest);
+    throw error;
+  }
+  return result;
+}
+
+/**
+ * Close what a before() hook opened (row T011-NOTES (3); request #48 B6). Every closer runs, in
+ * order, each in its own guard, so a failing close cannot leave a browser or server behind. Then
+ * the failure, if one closer failed, or an AggregateError of all of them, is thrown.
+ */
+export async function closeAll(closers) {
+  const failed = await closeEach(closers);
+  if (failed.length === 1) throw failed[0];
+  if (failed.length > 1) throw new AggregateError(failed, `${failed.length} closes failed; the first: ${failed[0]?.message ?? failed[0]}`);
 }
