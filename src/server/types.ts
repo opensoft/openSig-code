@@ -70,6 +70,13 @@ export interface HandlerResult {
   contentType?: string;
   /** Extra headers; security headers always override these. */
   headers?: Record<string, string>;
+  /**
+   * Caching (A-010 row STATIC-CACHE, request #33). 'immutable' is honoured only on a 200
+   * from the static handler (src/server/static.ts, T035) for a path that matches no route:
+   * a content-addressed asset whose URL changes with its bytes. Every other response, every
+   * route response (the review shell included) and every non-200, is no-store.
+   */
+  cache?: 'no-store' | 'immutable';
 }
 
 export interface RequestContext {

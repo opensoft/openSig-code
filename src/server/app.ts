@@ -13,7 +13,11 @@
 //    the recipient scheme;
 // 5. a declared body length over the route limit is a 413 before any byte is read;
 // 6. the handler, or 501 while the owning task has not landed;
-// 7. security headers on every response, including errors (src/server/headers.ts).
+// 7. security headers on every response, including errors (src/server/headers.ts). Cache-Control
+//    is no-store on every response but one: a 200 from the static handler for a path that matches
+//    no route, flagged cache: 'immutable', is cacheable as a content-addressed asset (A-010 row
+//    STATIC-CACHE, request #33). Every route response, the review shell through openReviewShell
+//    included, and every non-200 keeps no-store.
 // Errors are uniform contract Error bodies. An unexpected exception is a 500; the log
 // records only its class name and first stack-frame location, never its message. Every
 // request is logged once, without query string, headers or body.
@@ -78,7 +82,7 @@ import type { RouteDefinition } from '../api/routes.ts';
 import { abortBody, checkDeclaredLength, createBodyState, pdfBody, readJsonBody, type BodyState } from './body.ts';
 import type { ServerConfig } from './config.ts';
 import { errorBody, newCorrelationId } from './errors.ts';
-import { RESERVED_HEADERS, securityHeaders, type Framing } from './headers.ts';
+import { RESERVED_HEADERS, securityHeaders, type Caching, type Framing } from './headers.ts';
 import type { Logger } from './redact.ts';
 import { HttpError, type HandlerResult, type RequestContext, type StaticHandler } from './types.ts';
 
@@ -108,7 +112,12 @@ export interface App {
   /** The server's 'clientError' listener (SEC-11); createAppServer installs it. */
   clientError(error: Error & { code?: string }, socket: Duplex): void;
   readonly locals: Map<string, unknown>;
-  /** The registry this app was given, read-only (the relay surface serves its operator routes only). */
+  /**
+   * The registry this app was given (the relay surface serves its operator routes only). A
+   * read-only property: it can be neither reassigned nor redefined, so what it shows is always
+   * what the app was built from (request #30 (15), request #34 note 2). Dispatch uses a compiled
+   * copy made at creation.
+   */
   readonly routes: readonly RouteDefinition[];
   /**
    * Shutdown (A-010 row SHUTDOWN-INFLIGHT): from now on no queued request is dispatched, and the
@@ -294,11 +303,12 @@ export function createApp(options: AppOptions): App {
     extra: Record<string, string>,
     body: Uint8Array | null,
     contentType: string | null,
+    caching: Caching,
   ): void => {
     for (const [name, value] of Object.entries(extra)) if (!RESERVED_HEADERS.has(name.toLowerCase())) res.setHeader(name, value);
     // A connection that will close says so in its last response (SEC-11).
     if (connection.closing) res.setHeader('connection', 'close');
-    for (const [name, value] of Object.entries(securityHeaders(framing))) res.setHeader(name, value);
+    for (const [name, value] of Object.entries(securityHeaders(framing, caching))) res.setHeader(name, value);
     if (contentType !== null) res.setHeader('content-type', contentType);
     res.setHeader('content-length', String(body?.length ?? 0));
     res.writeHead(status);
@@ -341,7 +351,7 @@ export function createApp(options: AppOptions): App {
         else prepareLinger(req.socket);
       }
       const body = Buffer.from(JSON.stringify(errorBody(httpError.code, correlationId, httpError.details)));
-      send(res, connection, httpError.status, 'none', headers, body, 'application/json; charset=utf-8');
+      send(res, connection, httpError.status, 'none', headers, body, 'application/json; charset=utf-8', 'no-store');
     };
     bodyState.onTimeout = fail;
 
@@ -371,7 +381,7 @@ export function createApp(options: AppOptions): App {
           if (served !== null && !settled) {
             settled = true;
             status = served.status;
-            return respond(res, connection, served, null);
+            return respond(res, connection, served, null, 'static');
           }
         }
         throw new HttpError(404, 'not_found');
@@ -413,7 +423,7 @@ export function createApp(options: AppOptions): App {
       if (result === null) throw new HttpError(501, 'internal');
       settled = true;
       status = result.status;
-      respond(res, connection, result, operation);
+      respond(res, connection, result, operation, 'route');
     } catch (error) {
       fail(error);
     } finally {
@@ -431,7 +441,12 @@ export function createApp(options: AppOptions): App {
     }
   };
 
-  const respond = (res: ServerResponse, connection: Connection, result: HandlerResult, operation: OperationId | null): void => {
+  /**
+   * `source` is 'static' only for the static handler's answer to a path that matched no route;
+   * every routed answer is 'route', the review shell served by the static handler through
+   * openReviewShell included.
+   */
+  const respond = (res: ServerResponse, connection: Connection, result: HandlerResult, operation: OperationId | null, source: 'route' | 'static'): void => {
     let body: Uint8Array | null = null;
     let contentType = result.contentType ?? null;
     if (result.json !== undefined) {
@@ -443,7 +458,9 @@ export function createApp(options: AppOptions): App {
     }
     const framing: Framing =
       operation === 'readRecipientDocument' && result.status === 200 && contentType?.split(';')[0]?.trim() === 'application/pdf' ? 'self' : 'none';
-    send(res, connection, result.status, framing, result.headers ?? {}, body, contentType);
+    // STATIC-CACHE (request #33): the one caching exception, a content-addressed asset.
+    const caching: Caching = source === 'static' && result.status === 200 && result.cache === 'immutable' ? 'immutable' : 'no-store';
+    send(res, connection, result.status, framing, result.headers ?? {}, body, contentType, caching);
   };
 
   /**
@@ -492,7 +509,7 @@ export function createApp(options: AppOptions): App {
     socket.destroy(error);
   };
 
-  return {
+  const app: App = {
     locals,
     routes: options.routes,
     clientError,
@@ -563,6 +580,9 @@ export function createApp(options: AppOptions): App {
       });
     },
   };
+  // Read-only in fact, not only in type: neither writable nor configurable (request #34 note 2).
+  Object.defineProperty(app, 'routes', { value: options.routes, enumerable: true, writable: false, configurable: false });
+  return app;
 }
 
 /**

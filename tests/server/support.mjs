@@ -186,13 +186,14 @@ export function bearer(who = 'sender', overrides = {}) {
  * operations in a copy of the production registry (the policy under test is the server's;
  * the handlers only produce a response to apply it to).
  */
-export async function serveApp({ handlers = {}, origins = ['http://127.0.0.1:1'], auth = true, serverOptions = {} } = {}) {
+export async function serveApp({ handlers = {}, origins = ['http://127.0.0.1:1'], auth = true, serverOptions = {}, staticHandler = null } = {}) {
   const lines = [];
   const logger = createLogger((line) => lines.push(line));
   const routes = ROUTES.map((route) => (handlers[route.operationId] ? { ...route, handler: handlers[route.operationId] } : route));
   const authenticator = auth ? createOperatorAuthenticator(loadOperatorAuthConfig(authInput())) : null;
   const config = loadServerConfig({ OPENSIG_PORT: '0' });
-  const app = createApp({ routes, config, logger, authenticator, allowedOrigins: new Set(origins) });
+  // SEC-01 (extended, STATIC-CACHE) passes a stub static handler; every other test serves none.
+  const app = createApp({ routes, config, logger, authenticator, allowedOrigins: new Set(origins), staticHandler });
   // Built as the entrypoint builds it (src/server/main.ts), client-error handling included.
   const server = createAppServer(app, serverOptions);
   await new Promise((resolveListen) => server.listen({ host: '127.0.0.1', port: 0 }, resolveListen));

@@ -17,8 +17,10 @@
 //   the `listening` line; SEC-09): enforced or not configured, the policy source and the
 //   tenant ids. Never a key, token, secret or the file contents.
 // - The review shell and static assets come from src/server/static.ts (T035) when that
-//   module exists. It must export createStaticHandler({ config }) returning a
-//   StaticHandler (src/server/types.ts).
+//   module exists. It must export createStaticHandler({ config, distDir? }) returning a
+//   StaticHandler (src/server/types.ts). distDir is the directory of built assets it serves,
+//   by default the repository's dist/; only a test sets it, through StartOptions.distDir (row
+//   DIST-DIR, request #34). The entrypoint never sets it.
 // - Both listeners are built with createAppServer (src/server/app.ts), so a parser error after
 //   a complete request never replaces its pending response with Node's 400 (SEC-11, SEC-13).
 // - Logs are JSON lines through the central redactor; the first is `listening`.
@@ -76,6 +78,7 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, type Stats } from 'node:fs';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadOperatorAuthConfig } from '../api/auth/config.ts';
@@ -140,10 +143,19 @@ export interface StartOptions {
   readonly parseCountIntervalMs?: number;
   /**
    * The parse plan reader (default: T033's parseServicePlan(), the plan every upload's parsePdf()
-   * uses). It decides only what the `listening` line logs; uploads keep T033's own plan. A test
-   * seam, never set by the entrypoint.
+   * uses). Setting it replaces the startup settle as well as the plan the `listening` line logs:
+   * startup awaits this reader instead of parseServicePlan(), so T033's plan is then settled by
+   * the first upload, which waits for the sandbox probe. Uploads keep T033's own plan either way.
+   * A test seam, never set by the entrypoint (request #34, note 1).
    */
   readonly parsePlan?: () => Promise<ServicePlan>;
+  /**
+   * The directory of built assets that T035's static handler serves (an absolute path; default:
+   * the static handler's own, the repository's dist/). A test seam, so a test builds into a
+   * temporary directory and never into the shared dist/; never set by the entrypoint (row
+   * DIST-DIR, request #34).
+   */
+  readonly distDir?: string;
 }
 
 export interface RunningServer {
@@ -241,11 +253,13 @@ function loadAuthenticator(config: ServerConfig, logger: Logger): OperatorAuth {
   return { authenticator, tenants };
 }
 
-async function loadStaticHandler(config: ServerConfig): Promise<StaticHandler | null> {
+/** T035's static handler, when src/server/static.ts exists; `distDir` reaches it only when a test set it (DIST-DIR). */
+async function loadStaticHandler(config: ServerConfig, distDir: string | undefined): Promise<StaticHandler | null> {
   const url = new URL('./static.ts', import.meta.url);
   if (!existsSync(fileURLToPath(url))) return null;
-  const module = (await import(url.href)) as { createStaticHandler?: (options: { config: ServerConfig }) => StaticHandler };
-  return typeof module.createStaticHandler === 'function' ? module.createStaticHandler({ config }) : null;
+  const module = (await import(url.href)) as { createStaticHandler?: (options: { config: ServerConfig; distDir?: string }) => StaticHandler };
+  if (typeof module.createStaticHandler !== 'function') return null;
+  return module.createStaticHandler(distDir === undefined ? { config } : { config, distDir });
 }
 
 function prepareSocketPath(path: string): void {
@@ -264,20 +278,22 @@ function refuseKey(reason: string): never {
 }
 
 /**
- * The recipient challenge-HMAC key (WIRE-US1; the T031 line: "startup refuses unless it is a
- * regular 0600 file holding at least 32 bytes"). Who checks what:
+ * The recipient challenge-HMAC key (WIRE-US1; the T031 line: startup refuses it unless it is a
+ * regular file, not a symbolic link, owned by the server user, with no group or other
+ * permission bit (for example 0600 or 0400), holding 32 to 4096 bytes). Who checks what:
  * - here, before anything opens the file: the setting is present (absolute: config.ts); the
- *   path exists; it is not a symbolic link; it names a regular file. The regular-file check
- *   comes first so the loader's blocking open(2) never meets a FIFO or a device;
+ *   path exists; it is not a symbolic link; it names a regular file, which gives a FIFO or a
+ *   device already at the path its clear refusal;
  * - T008's loadChallengeKey({ path }) on the opened descriptor: opened with O_NOFOLLOW (a link
- *   swapped in afterwards is ELOOP); a regular file; owned by the server's user; no group or
- *   other permission bit (mode & 0o077); 32 to 4096 bytes; unchanged while read.
+ *   swapped in afterwards is ELOOP) and O_NONBLOCK (a FIFO or device swapped in afterwards opens
+ *   at once and is refused; row KEY-FIFO); a regular file; owned by the server's user; no group
+ *   or other permission bit (mode & 0o077); 32 to 4096 bytes; unchanged while read.
  * Refusals name the setting and the rule, never the path or any byte of the file.
- * The mode rule is "no group or other permission bit" (for example 0600 or 0400; A-010 request
- * #30 (4)): no other user can read or replace the key.
+ * The mode rule is an owner-only file, "no group or other permission bit" (for example 0600 or
+ * 0400; A-010 request #30 (4), request #34 note 3): no other user can read or replace the key.
  */
 function loadKey(path: string | null): ChallengeKey {
-  if (path === null) refuseKey('the setting is required (the 0600 file holding the recipient challenge-HMAC key)');
+  if (path === null) refuseKey('the setting is required (an owner-only file, with no group or other permission bit, holding the recipient challenge-HMAC key)');
   let stat: Stats;
   try {
     stat = lstatSync(path);
@@ -399,6 +415,8 @@ function viewOf(name: 'tcp' | 'relay', app: App, server: Server): ListenerView {
 export async function startServer(env: Readonly<Record<string, string | undefined>> = process.env, options: StartOptions = {}): Promise<RunningServer> {
   const interval = options.parseCountIntervalMs ?? PARSE_COUNT_INTERVAL_MS;
   if (!Number.isSafeInteger(interval) || interval < 1 || interval > PARSE_COUNT_INTERVAL_MS) throw new TypeError(`parseCountIntervalMs must be an integer in 1..${PARSE_COUNT_INTERVAL_MS}`);
+  const distDir = options.distDir;
+  if (distDir !== undefined && (typeof distDir !== 'string' || !isAbsolute(distDir))) throw new TypeError('distDir must be an absolute path');
   const parseCounts = options.parseCounts ?? readParseCounts;
   const readPlan = options.parsePlan ?? parseServicePlan;
   if (typeof readPlan !== 'function') throw new TypeError('parsePlan must be a function');
@@ -413,7 +431,7 @@ export async function startServer(env: Readonly<Record<string, string | undefine
     // upload's parsePdf(), so no upload waits for the probe. The server starts whatever the plan
     // is; uploads keep T033's own answers (a refused plan is their 500 sandbox-unavailable).
     const plan = await readPlan();
-    return await listenAll(config, logger, authenticator, tenants, composition, { read: parseCounts, intervalMs: interval }, plan);
+    return await listenAll(config, logger, authenticator, tenants, composition, { read: parseCounts, intervalMs: interval }, plan, distDir);
   } catch (error) {
     composition?.db.close();
     tenants?.close();
@@ -429,8 +447,9 @@ async function listenAll(
   composition: Composition,
   counts: { readonly read: () => ParseCounts; readonly intervalMs: number },
   plan: ServicePlan,
+  distDir: string | undefined,
 ): Promise<RunningServer> {
-  const staticHandler = await loadStaticHandler(config);
+  const staticHandler = await loadStaticHandler(config, distDir);
   const allowedOrigins = new Set<string>(config.allowedOrigins ?? []);
 
   if (config.relaySocket !== null) prepareSocketPath(config.relaySocket);

@@ -85,7 +85,8 @@ test('[SEC-12] startup refuses the challenge key file unless it is a regular fil
   const fifo = join(tempDir('key-fifo'), 'challenge-hmac.key');
   assert.equal(spawnSync('mkfifo', ['-m', '600', fifo]).status, 0, 'premise: a FIFO was created for the non-regular-file case');
   const cases = {
-    'no setting': [undefined, /OPENSIG_CHALLENGE_KEY_FILE refused: the setting is required/],
+    // The owner-only rule in words, never "0600" (request #34 note 3).
+    'no setting': [undefined, /^OPENSIG_CHALLENGE_KEY_FILE refused: the setting is required \(an owner-only file, with no group or other permission bit, holding the recipient challenge-HMAC key\)$/],
     'a relative path': ['relative/challenge-hmac.key', /OPENSIG_CHALLENGE_KEY_FILE must be an absolute path/],
     'a missing file': [join(tempDir('key-missing'), 'absent.key'), /OPENSIG_CHALLENGE_KEY_FILE refused: the file does not exist/],
     'a symbolic link to a valid key': [link, /OPENSIG_CHALLENGE_KEY_FILE refused: the path must not be a symbolic link/],
