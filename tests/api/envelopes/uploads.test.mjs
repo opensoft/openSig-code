@@ -3,7 +3,7 @@
 // T034 uploadDocument: the per-tenant upload cap and client aborts (A-010 LBR4-1, EA-01), no
 // caller-supplied option reaching parsePdf() (A-009 LBR-3), and the upload's own refusals.
 //
-// EA-01 choreography. Every pass criterion is state the services report themselves:
+// EA-01 choreography (with T034R-Q2). Every pass criterion is state the services report themselves:
 // bodyReadCapacity() and parseAdmissions() of the parse service (T033) and uploadCapacity()
 // of the upload cap, reached through barriers (a bounded poll under one hang guard). No fixed
 // sleep orders the test, no wall-clock bound is a pass criterion, and no load is generated:
@@ -119,9 +119,23 @@ test('[EA-01] one tenant holding its upload cap never stops another tenant\'s up
   const ticket = parseAdmissions().next_ticket;
 
   // A further alpha upload, headers only: 429 upload-capacity before any body byte, and it
-  // never takes a body-read permit.
+  // never takes a body-read permit. Barrier (T034R-Q2): whichever comes first, its answer or
+  // alpha's slot count or the permit count passing the cap. An unenforced cap therefore fails
+  // at once, on its own counts, and never waits for the hang guard or the held uploads' timers.
   const refused = headersOnlyUpload(world, sockets, { tenant: 'alpha', envelope: drafts[UPLOADS_PER_TENANT], pdf });
-  const answer = await settle(issue(refused.response), 'the further alpha upload is answered');
+  let answered = false;
+  issue(refused.response).then(
+    () => {
+      answered = true;
+    },
+    () => {
+      answered = true;
+    },
+  );
+  const pastCap = () => uploadCapacity(alpha).held > UPLOADS_PER_TENANT || bodyReadCapacity().held > UPLOADS_PER_TENANT;
+  await until(() => answered || pastCap(), 'the further alpha upload is answered, or the slot or permit count passes the cap');
+  assert.ok(!pastCap(), `the further alpha upload went past the cap: slots ${uploadCapacity(alpha).held}, permits ${bodyReadCapacity().held}, cap ${UPLOADS_PER_TENANT}`);
+  const answer = await refused.response;
   assert.equal(answer.status, 429, 'alpha at its cap is refused');
   assert.equal(answer.json?.code, 'rate_limited');
   assert.deepEqual(answer.json?.details, [{ field: 'tenant', code: 'upload-capacity' }], 'refused by the tenant cap, not by the parse service');

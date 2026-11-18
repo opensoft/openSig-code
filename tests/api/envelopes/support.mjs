@@ -327,6 +327,66 @@ export function parseRawResponse(raw) {
   return { status, json };
 }
 
+// --- table snapshots (A-010 T034R-DIFF) ---------------------------------------------------------
+
+/**
+ * Columns that hold a hash or a digest: the capability hashes (invitation token, challenge
+ * code, session, CSRF), request and response-body digests, and the audit chain's hashes.
+ */
+const HASH_COLUMN = /(?:^|_)(?:hash|digest)$/i;
+/** A run of 32 or more hex digits inside any other value (a digest in an audit event's details). */
+const HEX_RUN = /[0-9a-f]{32,}/gi;
+/** Each snapshot's full content, kept out of the snapshot object, so no diff or print can show it. */
+const FULL_CONTENT = new WeakMap();
+
+/** A value as a snapshot shows it: hash columns, bytes and hex runs are masked. */
+function maskedValue(column, value) {
+  if (value === null) return null;
+  if (HASH_COLUMN.test(column)) return '<hash>';
+  if (value instanceof Uint8Array) return `<bytes ${value.length}>`;
+  if (typeof value === 'bigint') return String(value);
+  if (typeof value === 'string') return value.replace(HEX_RUN, '<hex>');
+  return value;
+}
+
+/** A value as the full content keeps it, for comparison only. */
+function fullValue(value) {
+  if (value instanceof Uint8Array) return `bytes:${Buffer.from(value).toString('hex')}`;
+  return typeof value === 'bigint' ? String(value) : value;
+}
+
+/** What changed in one table, by row count and column name only: never a value. */
+function describeTableChange(table, before, after) {
+  const parts = [];
+  if (before.length !== after.length) parts.push(`${before.length} -> ${after.length} rows`);
+  const columns = new Set();
+  for (let i = 0; i < Math.min(before.length, after.length); i += 1) {
+    for (const column of new Set([...Object.keys(before[i]), ...Object.keys(after[i])])) {
+      if (JSON.stringify(before[i][column]) !== JSON.stringify(after[i][column])) columns.add(column);
+    }
+  }
+  if (columns.size > 0) parts.push(`changed columns: ${[...columns].sort().join(', ')}`);
+  return `${table} (${parts.join('; ') || 'changed'})`;
+}
+
+/**
+ * Assert that no row changed between two world snapshots. The full content is compared,
+ * hash columns included, so a change in any column fails; the failure names the tables, row
+ * counts and changed columns only, so it never prints a hash, a digest or any other value.
+ */
+export function assertSameRows(after, before, label) {
+  const later = FULL_CONTENT.get(after);
+  const earlier = FULL_CONTENT.get(before);
+  assert.ok(later !== undefined && earlier !== undefined, `${label}: two world snapshots are compared`);
+  const changes = [];
+  for (const table of new Set([...Object.keys(earlier), ...Object.keys(later)])) {
+    if (earlier[table] === later[table]) continue;
+    if (earlier[table] === undefined || later[table] === undefined) changes.push(`${table} (in one snapshot only)`);
+    else changes.push(describeTableChange(table, JSON.parse(earlier[table]), JSON.parse(later[table])));
+  }
+  if (changes.length > 0) assert.fail(`${label}: ${changes.join('; ')}`);
+}
+
 // --- the world --------------------------------------------------------------------------------
 
 /** Tables an operator envelope request could change. */
@@ -455,9 +515,9 @@ export async function createWorld({ bodyTiming } = {}) {
      * Mutations (POST and PUT) get a fresh Idempotency-Key unless `key` is given (null
      * leaves it out). A Buffer body is sent as application/pdf unless headers say otherwise.
      */
-    op({ tenant = 'alpha', who = 'sender', method = 'GET', path: target, body, headers = {}, key, ifMatch, roles, scopes } = {}) {
+    op({ tenant = 'alpha', who = 'sender', method = 'GET', path: target, body, headers = {}, key, ifMatch, roles, scopes, overrides } = {}) {
       const all = {};
-      if (who !== null) all.authorization = `Bearer ${bearer(tenant, who, { roles, scopes })}`;
+      if (who !== null) all.authorization = `Bearer ${bearer(tenant, who, { roles, scopes, overrides })}`;
       if ((method === 'POST' || method === 'PUT') && key !== null) all['idempotency-key'] = key ?? newKey();
       if (ifMatch !== undefined) all['if-match'] = typeof ifMatch === 'number' ? `"${ifMatch}"` : ifMatch;
       if (Buffer.isBuffer(body)) all['content-type'] = 'application/pdf';
@@ -493,25 +553,25 @@ export async function createWorld({ bodyTiming } = {}) {
       }
     },
     /**
-     * The content of `tables` (default: every envelope table), one JSON string per table; with
-     * `tenant` (alpha or beta), only that tenant's rows.
+     * The content of `tables` (default: every envelope table); with `tenant` (alpha or beta),
+     * only that tenant's rows. The snapshot object shows each table's rows masked (hash
+     * columns, bytes and hex runs; T034R-DIFF); its full content is kept apart and compared
+     * only by assertSameRows(), whose failure never prints a value.
      */
     snapshot(tenant = null, tables = ENVELOPE_TABLES) {
       const raw = new DatabaseSync(path, { readOnly: true });
       try {
-        const out = {};
+        const masked = {};
+        const full = {};
         for (const table of tables) {
           const statement = tenant === null ? raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`) : raw.prepare(`SELECT * FROM ${table} WHERE tenant_id = ? ORDER BY rowid`);
-          const rows = (tenant === null ? statement.all() : statement.all(TENANTS[tenant].id)).map((row) => {
-            const copy = {};
-            for (const [column, value] of Object.entries(row)) {
-              copy[column] = value instanceof Uint8Array ? `bytes:${Buffer.from(value).toString('hex')}` : typeof value === 'bigint' ? String(value) : value;
-            }
-            return copy;
-          });
-          out[table] = JSON.stringify(rows);
+          const rows = tenant === null ? statement.all() : statement.all(TENANTS[tenant].id);
+          masked[table] = rows.map((row) => Object.fromEntries(Object.entries(row).map(([column, value]) => [column, maskedValue(column, value)])));
+          full[table] = JSON.stringify(rows.map((row) => Object.fromEntries(Object.entries(row).map(([column, value]) => [column, fullValue(value)]))));
         }
-        return out;
+        const snapshot = Object.freeze(masked);
+        FULL_CONTENT.set(snapshot, Object.freeze(full));
+        return snapshot;
       } finally {
         raw.close();
       }
@@ -601,10 +661,11 @@ export function takeInvitation(world, to = 'signer.one@example.test') {
   return tokenOf(mails[0]);
 }
 
-export function resendRequest(world, { tenant = 'alpha', who = 'sender', envelope, recipient, key, version } = {}) {
+export function resendRequest(world, { tenant = 'alpha', who = 'sender', overrides, envelope, recipient, key, version } = {}) {
   return world.op({
     tenant,
     who,
+    overrides,
     method: 'POST',
     path: `/v1/envelopes/${envelope.id}/recipients/${recipient.id}/resend-invitation`,
     body: { expected_version: version ?? envelope.version },
@@ -704,6 +765,76 @@ export function headersOnlyUpload(world, sockets, { tenant = 'alpha', envelope, 
 }
 
 /** The server's `request` log records of `operation` on `path`. */
+/**
+ * A JSON request on a raw socket (request #25): it declares its whole body and sends only the
+ * first `sendBytes` bytes, then nothing more until the test destroys it, which is a client
+ * abort. `sockets` collects it for the test's cleanup.
+ */
+export function heldJsonRequest(world, sockets, { tenant = 'alpha', who = 'sender', method = 'POST', path, key, body, sendBytes }) {
+  const payload = Buffer.from(JSON.stringify(body), 'utf8');
+  assert.ok(sendBytes < payload.length, 'a held request leaves part of its body unsent');
+  const socket = connect({ host: '127.0.0.1', port: world.port });
+  sockets.add(socket);
+  socket.on('error', () => {});
+  socket.on('close', () => sockets.delete(socket));
+  socket.write(
+    [
+      `${method} ${path} HTTP/1.1`,
+      'Host: 127.0.0.1',
+      `Authorization: Bearer ${bearer(tenant, who)}`,
+      `Idempotency-Key: ${key}`,
+      'Content-Type: application/json',
+      `Content-Length: ${payload.length}`,
+      '',
+      '',
+    ].join('\r\n'),
+  );
+  if (sendBytes > 0) socket.write(payload.subarray(0, sendBytes));
+  return socket;
+}
+
+/**
+ * An upload whose body is streamed with chunked transfer encoding and no Content-Length, so the
+ * router cannot refuse it by its declared length and only reading it can find it too large
+ * (request #25). Resolves with { status, headers, json } once the response has ended; a write
+ * error after the response (the server closing an over-limit request) is ignored.
+ */
+export function streamedUpload(world, { tenant = 'alpha', who = 'sender', envelope, bytes, key = newKey(), ifMatch, chunkBytes = 64 * 1024 }) {
+  return new Promise((resolveResponse, rejectResponse) => {
+    let answered = false;
+    const req = request(
+      {
+        host: '127.0.0.1',
+        port: world.port,
+        method: 'PUT',
+        path: `/v1/envelopes/${envelope.id}/document`,
+        agent: false,
+        headers: { authorization: `Bearer ${bearer(tenant, who)}`, 'idempotency-key': key, 'if-match': `"${ifMatch ?? envelope.version}"`, 'content-type': 'application/pdf' },
+      },
+      (res) => {
+        answered = true;
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('error', () => {});
+        res.on('end', () => {
+          let json = null;
+          try {
+            json = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          } catch {
+            json = null;
+          }
+          resolveResponse({ status: res.statusCode, headers: res.headers, json });
+        });
+      },
+    );
+    req.on('error', (error) => {
+      if (!answered) rejectResponse(error);
+    });
+    for (let at = 0; at < bytes.length; at += chunkBytes) req.write(bytes.subarray(at, at + chunkBytes));
+    req.end();
+  });
+}
+
 export function requestLog(world, operation, path) {
   return world.logged('request').filter((record) => record.operation === operation && record.path === path);
 }

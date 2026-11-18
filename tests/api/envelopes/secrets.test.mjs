@@ -11,12 +11,17 @@
 // compared as booleans: no value is ever put in a test name, an assertion message or a log.
 // The check is not vacuous: it first requires the records of the send and the resend to exist
 // with their bodies, and requires every value to be a non-empty string of its contract shape.
+//
+// Evidence hygiene (row T034R-DIFF): a failing table-snapshot comparison names the tables, row
+// counts and columns that changed, never a value, so it can print no token hash, digest or
+// other secret-derived material. The second test forces such a failure and checks it.
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
+import { inspect } from 'node:util';
 
 import { RESEND_ROUTE } from '../../../src/api/envelopes/index.ts';
-import { confirmRequest, createWorld, openSession, preparedEnvelope, resendRequest, sendRequest, takeInvitation } from './support.mjs';
+import { assertSameRows, confirmRequest, createWorld, openSession, preparedEnvelope, resendRequest, sendRequest, sentEnvelope, takeInvitation } from './support.mjs';
 
 let world;
 before(async () => {
@@ -86,4 +91,43 @@ test('[EA-04] after send and resend, no stored idempotency body carries an invit
   for (const [label, value] of Object.entries(values)) {
     assert.ok(!sent.text.includes(value) && !resent.text.includes(value) && !confirmed.text.includes(value), `${label}: in no operator response`);
   }
+});
+
+test('[EA-04] a failing table-snapshot comparison names what changed and never prints a hash, a digest or a capability value (T034R-DIFF)', async () => {
+  // A resend changes rows with hash columns: a new invitation (its token hash), the old one
+  // revoked, audit events (chain hashes) and an idempotency record (request and body digests).
+  const { envelope } = await sentEnvelope(world);
+  const before = world.snapshot();
+  const resent = await resendRequest(world, { envelope, recipient: envelope.recipients[0] });
+  assert.equal(resent.status, 202);
+  const token = takeInvitation(world);
+  const after = world.snapshot();
+
+  let failure = null;
+  try {
+    assertSameRows(after, before, 'forced mismatch');
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure instanceof assert.AssertionError, 'the comparison of the two snapshots fails');
+  const shown = [String(failure.message), inspect(failure.actual, { depth: null }), inspect(failure.expected, { depth: null })].join('\n');
+
+  // What the failure must never show: any run of 32 or more hex digits, any stored hash or
+  // digest of the changed rows, or the capability itself. Compared as booleans and counts.
+  assert.equal(/[0-9a-f]{32,}/i.test(shown), false, 'the failure shows no run of 32 or more hex digits');
+  const stored = [
+    ...world.rows('invitations', 'WHERE envelope_id = ?', [envelope.id]).map((row) => String(row.token_hash)),
+    ...world.rows('idempotency_records', 'WHERE resource_id = ?', [envelope.recipients[0].id]).flatMap((row) => [String(row.request_digest), String(row.response_body_digest)]),
+  ].filter((value) => value.length >= 32);
+  assert.ok(stored.length >= 3, `the changed rows hold hashes and digests to look for (${stored.length})`);
+  assert.equal(stored.filter((value) => shown.includes(value)).length, 0, `none of the ${stored.length} stored hashes and digests is shown`);
+  assert.equal(shown.includes(token), false, 'the invitation itself is not shown');
+
+  // What it shows instead: the tables that changed, by name.
+  for (const table of ['invitations', 'audit_events', 'idempotency_records']) {
+    assert.ok(failure.message.includes(table), `the failure names the changed table ${table}`);
+  }
+
+  // A snapshot printed on its own is masked too.
+  assert.equal(/[0-9a-f]{32,}/i.test(inspect(after, { depth: null })), false, 'a printed snapshot shows no run of 32 or more hex digits');
 });

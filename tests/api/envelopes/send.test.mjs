@@ -10,7 +10,9 @@
 // - Invitations reach the recipient by mail only: the send response carries no link, token or
 //   code, and neither do the logs.
 // - resendInvitation passes the authenticated operator to the ceremony, so its audit events
-//   name that operator, never the system (EA-05, row T008FU-D8).
+//   name that operator, never the system (EA-05, row T008FU-D8). The resend is made by a
+//   second operator, distinct from the envelope's creator, so the events must name the one
+//   who resent (row T034R-EA05).
 // - void and reissue are human-only (403 for a service, from the router and from the handler's
 //   own check), void revokes the outstanding capabilities, and reissue makes a linked draft.
 // Every request goes through the real router; mail goes to the local spool only.
@@ -20,8 +22,10 @@ import { after, before, test } from 'node:test';
 
 import { HttpError } from '../../../src/server/types.ts';
 import {
+  assertSameRows,
   confirmRequest,
   contractErrors,
+  createInput,
   createWorld,
   newKey,
   preparedEnvelope,
@@ -33,6 +37,9 @@ import {
   takeInvitation,
   voidRequest,
 } from './support.mjs';
+
+/** A second sender of tenant alpha, distinct from the fixture's sender (synthetic subject; T034R-EA05). */
+const SECOND_SENDER_SUBJECT = 'alpha-sender-0002';
 
 let world;
 before(async () => {
@@ -66,7 +73,7 @@ test('[SC002-24] a service-created envelope is sent only with a human operator\'
   assert.deepEqual([humanUnconfirmed.status, humanUnconfirmed.json?.code], [409, 'confirmation_required'], 'a service-created envelope needs a confirmation whoever sends it');
   const serviceConfirm = await confirmRequest(world, { who: 'service', envelope: prepared });
   assert.deepEqual([serviceConfirm.status, serviceConfirm.json?.code], [403, 'forbidden'], 'a service principal can never confirm a send');
-  assert.deepEqual(world.snapshot(), rows, 'the refusals changed nothing');
+  assertSameRows(world.snapshot(), rows, 'the refusals changed nothing');
   assert.equal(world.mails().length, 0, 'and mailed nothing');
 
   // A human confirms the preview; the service sends with the single-use reference.
@@ -120,14 +127,23 @@ test('[SC002-24] a service send of a human-created envelope also needs a human c
   assertNoCapability(plain, [token], 'the human send');
 });
 
-test('[EA-05] resendInvitation names the operator as the actor of its audit events, revokes the old invitation and mails a new one', async () => {
+test('[EA-05] resendInvitation names the operator who resent, a second operator distinct from the envelope\'s creator, as the actor of its audit events, revokes the old invitation and mails a new one', async () => {
   const { envelope, token: first } = await sentEnvelope(world);
-  const operator = envelope.created_by;
-  assert.equal(operator.kind, 'human-operator');
+  const creator = envelope.created_by;
+  assert.equal(creator.kind, 'human-operator');
   const recipient = envelope.recipients[0];
+
+  // A second operator of the tenant (T034R-EA05): another human sender, with its own subject.
+  // Its reference is learnt from the API itself, through an envelope it creates.
+  const asSecondOperator = { overrides: { sub: SECOND_SENDER_SUBJECT } };
+  const theirs = await world.op({ ...asSecondOperator, method: 'POST', path: '/v1/envelopes', body: createInput(1) });
+  assert.equal(theirs.status, 201);
+  const resender = theirs.json.created_by;
+  assert.equal(resender.kind, 'human-operator');
+  assert.notEqual(resender.ref, creator.ref, 'the second operator is an identity distinct from the creator');
   const seq = Math.max(0, ...world.rows('audit_events', 'WHERE tenant_id = ?', [world.tenantId('alpha')]).map((row) => Number(row.seq)));
 
-  const resent = await resendRequest(world, { envelope, recipient });
+  const resent = await resendRequest(world, { ...asSecondOperator, envelope, recipient });
   assert.equal(resent.status, 202);
   assert.deepEqual(resent.json, { status: 'accepted' });
   assert.deepEqual(contractErrors('Accepted', resent.json), []);
@@ -140,8 +156,9 @@ test('[EA-05] resendInvitation names the operator as the actor of its audit even
   assert.ok(types.includes('recipient.capabilities_revoked'), 'the resend recorded what it revoked');
   assert.ok(types.includes('recipient.invited'), 'and the new invitation');
   for (const row of events) {
-    assert.equal(row.actor_kind, 'human-operator', `${row.type}: the actor is the operator, not the system`);
-    assert.equal(row.actor_ref, operator.ref, `${row.type}: the actor is the operator who resent`);
+    assert.equal(row.actor_kind, 'human-operator', `${row.type}: the actor is an operator, not the system`);
+    assert.equal(row.actor_ref, resender.ref, `${row.type}: the actor is the operator who resent`);
+    assert.notEqual(row.actor_ref, creator.ref, `${row.type}: not the envelope's creator`);
   }
   const invitations = world.rows('invitations', 'WHERE envelope_id = ?', [envelope.id]);
   assert.equal(invitations.length, 2);

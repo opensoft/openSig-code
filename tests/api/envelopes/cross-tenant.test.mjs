@@ -32,6 +32,7 @@ import {
   MULTI_PAGE,
   SINGLE_PAGE,
   absentId,
+  assertSameRows,
   comparableHeaders,
   contract,
   contractErrors,
@@ -137,7 +138,7 @@ test('[SC002-08] a cross-tenant mutation is the uniform 404 and changes nothing:
       assertUniform404(await pair({ ...attempt, who: role, absentPath: swap(attempt.path, absentId()) }), `${attempt.label} by beta ${role}`);
     }
   }
-  assert.deepEqual(world.snapshot('alpha'), rowsBefore, 'no row of tenant alpha changed');
+  assertSameRows(world.snapshot('alpha'), rowsBefore, 'no row of tenant alpha changed');
   assert.equal(world.mails().length, mailsBefore, 'nothing was mailed');
   assert.equal(parseAdmissions().next_ticket, ticketBefore, 'the cross-tenant upload was refused before its body was parsed');
 
@@ -238,6 +239,6 @@ test('[SC002-26] the cross-tenant 404 matrix, generated from the contract\'s ope
   }
   t.diagnostic(`cross-tenant matrix: ${operator.length} operator routes, ${live} checked live, ${pending} waiting for their owner's handler`);
   assert.ok(live >= 10, 'every T034 route is checked live');
-  assert.deepEqual(world.snapshot('alpha'), rowsBefore, 'no row of tenant alpha changed');
+  assertSameRows(world.snapshot('alpha'), rowsBefore, 'no row of tenant alpha changed');
   assert.equal(world.mails().length, mailsBefore, 'nothing was mailed');
 });

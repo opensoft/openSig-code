@@ -17,6 +17,25 @@
 // (deliver()). The HTTP response never carries a link, token or code: invitations reach the
 // recipient by mail only.
 //
+// Expiry announcement (A-010 row EXPIRED-EVT, request #26; test EA-06). An operator request
+// that finds a pre-reservation envelope past its expires_at expires it and is refused (409
+// state_conflict): prepare, confirmSend, send and void through the domain's refusal path, and
+// uploadDocument through expireIfDue in its pre-parse check (below). Both run in the same
+// EnvelopeService, whose onChange is therefore T010's expiryAnnouncer wrapped around the
+// ceremony's listener, composed once, here, so every such expiry writes exactly one
+// envelope.expired outbox event in its own transaction (the announcer runs inside the
+// change's transaction, after the compare-and-set), and no other change writes one. resendInvitation commits no expiry: it refuses an envelope past its
+// expires_at (409 state_conflict) and writes nothing.
+//
+// Overdue uploads (A-010 row UPLOAD-OVERDUE, request #27). uploadDocument's pre-parse target
+// check applies the domain's order (existence, expiry, state, version), so an upload to a
+// pre-reservation envelope past its expires_at expires it through T007's expiry path
+// (EnvelopeService.expireIfDue: the one compare-and-set path, its own transaction, with the
+// composed announcer writing the single envelope.expired) and is refused with 409
+// state_conflict before any body byte is read, before an upload slot is taken and before any
+// parse. The unread body is handled as every other early answer's: the server answers with
+// Connection: close and closes the connection with its lingering close (T031).
+//
 // Tenancy. Every read and write goes through the store of the principal's tenant, so an
 // envelope of another tenant is exactly as absent as one that never existed: the same 404
 // not_found, with the same body and headers (SC002-07, SC002-08, SC002-26).
@@ -29,6 +48,20 @@
 // envelope has moved on; a changed request is 409 idempotency_conflict. resendInvitation has
 // no domain mutation of its own, so its record is kept here in the same way, in the resend's
 // transaction. Responses are sent as the exact bytes the record keeps.
+//
+// Key before body (A-010 T034R-RESEND, requests #23 and #25). In every idempotent T034
+// handler an existing key is resolved before the body is validated, as request #16 ruled for
+// uploads. Authentication, the role matrix and the human-only check come first; then the
+// framing answers of the body (415 media type, 413 size, 408 body timeout) and upload's
+// If-Match precondition (428/400), which keep their own answers because a 409 needs a
+// complete, comparable body; then the key. A complete body that is not a JSON value (bad
+// syntax or UTF-8, or no canonical form) under a key this principal has already used on the
+// route is a changed payload: 409 idempotency_conflict, never 400 (hasLiveRecord(), judged
+// once, at arrival, as request #19 ruled for uploads). A body the client aborted was never
+// compared: it keeps T031's abort answer, never 409. A JSON body is digested and resolved
+// against the record (replay, or 409) before its own rules run: the domain does this for
+// create, prepare, confirmSend, send, void and reissue, and resend() does it here. None of the
+// refusals before the comparison writes a record or a mutation.
 //
 // Upload replays (A-010, request #16). An upload whose Idempotency-Key already has a live
 // record of this principal is resolved before any parse: its body is read only for its SHA-256
@@ -61,7 +94,16 @@
 import { createHash } from 'node:crypto';
 
 import type { JsonValue } from '../../domain/canonical/index.ts';
-import { APPROVING_STATES, EnvelopeService, ROUTES as IDEMPOTENCY_ROUTES, type DocumentInput, type MutationResult, type OperatorRequest } from '../../domain/envelopes/index.ts';
+import { expiryAnnouncer } from '../../domain/approval/index.ts';
+import {
+  APPROVING_STATES,
+  EnvelopeService,
+  PRE_RESERVATION_STATES,
+  ROUTES as IDEMPOTENCY_ROUTES,
+  type DocumentInput,
+  type MutationResult,
+  type OperatorRequest,
+} from '../../domain/envelopes/index.ts';
 import { checkVersionOnly } from '../../domain/envelopes/validation.ts';
 import { DEFAULT_PARSER_LIMITS } from '../../pdf/limits.ts';
 import { parsePdf, type ParseOutcome, type ServiceReport } from '../../pdf/service.ts';
@@ -242,7 +284,9 @@ export class EnvelopeApi {
     this.#blobs = options.blobs;
     this.#ceremony = options.ceremony;
     this.#clock = options.clock;
-    this.#envelopes = new EnvelopeService({ db: options.db, clock: options.clock, onChange: options.ceremony.onEnvelopeChange });
+    // The one composition point of the expiry announcement (EXPIRED-EVT): every EnvelopeApi
+    // mutation goes through this service, so every expiry it commits is announced once.
+    this.#envelopes = new EnvelopeService({ db: options.db, clock: options.clock, onChange: expiryAnnouncer(options.db, options.clock, options.ceremony.onEnvelopeChange) });
     Object.freeze(this);
   }
 
@@ -322,22 +366,17 @@ export class EnvelopeApi {
   /**
    * resendInvitation (human operators only): the current-turn recipient's outstanding
    * invitations and sessions are revoked and a fresh invitation is mailed after the commit
-   * (202 Accepted). Order of checks, as in the domain: idempotency replay or conflict, the
-   * request's own rules, the envelope and recipient in the tenant (404), the envelope's state
-   * and expiry (409 state_conflict), the expected version (409 version_conflict), then the
-   * ceremony's turn and status rules (409). The envelope row itself does not change, so its
-   * version does not either.
+   * (202 Accepted). Order of checks, as in the domain (T034R-RESEND): idempotency replay or
+   * conflict, then the request's own rules (400), the envelope and recipient in the tenant
+   * (404), the envelope's state and expiry (409 state_conflict), the expected version (409
+   * version_conflict), then the ceremony's turn and status rules (409). So a reused key with a
+   * changed or malformed body is 409 idempotency_conflict, never 400. The envelope row itself
+   * does not change, so its version does not either.
    */
   async resend(principal: OperatorPrincipal, envelopeId: string, recipientId: string, key: string, body: JsonValue): Promise<HandlerResult> {
     requireHuman(principal);
     const actor = actorOf(principal);
     return this.#mutate(() => {
-      let expectedVersion: number;
-      try {
-        expectedVersion = checkVersionOnly(body).expectedVersion;
-      } catch (error) {
-        throw httpErrorOf(error);
-      }
       const digest = idempotencyRequestDigest({ route: RESEND_ROUTE, target: `${envelopeId}/${recipientId}`, request: body });
       const now = this.#now();
       return this.#db.transaction((): { status: number; bytes: Uint8Array } => {
@@ -351,6 +390,13 @@ export class EnvelopeApi {
           const response = recordedResponse(existing);
           if (response.kind !== 'body') throw new HttpError(500, 'internal');
           return { status: existing.responseStatus, bytes: response.bytes };
+        }
+        // The request's own rules come after the key (T034R-RESEND).
+        let expectedVersion: number;
+        try {
+          expectedVersion = checkVersionOnly(body).expectedVersion;
+        } catch (error) {
+          throw httpErrorOf(error);
         }
         const envelope = getEnvelope(store, envelopeId);
         if (envelope === undefined) throw new HttpError(404, 'not_found');
@@ -429,29 +475,47 @@ export class EnvelopeApi {
    * Before any body byte is read. When the key has a live idempotency record of this
    * principal on the upload route, that record is returned, and the request is resolved
    * against it alone, as of its arrival (also after the envelope has moved on); nothing else
-   * is checked. Otherwise (a new key, or a record past its 24 hours) the envelope exists in the
-   * tenant (404), is a draft (409 state_conflict) and is at the If-Match version (409
-   * version_conflict), so a refused upload never reaches the parse service; the domain repeats
-   * every check, and deletes an expired record, in its own transaction.
+   * is checked. Otherwise (a new key, or a record past its 24 hours), in the domain's order:
+   * the envelope exists in the tenant (404); it is not overdue (UPLOAD-OVERDUE: a
+   * pre-reservation envelope past its expires_at is expired through T007's expiry path, then
+   * 409 state_conflict); it is a draft (409 state_conflict); and it is at the If-Match version
+   * (409 version_conflict). So a refused upload never reaches the parse service; the domain
+   * repeats every check, and deletes an expired record, in its own transaction.
    */
   #uploadPrecheck(principal: OperatorPrincipal, envelopeId: string, key: string, expectedVersion: number): RecordedUpload | null {
     const now = this.#now();
     const actor = actorOf(principal);
-    return this.#db.transaction((): RecordedUpload | null => {
-      const store = this.#db.forTenant(principal.tenant_id);
-      const record = findIdempotencyRecord(store, IDEMPOTENCY_ROUTES.upload, actor.ref, key);
-      if (record !== undefined && !isIdempotencyRecordExpired(record, now)) {
-        const response = recordedResponse(record);
-        // Envelope responses carry no one-time secret, so their records always keep the body.
-        if (response.kind !== 'body') throw new HttpError(500, 'internal');
-        return { requestDigest: record.requestDigest, principalKind: record.principal.kind, status: record.responseStatus, bytes: response.bytes };
+    // Single read statements outside any transaction (request #25): Database.transaction()
+    // opens BEGIN IMMEDIATE and would wait for the write lock (up to the busy timeout, blocking
+    // the event loop) before the body could be read, so before a streaming 413 or a 408 could
+    // be answered. In WAL a read takes no write lock and is not blocked by a writer. The reads
+    // need no common snapshot: their outcome is a fast refusal or a go-ahead, the domain
+    // repeats every check in its own transaction when it records the upload, and the overdue
+    // expiry below is T007's own write transaction, which re-reads the envelope.
+    const store = this.#db.forTenant(principal.tenant_id);
+    const record = findIdempotencyRecord(store, IDEMPOTENCY_ROUTES.upload, actor.ref, key);
+    if (record !== undefined && !isIdempotencyRecordExpired(record, now)) {
+      const response = recordedResponse(record);
+      // Envelope responses carry no one-time secret, so their records always keep the body.
+      if (response.kind !== 'body') throw new HttpError(500, 'internal');
+      return { requestDigest: record.requestDigest, principalKind: record.principal.kind, status: record.responseStatus, bytes: response.bytes };
+    }
+    const envelope = getEnvelope(store, envelopeId);
+    if (envelope === undefined) throw new HttpError(404, 'not_found');
+    if (PRE_RESERVATION_STATES.includes(envelope.state) && Date.parse(envelope.expiresAt) <= now.getTime()) {
+      // UPLOAD-OVERDUE: expire through T007's expiry path, in its own transaction (it re-reads
+      // the envelope and expires it only if still due, so a concurrent expiry is not repeated),
+      // then refuse as the domain refuses a request that finds the envelope expired.
+      try {
+        this.#envelopes.expireIfDue(principal.tenant_id, envelopeId);
+      } catch (error) {
+        throw httpErrorOf(error);
       }
-      const envelope = getEnvelope(store, envelopeId);
-      if (envelope === undefined) throw new HttpError(404, 'not_found');
-      if (envelope.state !== 'draft') throw new HttpError(409, 'state_conflict');
-      if (envelope.version !== expectedVersion) throw new HttpError(409, 'version_conflict');
-      return null;
-    });
+      throw new HttpError(409, 'state_conflict');
+    }
+    if (envelope.state !== 'draft') throw new HttpError(409, 'state_conflict');
+    if (envelope.version !== expectedVersion) throw new HttpError(409, 'version_conflict');
+    return null;
   }
 
   /**
@@ -471,6 +535,22 @@ export class EnvelopeApi {
     });
     if (recorded.requestDigest !== digest || recorded.principalKind !== request.principal.kind) throw new HttpError(409, 'idempotency_conflict');
     return bytesResult(recorded.status, recorded.bytes);
+  }
+
+  /**
+   * T034R-RESEND: whether `key` already has a live idempotency record of this principal on
+   * `route` (an operationId), judged once, at arrival, before the body is read. A handler
+   * whose body turns out not to be a JSON value answers 409 idempotency_conflict when it has.
+   *
+   * One read statement, outside any transaction (request #25): Database.transaction() opens
+   * BEGIN IMMEDIATE and would wait for the write lock (up to the busy timeout, blocking the
+   * event loop) before the body's transport answers (415, 413, 408) could be given. In WAL a
+   * single read takes no write lock and is not blocked by a writer; it sees the last commit.
+   */
+  hasLiveRecord(principal: OperatorPrincipal, route: string, key: string): boolean {
+    const now = this.#now();
+    const record = findIdempotencyRecord(this.#db.forTenant(principal.tenant_id), route, actorOf(principal).ref, key);
+    return record !== undefined && !isIdempotencyRecordExpired(record, now);
   }
 
   /** The envelope domain service this API mutates through (its onChange is the ceremony's). */
