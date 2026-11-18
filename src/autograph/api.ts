@@ -14,7 +14,9 @@
 // Same origin only: the session cookie (__Host-opensig_rs; HttpOnly, so never visible here)
 // goes with credentials 'same-origin', the browser adds the Origin the server checks, and the
 // CSRF token from the session state goes in X-CSRF-Token. No request ever carries a token in
-// a URL. Errors come back as the uniform contract Error body; only its `code` is used.
+// a URL. Errors come back as the uniform contract Error body; only its `code` is used. Each
+// operation takes an optional AbortSignal: when the shell restarts on a new invitation it aborts
+// the previous flow's requests (flow.ts), and an aborted call settles as a failed result.
 
 import type { ApprovalBody, ApprovalReceipt, DeclineBody, SessionState } from './types.js';
 
@@ -39,7 +41,7 @@ async function errorCode(response: Response): Promise<string> {
   return 'unknown';
 }
 
-async function call<T>(method: string, path: string, expect: Expect, options: { readonly json?: unknown; readonly csrf?: string } = {}): Promise<ApiResult<T>> {
+async function call<T>(method: string, path: string, expect: Expect, options: { readonly json?: unknown; readonly csrf?: string; readonly signal?: AbortSignal } = {}): Promise<ApiResult<T>> {
   const headers: Record<string, string> = { accept: expect === 'bytes' ? '*/*' : 'application/json' };
   if (options.json !== undefined) headers['content-type'] = 'application/json';
   if (options.csrf !== undefined) headers['x-csrf-token'] = options.csrf;
@@ -53,6 +55,7 @@ async function call<T>(method: string, path: string, expect: Expect, options: { 
       cache: 'no-store',
       redirect: 'error',
       referrerPolicy: 'no-referrer',
+      signal: options.signal ?? null,
     });
   } catch {
     return { ok: false, status: 0, code: 'network' };
@@ -68,23 +71,23 @@ async function call<T>(method: string, path: string, expect: Expect, options: { 
 }
 
 export interface RecipientApi {
-  requestChallenge(invitation: string): Promise<ApiResult<null>>;
-  createSession(invitation: string, code: string): Promise<ApiResult<SessionState>>;
-  readSession(): Promise<ApiResult<SessionState>>;
-  endSession(csrf: string): Promise<ApiResult<null>>;
-  document(): Promise<ApiResult<ArrayBuffer>>;
-  manifest(): Promise<ApiResult<ArrayBuffer>>;
-  approve(csrf: string, body: ApprovalBody): Promise<ApiResult<ApprovalReceipt>>;
-  decline(csrf: string, body: DeclineBody): Promise<ApiResult<{ readonly envelope_state: 'declined' }>>;
+  requestChallenge(invitation: string, signal?: AbortSignal): Promise<ApiResult<null>>;
+  createSession(invitation: string, code: string, signal?: AbortSignal): Promise<ApiResult<SessionState>>;
+  readSession(signal?: AbortSignal): Promise<ApiResult<SessionState>>;
+  endSession(csrf: string, signal?: AbortSignal): Promise<ApiResult<null>>;
+  document(signal?: AbortSignal): Promise<ApiResult<ArrayBuffer>>;
+  manifest(signal?: AbortSignal): Promise<ApiResult<ArrayBuffer>>;
+  approve(csrf: string, body: ApprovalBody, signal?: AbortSignal): Promise<ApiResult<ApprovalReceipt>>;
+  decline(csrf: string, body: DeclineBody, signal?: AbortSignal): Promise<ApiResult<{ readonly envelope_state: 'declined' }>>;
 }
 
 export const recipientApi: RecipientApi = {
-  requestChallenge: (invitation) => call<null>('POST', CHALLENGE_PATH, 'none', { json: { invitation } }),
-  createSession: (invitation, code) => call<SessionState>('POST', SESSION_PATH, 'json', { json: { invitation, code } }),
-  readSession: () => call<SessionState>('GET', SESSION_PATH, 'json'),
-  endSession: (csrf) => call<null>('DELETE', SESSION_PATH, 'none', { csrf }),
-  document: () => call<ArrayBuffer>('GET', DOCUMENT_PATH, 'bytes'),
-  manifest: () => call<ArrayBuffer>('GET', MANIFEST_PATH, 'bytes'),
-  approve: (csrf, body) => call<ApprovalReceipt>('POST', APPROVAL_PATH, 'json', { json: body, csrf }),
-  decline: (csrf, body) => call<{ readonly envelope_state: 'declined' }>('POST', DECLINE_PATH, 'json', { json: body, csrf }),
+  requestChallenge: (invitation, signal) => call<null>('POST', CHALLENGE_PATH, 'none', { json: { invitation }, signal }),
+  createSession: (invitation, code, signal) => call<SessionState>('POST', SESSION_PATH, 'json', { json: { invitation, code }, signal }),
+  readSession: (signal) => call<SessionState>('GET', SESSION_PATH, 'json', { signal }),
+  endSession: (csrf, signal) => call<null>('DELETE', SESSION_PATH, 'none', { csrf, signal }),
+  document: (signal) => call<ArrayBuffer>('GET', DOCUMENT_PATH, 'bytes', { signal }),
+  manifest: (signal) => call<ArrayBuffer>('GET', MANIFEST_PATH, 'bytes', { signal }),
+  approve: (csrf, body, signal) => call<ApprovalReceipt>('POST', APPROVAL_PATH, 'json', { json: body, csrf, signal }),
+  decline: (csrf, body, signal) => call<{ readonly envelope_state: 'declined' }>('POST', DECLINE_PATH, 'json', { json: body, csrf, signal }),
 };

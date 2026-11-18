@@ -14,6 +14,11 @@
 //          After the drawing the test records and asserts that the consent target
 //          is in the viewport and hit at its tap point, and records the touch, pointer and click
 //          events the page received, in order.
+//          AG-06 explains its own failure at Approve (the SHELL-HASHCHANGE dispatch, Addendum 4):
+//          full run 1 failed with one trusted click on Approve, an empty alert and no approval
+//          response, and its cause stays undetermined because nothing kept the page, network or
+//          server evidence. watchApproval() below now keeps it; the success path, its assertions
+//          and the 10 s wait are unchanged.
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
@@ -56,9 +61,81 @@ function smallTargets(page) {
   });
 }
 
+/**
+ * The evidence for a failed approval (the SHELL-HASHCHANGE dispatch, Addendum 4). From the page's
+ * opening it records, passively, the approval POST's lifecycle (request; response, with its
+ * status and correlation ID; requestfailed, with its errorText; requestfinished) and the page's
+ * errors (pageerror messages and console errors). tapped() marks the start of the tap on Approve,
+ * from which every event is timed in ms (negative: before the tap). report() is read on failure
+ * only. It gives the lifecycle, or "approval request: NOT SENT" when no request event occurred;
+ * the page and console errors; the server log's lines for the approval path (method, path,
+ * operation, status, correlation ID and duration only: no bodies, no tokens); and the current
+ * step with the #alert and #status texts. Nothing here waits or asserts.
+ */
+function watchApproval(page) {
+  const approvalUrl = `${world.origin}${APPROVAL_PATH}`;
+  const isApproval = (request) => request.url() === approvalUrl && request.method() === 'POST';
+  const serverFrom = world.lines.length;
+  const lifecycle = [];
+  const errors = [];
+  let tappedAt = null;
+  page.on('request', (request) => {
+    if (isApproval(request)) lifecycle.push({ at: performance.now(), what: 'request' });
+  });
+  page.on('response', (response) => {
+    if (isApproval(response.request())) lifecycle.push({ at: performance.now(), what: `response ${response.status()} correlation ${response.headers()['x-correlation-id'] ?? '(none)'}` });
+  });
+  page.on('requestfailed', (request) => {
+    if (isApproval(request)) lifecycle.push({ at: performance.now(), what: `requestfailed ${request.failure()?.errorText ?? '(no errorText)'}` });
+  });
+  page.on('requestfinished', (request) => {
+    if (isApproval(request)) lifecycle.push({ at: performance.now(), what: 'requestfinished' });
+  });
+  page.on('pageerror', (error) => errors.push({ at: performance.now(), what: `pageerror ${error.message}` }));
+  page.on('console', (message) => {
+    if (message.type() === 'error') errors.push({ at: performance.now(), what: `console error ${message.text()}` });
+  });
+  const timed = (entry) => {
+    if (tappedAt === null) return `${entry.what} (before any tap)`;
+    const ms = Math.round(entry.at - tappedAt);
+    return `${entry.what} at ${ms >= 0 ? '+' : ''}${ms} ms`;
+  };
+  const serverLines = () => {
+    const lines = [];
+    for (const line of world.lines.slice(serverFrom)) {
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (record.event !== 'request' || record.path !== APPROVAL_PATH) continue;
+      lines.push(`${record.method} ${record.path} ${record.operation} ${record.status} correlation ${record.correlation_id} ${record.duration_ms} ms`);
+    }
+    return lines;
+  };
+  return {
+    tapped() {
+      tappedAt = performance.now();
+    },
+    async report() {
+      const flow = lifecycle.some((entry) => entry.what === 'request') ? `approval request: ${lifecycle.map(timed).join(', ')}` : 'approval request: NOT SENT';
+      const state = await page
+        .evaluate(() => ({
+          step: document.getElementById('app')?.getAttribute('data-step') ?? null,
+          alert: document.getElementById('alert')?.textContent ?? null,
+          status: document.getElementById('status')?.textContent ?? null,
+        }))
+        .catch((error) => ({ unreadable: String(error?.message ?? error).split('\n')[0] }));
+      return { flow, errors: errors.map(timed), server: serverLines(), state };
+    },
+  };
+}
+
 test('[AG-06] at 360 px with touch: no sideways scrolling at any step, 44 px targets, the pad takes touch strokes without scrolling the page, and taps alone reach the receipt (draw, consent, approve)', async (t) => {
   const sent = await world.sentEnvelope();
   const { page, requests, close } = await openPage(browser, PHONE);
+  const approval = watchApproval(page);
   try {
     await page.goto(sent.url);
     await step(page, 'invitation');
@@ -152,10 +229,24 @@ test('[AG-06] at 360 px with touch: no sideways scrolling at any step, 44 px tar
 
       const approveClicks = await countClicks(page, '#approve');
       const answer = page.waitForResponse((candidate) => candidate.url() === `${world.origin}${APPROVAL_PATH}` && candidate.request().method() === 'POST', { timeout: 10_000 });
+      approval.tapped();
       await touch.tap(page.getByRole('button', { name: 'Approve the document' }));
-      response = await answer.catch(async () =>
-        assert.fail(`a tap on Approve sent no approval (trusted clicks on Approve: ${await approveClicks()}; alert: ${JSON.stringify(await page.locator('#alert').textContent())}; events: ${(await events()).join(' ')})`),
-      );
+      response = await answer.catch(async (error) => {
+        // On failure only: what was observed, in that order, with the token and the code redacted.
+        const seen = await approval.report();
+        const clicks = await approveClicks().catch(() => 'unreadable');
+        const received = await events()
+          .then((list) => list.join(' '))
+          .catch(() => 'unreadable');
+        const hide = (text) => text.split(sent.token).join('[token redacted]').split(code).join('[code redacted]');
+        assert.fail(
+          hide(
+            `no approval response within 10 s of the tap on Approve; ${seen.flow}; trusted clicks on Approve: ${clicks}; events: ${received}; wait: ${String(error?.message ?? error).split('\n')[0]}; ` +
+              `page and console errors: ${JSON.stringify(seen.errors)}; server log for the approval path: ${JSON.stringify(seen.server)}; ` +
+              ('unreadable' in seen.state ? `page state unreadable: ${seen.state.unreadable}` : `step: ${seen.state.step}; alert: ${JSON.stringify(seen.state.alert)}; status: ${JSON.stringify(seen.state.status)}`),
+          ),
+        );
+      });
     } finally {
       await touch.detach();
     }

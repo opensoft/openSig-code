@@ -23,6 +23,16 @@ export function invitationFromFragment(hash: string): string | null {
   return token;
 }
 
+/**
+ * True when a location hash carries the invitation parameter `i` at all, well formed or not
+ * ("#i=<token>", "#i=<a>&i=<b>", "#i=x", "#i"). A fragment without it (a skip link or an
+ * in-page anchor) is not an invitation and is left alone.
+ */
+export function carriesInvitationParameter(hash: string): boolean {
+  if (!hash.startsWith('#') || hash.length < 2) return false;
+  return new URLSearchParams(hash.slice(1)).has('i');
+}
+
 /** Replace the current history entry with the bare path: no fragment, no query. */
 export function scrubLocation(location: Location, history: History): void {
   if (location.hash === '' && location.search === '') return;

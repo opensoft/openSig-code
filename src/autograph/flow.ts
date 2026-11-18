@@ -19,6 +19,13 @@
 // The invitation token lives in this object only until a session exists; the CSRF token only
 // in the session state held here.
 //
+// restart (A-010 SHELL-HASHCHANGE, request #38): an invitation link followed in a tab already
+// on /sign is a same-document fragment navigation, so main.ts scrubs the fragment and calls
+// restart(). Each flow has a generation and an AbortController: a restart aborts the previous
+// flow's requests, moves the generation on and clears the previous step state; every
+// continuation checks its generation after each await, so a late response of an earlier flow
+// never touches the restarted UI. The restart sends nothing: the recipient asks for a code.
+//
 // Review shows: the document's size and digest; the exact bytes fetched and checked against
 // document.digest (and the manifest bytes against manifest_digest) before the browser's own PDF
 // viewer is pointed at them; a download link and a new-tab link to the same bytes; the
@@ -79,6 +86,10 @@ export class ReviewShell {
   #signatures = new Map<string, SignatureControl>();
   #consent: HTMLInputElement | null = null;
   #reasons: ReadonlyArray<readonly [DeclineReason, HTMLInputElement]> = [];
+  /** The current flow's generation; a continuation of an earlier one is stale. */
+  #generation = 0;
+  /** Aborts the current flow's requests when a new flow begins. */
+  #controller = new AbortController();
 
   constructor(page: ShellPage, api: RecipientApi = recipientApi) {
     this.#page = page;
@@ -87,16 +98,53 @@ export class ReviewShell {
 
   /** Start with the invitation read from the fragment (or none). */
   async start(invitation: string | null): Promise<void> {
-    this.#invitation = invitation;
-    this.#state = null;
-    this.#clearAlert();
+    const flow = this.#begin(invitation);
     if (invitation !== null) {
       this.#showInvitation(false);
       return;
     }
-    const read = await this.#api.readSession();
+    const read = await this.#api.readSession(this.#controller.signal);
+    if (this.#stale(flow)) return;
     if (read.ok) await this.#afterSession(read.value, false);
     else this.#showNoInvitation(false);
+  }
+
+  /**
+   * Restart on an invitation followed in this tab (main.ts, on hashchange, after the fragment is
+   * scrubbed). Synchronous: the previous flow ends (#begin) and the invitation step is shown with
+   * focus on its heading. Nothing is sent, and a session left by an earlier flow is neither read
+   * nor reused: the new invitation goes through its own code step.
+   */
+  restart(invitation: string): void {
+    this.#begin(invitation);
+    this.#showInvitation(true);
+  }
+
+  /**
+   * A new flow: abort the previous flow's requests, move the generation on, and clear the
+   * previous step state (invitation, session state, document check, signature inputs and pad
+   * strokes, consent, busy flag, live regions). Returns the new generation.
+   */
+  #begin(invitation: string | null): number {
+    this.#controller.abort();
+    this.#controller = new AbortController();
+    this.#generation += 1;
+    this.#invitation = invitation;
+    this.#state = null;
+    this.#documentDigest = null;
+    this.#consentOk = false;
+    this.#busy = false;
+    this.#signatures = new Map();
+    this.#consent = null;
+    this.#reasons = [];
+    this.#announce('');
+    this.#clearAlert();
+    return this.#generation;
+  }
+
+  /** True when `flow` is no longer the current flow: its continuation must do nothing. */
+  #stale(flow: number): boolean {
+    return flow !== this.#generation;
   }
 
   #announce(text: string): void {
@@ -154,10 +202,12 @@ export class ReviewShell {
       this.#showNoInvitation(true);
       return;
     }
+    const flow = this.#generation;
     this.#busy = true;
     this.#clearAlert();
     this.#announce('Asking for a code...');
-    const result = await this.#api.requestChallenge(invitation);
+    const result = await this.#api.requestChallenge(invitation, this.#controller.signal);
+    if (this.#stale(flow)) return;
     this.#busy = false;
     if (result.ok) {
       this.#showCode(true, 'If your link is valid, we emailed you a code. It works for 10 minutes.');
@@ -212,10 +262,12 @@ export class ReviewShell {
       input.focus();
       return;
     }
+    const flow = this.#generation;
     this.#busy = true;
     this.#clearAlert();
     this.#announce('Checking the code...');
-    const result = await this.#api.createSession(invitation, code);
+    const result = await this.#api.createSession(invitation, code, this.#controller.signal);
+    if (this.#stale(flow)) return;
     this.#busy = false;
     if (result.ok) {
       this.#invitation = null;
@@ -231,9 +283,12 @@ export class ReviewShell {
   }
 
   async #afterSession(state: SessionState, focus: boolean): Promise<void> {
+    const flow = this.#generation;
+    const consentOk = (await textDigest(state.consent.text)) === state.consent.text_digest;
+    if (this.#stale(flow)) return;
     this.#state = state;
     this.#documentDigest = null;
-    this.#consentOk = (await textDigest(state.consent.text)) === state.consent.text_digest;
+    this.#consentOk = consentOk;
     this.#clearAlert();
     this.#announce('');
     if (state.turn === 'yours') this.#showReview(focus);
@@ -358,17 +413,20 @@ export class ReviewShell {
   }
 
   async #verifyDocument(state: SessionState, check: HTMLElement, frame: HTMLIFrameElement): Promise<void> {
-    const pdf = await this.#api.document();
-    if (this.#state !== state) return;
+    const flow = this.#generation;
+    const signal = this.#controller.signal;
+    const pdf = await this.#api.document(signal);
+    if (this.#stale(flow) || this.#state !== state) return;
     if (!pdf.ok) {
       if (pdf.status === 401) return this.#sessionEnded();
       check.textContent = 'The document could not be loaded. Do not approve it.';
       return;
     }
     const digest = await sha256Hex(pdf.value);
-    const manifest = await this.#api.manifest();
+    if (this.#stale(flow) || this.#state !== state) return;
+    const manifest = await this.#api.manifest(signal);
     const manifestOk = manifest.ok && (await sha256Hex(manifest.value)) === state.manifest_digest;
-    if (this.#state !== state) return;
+    if (this.#stale(flow) || this.#state !== state) return;
     if (digest !== state.document.digest || pdf.value.byteLength !== state.document.bytes || !manifestOk) {
       check.textContent = 'The document does not match its digest. Do not approve it.';
       this.#fail('The document does not match the digest recorded for it. Do not approve it.');
@@ -400,10 +458,12 @@ export class ReviewShell {
       this.#fail(problems.map((problem) => problem.message).join(' '));
       return;
     }
+    const flow = this.#generation;
     this.#busy = true;
     this.#clearAlert();
     this.#announce('Sending your approval...');
-    const result = await this.#api.approve(state.csrf_token, approvalBody(state, digest, inputs));
+    const result = await this.#api.approve(state.csrf_token, approvalBody(state, digest, inputs), this.#controller.signal);
+    if (this.#stale(flow)) return;
     this.#busy = false;
     if (result.ok) {
       this.#showApproved(result.value);
@@ -412,7 +472,8 @@ export class ReviewShell {
     this.#announce('');
     if (result.status === 401) return this.#sessionEnded();
     if (result.status === 403 || result.status === 409) {
-      const read = await this.#api.readSession();
+      const read = await this.#api.readSession(this.#controller.signal);
+      if (this.#stale(flow)) return;
       if (!read.ok) return this.#sessionEnded();
       if (result.status === 403 && read.value.envelope_version === state.envelope_version && read.value.turn === 'yours') {
         this.#state = read.value;
@@ -420,6 +481,7 @@ export class ReviewShell {
         return;
       }
       await this.#afterSession(read.value, true);
+      if (this.#stale(flow)) return;
       this.#fail('Something changed before your approval was recorded. Review the document again before you approve.');
       return;
     }
@@ -451,9 +513,15 @@ export class ReviewShell {
     const state = this.#state;
     if (this.#busy || state === null) return;
     const chosen = this.#reasons.find(([, radio]) => radio.checked)?.[0];
+    const flow = this.#generation;
     this.#busy = true;
     this.#clearAlert();
-    const result = await this.#api.decline(state.csrf_token, chosen === undefined ? { expected_version: state.envelope_version } : { expected_version: state.envelope_version, reason_code: chosen });
+    const result = await this.#api.decline(
+      state.csrf_token,
+      chosen === undefined ? { expected_version: state.envelope_version } : { expected_version: state.envelope_version, reason_code: chosen },
+      this.#controller.signal,
+    );
+    if (this.#stale(flow)) return;
     this.#busy = false;
     if (result.ok) {
       this.#render('declined', 'Document declined', true, el('p', { id: 'decline-outcome' }, 'You declined this document. Nothing was signed. The sender is told that it was declined.'));
@@ -461,8 +529,10 @@ export class ReviewShell {
     }
     if (result.status === 401) return this.#sessionEnded();
     if (result.status === 409) {
-      const read = await this.#api.readSession();
+      const read = await this.#api.readSession(this.#controller.signal);
+      if (this.#stale(flow)) return;
       if (read.ok) await this.#afterSession(read.value, true);
+      if (this.#stale(flow)) return;
       this.#fail('Something changed first. Review the document again.');
       return;
     }
@@ -470,9 +540,12 @@ export class ReviewShell {
   }
 
   async #endSession(): Promise<void> {
+    const flow = this.#generation;
     const state = this.#state;
     this.#state = null;
+    // Not aborted by a restart: an end the recipient asked for always reaches the server.
     if (state !== null) await this.#api.endSession(state.csrf_token);
+    if (this.#stale(flow)) return;
     this.#render('ended', 'Session ended', true, el('p', {}, 'Your session has ended. To continue, open the link from your invitation email again.'));
   }
 
