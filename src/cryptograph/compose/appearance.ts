@@ -37,7 +37,7 @@
 // the field; it is left-aligned and vertically centred.
 
 import { WINANSI_HIGH_CODE_POINTS } from '../../domain/approval/winansi.ts';
-import type { CheckedPage } from './report.ts';
+import type { CentipointBox } from './bounds.ts';
 import { decimal } from './syntax.ts';
 
 export interface NormalizedRect {
@@ -74,8 +74,21 @@ export function checkRect(value: unknown): NormalizedRect | null {
   return Object.freeze({ x, y, width, height });
 }
 
-/** Where a field lands on its page, or null when it rounds to less than one centipoint. */
-export function placeField(page: CheckedPage, rect: NormalizedRect): Placement | null {
+/** A page as placement sees it: its rotation and its MediaBox in centipoints (bounds.ts centipointBox). */
+export interface PageGeometry {
+  readonly rotate: 0 | 90 | 180 | 270;
+  readonly box: CentipointBox;
+}
+
+/**
+ * The field-placement rule (request #46): where a field with normalized rectangle `rect`
+ * lands on `page`, or null when it rounds to less than one centipoint in width or height
+ * (the composer's 400 field_too_small). Pure. The composer places every field with this
+ * function, and T007's prepare check calls it over the stored page geometry:
+ * placeField({ rotate, box: centipointBox(media_box) }, rect) === null means
+ * field_too_small.
+ */
+export function placeField(page: PageGeometry, rect: NormalizedRect): Placement | null {
   const [left, bottom, right, top] = page.box;
   const upright = page.rotate % 180 === 0;
   const shownWidth = upright ? right - left : top - bottom;

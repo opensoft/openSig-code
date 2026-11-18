@@ -14,6 +14,7 @@ import { test } from 'node:test';
 import * as bounds from '../../src/cryptograph/compose/bounds.ts';
 import { checkRequest, composeFromReport } from '../../src/cryptograph/compose/compose.ts';
 import * as compose from '../../src/cryptograph/compose/index.ts';
+import { MAX_BOX_COORDINATE, MAX_OBJECT_NUMBER } from '../../src/cryptograph/compose/report.ts';
 import { MAX_FIELD_VALUES } from '../../src/domain/approval/values.ts';
 import { DEFAULT_PARSER_LIMITS, MAX_DOCUMENT_BYTES, reportBudget } from '../../src/pdf/limits.ts';
 import { parsePdf } from '../../src/pdf/service.ts';
@@ -50,11 +51,22 @@ test('[CP-01] bounds.ts imports nothing, restates its two foreign constants exac
   assert.doesNotMatch(code, /\bimport\b|\brequire\s*\(|\bexport\s+\*\s+from\b|\bfrom\s+['"]/, 'the import closure of bounds.ts is bounds.ts alone');
   assert.equal(bounds.MAX_FIELD_VALUES, MAX_FIELD_VALUES, 'restated from src/domain/approval/values.ts');
   assert.equal(bounds.MAX_DOCUMENT_BYTES, MAX_DOCUMENT_BYTES, 'restated from src/pdf/limits.ts');
+  assert.equal(bounds.MAX_OBJECT_NUMBER, MAX_OBJECT_NUMBER, 'restated from src/cryptograph/compose/report.ts');
+  assert.equal(bounds.MAX_BOX_COORDINATE, MAX_BOX_COORDINATE, 'restated from src/cryptograph/compose/report.ts');
   assert.equal(bounds.REPORT_BYTE_BUDGET, reportBudget(DEFAULT_PARSER_LIMITS).bytes);
   assert.equal(bounds.MAX_SEALED_PDF_BYTES, 50_331_648);
   assert.equal(bounds.UPDATE_BOUND, bounds.UPDATE_REQUEST_BOUND + 65 * bounds.REPORT_BYTE_BUDGET + 22 * bounds.REWRITE_OVERHEAD_BYTES);
-  assert.deepEqual([...bounds.SEAL_REFUSAL_DETAILS], ['composition_too_large', 'number_range', 'dangling_form_reference', 'annots_shape', 'acroform_shape']);
-  for (const name of ['MAX_SEALED_PDF_BYTES', 'UPDATE_BOUND', 'UPDATE_REQUEST_BOUND', 'SEAL_REFUSAL_DETAILS', 'estimateSealedSize', 'withinSealedBound']) {
+  assert.deepEqual([...bounds.SEAL_REFUSAL_DETAILS], [
+    'composition_too_large',
+    'number_range',
+    'dangling_form_reference',
+    'annots_shape',
+    'acroform_shape',
+    'xref_size',
+    'page_box',
+    'name_character',
+  ]);
+  for (const name of ['MAX_SEALED_PDF_BYTES', 'UPDATE_BOUND', 'UPDATE_REQUEST_BOUND', 'SEAL_REFUSAL_DETAILS', 'centipointBox', 'estimateSealedSize', 'withinSealedBound']) {
     assert.equal(compose[name], bounds[name], `index.ts re-exports ${name}`);
   }
   assert.equal(typeof compose.byteRangeText, 'function', 'index.ts exports byteRangeText');

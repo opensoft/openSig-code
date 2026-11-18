@@ -22,8 +22,10 @@
 //   rewrites (number_range); a form reference (/AcroForm, /Fields, page /Annots)
 //   that resolves to nothing (dangling_form_reference); a page /Annots that is not
 //   an array (annots_shape); an AcroForm that is not a dictionary, whose /Fields is
-//   not an array, or that is a page the composer also rewrites (acroform_shape).
-//   Not retryable.
+//   not an array, or that is a page the composer also rewrites (acroform_shape); new
+//   objects that would pass the object-number limit (xref_size); a page box the
+//   composer cannot place fields on (page_box); a NUL in a name or key (name_character)
+//   (requests #45 and #46). Not retryable.
 // - 413, 422, 429 and 500 from the parse service, passed through with the
 //   service's code and reason and a fixed machine detail, never the service's
 //   text; retryable for 429 and 500 only.
@@ -113,6 +115,27 @@ export function annotsShape(): ComposeError {
 export function acroformShape(): ComposeError {
   return new ComposeError('unsupported_pdf', 'unsupported-feature', 'acroform_shape', 'the document has a form the composer cannot extend', [
     { field: 'acroform', code: 'acroform_shape' },
+  ]);
+}
+
+/** 422 (request #46): the new objects' numbers would pass the PDF object-number limit. */
+export function xrefSize(): ComposeError {
+  return new ComposeError('unsupported_pdf', 'unsupported-feature', 'xref_size', 'the document has no room for the objects of a seal', [
+    { field: 'document', code: 'xref_size' },
+  ]);
+}
+
+/** 422 (request #46): page `page` has a box coordinate above 1,000,000 points in magnitude, or a side under one centipoint. */
+export function pageBox(page: number): ComposeError {
+  return new ComposeError('unsupported_pdf', 'unsupported-feature', 'page_box', 'the document has a page the composer cannot place fields on', [
+    { field: `pages[${page}]`, code: 'page_box' },
+  ]);
+}
+
+/** 422 (request #46): a reported object holds a NUL in a name or a dictionary key. */
+export function nameCharacter(): ComposeError {
+  return new ComposeError('unsupported_pdf', 'unsupported-feature', 'name_character', 'the document has a name the composer cannot write', [
+    { field: 'document', code: 'name_character' },
   ]);
 }
 

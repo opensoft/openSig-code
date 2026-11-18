@@ -17,7 +17,7 @@
 // whole report share one node budget, so a lying report fails closed with
 // report-invalid instead of costing unbounded work.
 
-import { numberRange, reportInvalid } from './errors.ts';
+import { nameCharacter, numberRange, reportInvalid } from './errors.ts';
 
 /** `units / 10^scale` as an exact decimal: no exponent, no rounding, trailing zeros dropped. */
 export function decimal(units: number, scale: number): string {
@@ -55,7 +55,10 @@ export function pdfName(decoded: string): string {
   let out = '/';
   for (let index = 0; index < decoded.length; index += 1) {
     const code = decoded.charCodeAt(index);
-    if (code === 0 || code > 0xff) throw reportInvalid('name-character');
+    // A NUL, which T033 reads from `#00`, is a document defect the predicate reports (422,
+    // request #46); a code above 0xff cannot come from T033, so only a lying report has one.
+    if (code === 0) throw nameCharacter();
+    if (code > 0xff) throw reportInvalid('name-character');
     const char = decoded[index] ?? '';
     if (code >= 0x21 && code <= 0x7e && !NAME_DELIMITERS.has(char)) out += char;
     else out += `#${code.toString(16).toUpperCase().padStart(2, '0')}`;

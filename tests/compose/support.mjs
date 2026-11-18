@@ -141,12 +141,44 @@ function objectsOf(bodies) {
   return { chunks, offsets, length };
 }
 
-const tableOf = (offsets) => [`xref\n0 ${offsets.length + 1}\n`, '0000000000 65535 f \n', ...offsets.map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`)].join('');
+const tableOf = (offsets, head = 'xref\n') => [`${head}0 ${offsets.length + 1}\n`, '0000000000 65535 f \n', ...offsets.map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`)].join('');
 
-/** A classic one-section document; `bodies[i]` is object i + 1. */
-export function classicDocument(bodies, { root = 1, trailer = '', finalEol = true } = {}) {
+/**
+ * A classic one-section document; `bodies[i]` is object i + 1. `size` overrides the
+ * trailer /Size; `head` replaces the table's first line (`xref` and its end of line);
+ * `lead` is written just before the table, and startxref names the start of `lead`.
+ */
+export function classicDocument(bodies, { root = 1, trailer = '', finalEol = true, size, head = 'xref\n', lead = '' } = {}) {
   const { chunks, offsets, length } = objectsOf(bodies);
-  chunks.push(enc(`${tableOf(offsets)}trailer\n<< /Size ${offsets.length + 1} /Root ${root} 0 R${trailer ? ` ${trailer}` : ''} >>\nstartxref\n${length}\n%%EOF${finalEol ? '\n' : ''}`));
+  chunks.push(
+    enc(`${lead}${tableOf(offsets, head)}trailer\n<< /Size ${size ?? offsets.length + 1} /Root ${root} 0 R${trailer ? ` ${trailer}` : ''} >>\nstartxref\n${length}\n%%EOF${finalEol ? '\n' : ''}`),
+  );
+  return new Uint8Array(Buffer.concat(chunks));
+}
+
+/**
+ * A cross-reference-stream document: `bodies[i]` is object i + 1, then the unfiltered
+ * cross-reference stream as the last object, whose header text is `head(num)` (by default
+ * `${num} 0 obj`). `lead` is written just before that header, and startxref names the
+ * start of `lead`, so the bytes at startxref are `lead` followed by the header.
+ */
+export function xrefStreamDocument(bodies, { root = 1, head = (num) => `${num} 0 obj`, lead = '' } = {}) {
+  const { chunks, offsets, length: objectsEnd } = objectsOf(bodies);
+  const self = bodies.length + 1;
+  const rows = Buffer.alloc(7 * (self + 1));
+  rows[0] = 0;
+  rows.writeUInt16BE(0xffff, 5);
+  const headerAt = objectsEnd + enc(lead).length;
+  [...offsets, headerAt].forEach((offset, index) => {
+    const at = 7 * (index + 1);
+    rows[at] = 1;
+    rows.writeUInt32BE(offset, at + 1);
+  });
+  chunks.push(
+    enc(`${lead}${head(self)}\n<< /Type /XRef /Size ${self + 1} /W [1 4 2] /Root ${root} 0 R /Length ${rows.length} >>\nstream\n`),
+    rows,
+    enc(`\nendstream\nendobj\nstartxref\n${objectsEnd}\n%%EOF\n`),
+  );
   return new Uint8Array(Buffer.concat(chunks));
 }
 
@@ -303,18 +335,32 @@ export function numberDocument(numbers = {}) {
   );
 }
 
+/** The bodies of plainDocument (catalog 1, pages 2, page 3, font 4, contents 5). */
+export function plainBodies({ page = '', catalog = '', font = '' } = {}) {
+  return [
+    `<< /Type /Catalog /Pages 2 0 R${catalog ? ` ${catalog}` : ''} >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>',
+    `<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R${page ? ` ${page}` : ''} >>`,
+    `<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding${font ? ` ${font}` : ''} >>`,
+    streamBody('', PAGE_TEXT),
+  ];
+}
+
 /** A plain one-page document (catalog 1, pages 2, page 3, font 4, contents 5). */
-export function plainDocument({ trailer = '', finalEol = true, page = '', catalog = '' } = {}) {
-  return classicDocument(
-    [
-      `<< /Type /Catalog /Pages 2 0 R${catalog ? ` ${catalog}` : ''} >>`,
-      '<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>',
-      `<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R${page ? ` ${page}` : ''} >>`,
-      '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>',
-      streamBody('', PAGE_TEXT),
-    ],
-    { trailer, finalEol },
-  );
+export function plainDocument({ trailer = '', finalEol = true, page = '', catalog = '', font = '', size } = {}) {
+  return classicDocument(plainBodies({ page, catalog, font }), { trailer, finalEol, size });
+}
+
+/** Two pages (3 and 6) sharing contents 5; `page1` and `page2` add entries to each. */
+export function twoPageDocument({ page1 = '', page2 = '', catalog = '' } = {}) {
+  return classicDocument([
+    `<< /Type /Catalog /Pages 2 0 R${catalog ? ` ${catalog}` : ''} >>`,
+    '<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 /MediaBox [0 0 612 792] >>',
+    `<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R${page1 ? ` ${page1}` : ''} >>`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>',
+    streamBody('', PAGE_TEXT),
+    `<< /Type /Page /Parent 2 0 R /Contents 5 0 R${page2 ? ` ${page2}` : ''} >>`,
+  ]);
 }
 
 // --- an independent cross-reference reader -----------------------------------------------------

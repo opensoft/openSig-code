@@ -76,10 +76,12 @@
 // stopping as soon as the objects it writes cross it; an uploaded document cannot
 // reach it once T034 applies the predicate. Numbers are checked only in the objects
 // the composer rewrites (detail number_range, not retryable); the base bytes are
-// never re-read, so a number anywhere else never matters. These five report-only
+// never re-read, so a number anywhere else never matters. The eight report-only
 // refusals (composition_too_large, number_range, dangling_form_reference,
-// annots_shape, acroform_shape) are the ones the predicate reports for T034 (request
-// #45); after upload each is a broken invariant, 422 unsupported_pdf, not retryable.
+// annots_shape, acroform_shape, xref_size, page_box, name_character) are the ones the
+// predicate reports for T034 (requests #45 and #46); after upload each is a broken
+// invariant, 422 unsupported_pdf, not retryable. Every field is placed with
+// appearance.ts placeField(), the rule index.ts exports for T007's prepare check.
 // Rewrites count depth but no nodes: the report's node budget and the size bound
 // already bound them, and a composition-time node limit could strand a document.
 
@@ -125,6 +127,7 @@ import {
   inputInvalid,
   reportInvalid,
   unsupportedCharacters,
+  xrefSize,
 } from './errors.ts';
 import { checkReport, MAX_OBJECT_NUMBER, typedDict, type CheckedObject, type CheckedPage } from './report.ts';
 import { dictEntries, entryOf, isCalendarDate, pdfAsciiString, pdfDate, pdfRef, refValue, rewriteDict, serializeValue, type Ref, type ValueBudget } from './syntax.ts';
@@ -546,7 +549,7 @@ export function composeFromReport(request: CheckedRequest, report: unknown): Com
   }
   const xrefSelf = checked.kind === 'stream' ? take() : null;
   const size = next;
-  if (size - 1 > MAX_OBJECT_NUMBER) throw reportInvalid('xref-size');
+  if (size - 1 > MAX_OBJECT_NUMBER) throw xrefSize();
 
   // Pages gaining widgets, in page order; widgets on a page in field-manifest order.
   for (const page of checked.pages) {

@@ -130,8 +130,6 @@ test('[CP-08] every report member the composer uses is checked against the docum
     ['xref-startxref', (r) => (r.xref.startxref = base.length + 10)],
     ['xref-kind', (r) => (r.xref.kind = 'stream')],
     ['xref-shape', (r) => (r.xref.kind = 'hybrid')],
-    ['xref-size', (r) => (r.xref.size = 8_388_609)],
-    ['xref-size', (r) => (r.xref.size = 8_388_605)],
     ['trailer-root', (r) => (r.trailer.root = [99, 0])],
     ['catalog-type', (r) => (r.trailer.root = [4, 0])],
     ['trailer-id', (r) => (r.trailer.id = ['zz', 'zz'])],
@@ -151,7 +149,6 @@ test('[CP-08] every report member the composer uses is checked against the docum
     ['catalog-missing', (r) => delete r.objects['1']],
     ['report-depth', (r) => (catalog(r).Deep = nested())],
     ['name-character', (r) => (catalog(r).Bad = { name: 'xĀ' })],
-    ['name-character', (r) => (catalog(r)['K\u0000'] = 1)],
     ['string-not-hex', (r) => (catalog(r).Bad = { hex: 'zz' })],
     ['value-shape', (r) => (catalog(r).Bad = { dict: {}, name: 'x' })],
     ['value-shape', (r) => (catalog(r).Bad = 'text')],
@@ -177,9 +174,14 @@ test('[CP-08] every report member the composer uses is checked against the docum
       where,
     );
   }
-  // Form shapes the composer cannot extend are 422 unsupported_pdf with the predicate's
-  // details (request #45), never 500: T034 refuses such a document at upload.
+  // Report-only refusals are 422 unsupported_pdf with the predicate's details (requests #45
+  // and #46), never 500: T034 refuses such a document at upload.
   for (const [detail, mutate] of [
+    ['xref_size', (r) => (r.xref.size = 8_388_609)],
+    ['xref_size', (r) => (r.xref.size = 8_388_605)],
+    ['page_box', (r) => (r.pages[0].media_box = r.pages[0].crop_box = [0, 0, 1_000_001, 792])],
+    ['name_character', (r) => (catalog(r)['K\u0000'] = 1)],
+    ['name_character', (r) => (catalog(r).Bad = { name: 'x\u0000' })],
     ['acroform_shape', (r) => (catalog(r).AcroForm = [1, 2])],
     ['acroform_shape', (r) => (catalog(r).AcroForm = { dict: { Fields: { name: 'NotAnArray' } } })],
     ['acroform_shape', (r) => (catalog(r).AcroForm = { ref: [4, 0] })],

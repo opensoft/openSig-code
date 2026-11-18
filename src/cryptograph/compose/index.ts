@@ -38,22 +38,29 @@
 //    each side of the /Contents hex string (CP-05). byteRangeText() is the
 //    fixed-width /ByteRange writer, for T037's synthetic /Sig.
 // 7. For T034 (EA-07): estimateSealedSize(outcome.report) gives the worst-case
-//    sealed size and every refusal the composer could make from the report alone
-//    (composition_too_large, number_range, dangling_form_reference, annots_shape,
-//    acroform_shape), with object references only; the composer makes each as 422
-//    unsupported_pdf with the same detail, not retryable. bounds.ts imports nothing.
+//    sealed size and every refusal the composer could make from the report alone, in
+//    the order of SEAL_REFUSAL_DETAILS (composition_too_large, number_range,
+//    dangling_form_reference, annots_shape, acroform_shape, xref_size, page_box,
+//    name_character; T034 takes the first), with object references only; the
+//    composer makes each as 422 unsupported_pdf with the same detail, not retryable.
+//    bounds.ts imports nothing.
+// 8. For T007's prepare check (request #46): placeField(page, rect), the rule the
+//    composer places every field with, over page = { rotate, box: centipointBox(
+//    media_box) }; null means the composer refuses the field with 400 field_too_small.
 
 import { parsePdf, type ParseOutcome } from '../../pdf/service.ts';
 import { checkRequest, composeFromReport, type ComposedRevision, type ComposeRequest } from './compose.ts';
 import { fromParseOutcome, parseRejected } from './errors.ts';
 
 export {
+  centipointBox,
   estimateSealedSize,
   MAX_SEALED_PDF_BYTES,
   SEAL_REFUSAL_DETAILS,
   UPDATE_BOUND,
   UPDATE_REQUEST_BOUND,
   withinSealedBound,
+  type CentipointBox,
   type ObjectRef,
   type SealableReport,
   type SealedSizeEstimate,
@@ -77,7 +84,7 @@ export {
   type FieldManifestInput,
   type FieldValueInput,
 } from './compose.ts';
-export { encodeWinAnsi } from './appearance.ts';
+export { encodeWinAnsi, placeField, type NormalizedRect, type PageGeometry, type Placement } from './appearance.ts';
 export { ComposeError, fromParseOutcome, type ComposeErrorCode, type ComposeErrorDetail, type ParseRefusal } from './errors.ts';
 
 /** Compose the seal revision of `request.document` (see the header for the contract). */
