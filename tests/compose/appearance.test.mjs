@@ -210,6 +210,33 @@ test('[CP-04] a typed character outside WinAnsiEncoding is refused with 422 unsu
   );
 });
 
+test('[CP-04] the 422 for an unsupported character comes after each 400 rule: the time, the certificate, the digest, the page and the field size', async () => {
+  // Request #44 (T036-FIXES): the recheck saw the 422 before each of these five rules.
+  const base = fixture('single-page.pdf');
+  const rect = { x: 0.1, y: 0.7, width: 0.4, height: 0.06 };
+  const request = (fieldInput, overrides = {}) => composeRequest(base, [fieldInput], [approval(RECIPIENT_1, [typed('sig_1', '中')])], overrides);
+  const valid = field('sig_1', 1, rect);
+  const badDigest = request(valid);
+  badDigest.fieldManifest = { ...badDigest.fieldManifest, document_digest: 'Z'.repeat(64) };
+  const pairs = [
+    ['invalid_time', request(valid, { sealTime: 'not a time' })],
+    ['invalid_certificate', request(valid, { certificateDer: 'not der' })],
+    ['invalid_digest', badDigest],
+    ['page_out_of_range', request(field('sig_1', 2, rect))],
+    // Narrower than one centipoint on the 612-point page: x0 = x1 = 30600.
+    ['field_too_small', request(field('sig_1', 1, { x: 0.5, y: 0.6, width: 0.000001, height: 0.05 }))],
+  ];
+  for (const [rule, input] of pairs) {
+    await assert.rejects(
+      composeSealRevision(input),
+      (error) => error instanceof ComposeError && error.status === 400 && error.code === 'invalid_request' && error.details[0].code === rule && error.retryable === false,
+      rule,
+    );
+  }
+  // Without the 400 defect the same request is the 422.
+  await assert.rejects(composeSealRevision(request(valid)), (error) => error instanceof ComposeError && error.status === 422 && error.code === 'unsupported_characters');
+});
+
 test('[CP-04] text fits at one em per character in the narrowest valid field: 80 characters, and two characters, one centipoint wide', async () => {
   const base = fixture('single-page.pdf');
   // One centipoint on the 612-point page: x0 = round(0.5 x 61200) = 30600, x1 = 30601.

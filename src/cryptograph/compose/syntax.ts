@@ -17,7 +17,7 @@
 // whole report share one node budget, so a lying report fails closed with
 // report-invalid instead of costing unbounded work.
 
-import { reportInvalid } from './errors.ts';
+import { numberRange, reportInvalid } from './errors.ts';
 
 /** `units / 10^scale` as an exact decimal: no exponent, no rounding, trailing zeros dropped. */
 export function decimal(units: number, scale: number): string {
@@ -43,7 +43,8 @@ export function reportNumber(value: number): string {
   if (!Number.isFinite(value)) throw reportInvalid('number-not-finite');
   if (Object.is(value, -0)) return '0';
   const text = String(value);
-  if (text.includes('e')) throw reportInvalid('number-range');
+  // Only values the composer writes reach here (request #44, T036-NUMRANGE).
+  if (text.includes('e')) throw numberRange();
   return text;
 }
 
@@ -126,6 +127,46 @@ export function serializeValue(value: unknown, budget: ValueBudget, depth = 0): 
     const parts: string[] = [];
     for (const entryKey of Object.keys(inner)) parts.push(`${pdfName(entryKey)} ${serializeValue(inner[entryKey], budget, depth + 1)}`);
     return parts.length === 0 ? '<< >>' : `<< ${parts.join(' ')} >>`;
+  }
+  throw reportInvalid('value-shape');
+}
+
+/**
+ * Check one JSON-form value's shape without writing it: the same rules, node budget
+ * and depth ceiling as serializeValue, with any finite number allowed. checkReport
+ * runs it on every reported value; numbers are judged only where they are written.
+ */
+export function checkValue(value: unknown, budget: ValueBudget, depth = 0): void {
+  budget.nodes -= 1;
+  if (budget.nodes < 0) throw reportInvalid('report-nodes');
+  if (depth > budget.maxDepth) throw reportInvalid('report-depth');
+  if (value === null || value === true || value === false) return;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw reportInvalid('number-not-finite');
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) checkValue(item, budget, depth + 1);
+    return;
+  }
+  if (!isRecord(value)) throw reportInvalid('value-shape');
+  const key = wrapperKey(value);
+  const inner = key === null ? undefined : value[key];
+  if (key === 'name' && typeof inner === 'string') {
+    pdfName(inner);
+    return;
+  }
+  if (key === 'hex' && typeof inner === 'string') {
+    pdfHexString(inner);
+    return;
+  }
+  if (key === 'ref' && isRefPair(inner)) return;
+  if (key === 'dict' && isRecord(inner)) {
+    for (const entryKey of Object.keys(inner)) {
+      pdfName(entryKey);
+      checkValue(inner[entryKey], budget, depth + 1);
+    }
+    return;
   }
   throw reportInvalid('value-shape');
 }

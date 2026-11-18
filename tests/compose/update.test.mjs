@@ -27,9 +27,11 @@ import {
   lastSection,
   latin1,
   literalOf,
+  maximalRequest,
   objectText,
   plainDocument,
   sharedAnnotsDocument,
+  sigFlagsDocument,
   RECIPIENT_1,
   RECIPIENT_2,
   refList,
@@ -161,42 +163,28 @@ test('[CP-01] a hybrid base gets a classic table, a twice-revised base chains to
   assert.equal(roundTripReason(await parsePdf(afterShared.bytes)), '422 already-signed');
 });
 
-/** `count` points in 50 strokes, with coordinates spread over 0..10000. */
-function strokesOf(count) {
-  return Array.from({ length: 50 }, (_, s) =>
-    Array.from({ length: count / 50 }, (_, i) => [(i * 7919 + s * 104729) % 10001, (i * 6007 + s * 3001) % 10001]),
-  );
-}
-
-test('[CP-01] the largest request the budgets allow stays under the update bound the module header states', async () => {
-  // The largest page (14,400 points), 20 fields across the page width, a 16 KiB certificate,
-  // and per approval 15,000 points (10,000 + 5,000 in 50-stroke values) plus 8 typed 80-character values.
-  const base = plainDocument({ page: '/MediaBox [0 0 14400 14400]' });
+test('[CP-01] the largest request the budgets allow, on the largest page box a report admits, stays under the update bound the module header states', async () => {
+  // 20 fields across the page width, a 16 KiB certificate, and per approval 15,000 points
+  // (10,000 + 5,000 in 50-stroke values) plus 8 typed 80-character values (maximalRequest),
+  // on a 14,400-point page and on the largest box report.ts admits (+-1,000,000 points),
+  // whose coordinates are the longest the appearance streams can carry (T036-FIXES).
   const certificate = largestCertificate();
   assert.ok(certificate.length > 16_000 && certificate.length <= 16_384, `a certificate of ${certificate.length} bytes`);
-  const fields = [];
-  const approvals = [];
-  [RECIPIENT_1, RECIPIENT_2].forEach((recipient, a) => {
-    const values = [];
-    for (let i = 0; i < 10; i += 1) {
-      const key = `f_${a * 10 + i}`;
-      fields.push(field(key, 1, { x: 0, y: (a * 10 + i) * 0.05, width: 0.99999, height: 0.0499 }, { recipient, ordinal: a + 1 }));
-      values.push(i === 0 ? drawn(key, strokesOf(10_000)) : i === 1 ? drawn(key, strokesOf(5_000)) : typed(key, 'W'.repeat(80)));
+  for (const box of ['[0 0 14400 14400]', '[-1000000 -1000000 1000000 1000000]']) {
+    const base = plainDocument({ page: `/MediaBox ${box}` });
+    const revision = await composeSealRevision(maximalRequest(base, 1, { certificateDer: certificate }));
+    const update = revision.bytes.length - revision.documentLength;
+    const baseSize = lastSection(base).size;
+    const text = latin1(revision.bytes);
+    let rewritten = 0;
+    for (const [num, entry] of lastSection(revision.bytes).entries) {
+      if (num < baseSize) rewritten += text.indexOf('endobj\n', entry.offset) + 'endobj\n'.length - entry.offset;
     }
-    approvals.push(approval(recipient, values));
-  });
-  const revision = await composeSealRevision(composeRequest(base, fields, approvals, { certificateDer: certificate }));
-  const update = revision.bytes.length - revision.documentLength;
-  const baseSize = lastSection(base).size;
-  const text = latin1(revision.bytes);
-  let rewritten = 0;
-  for (const [num, entry] of lastSection(revision.bytes).entries) {
-    if (num < baseSize) rewritten += text.indexOf('endobj\n', entry.offset) + 'endobj\n'.length - entry.offset;
+    const pathLines = (text.slice(revision.documentLength).match(/^\S+ \S+ [ml]$/gm) ?? []).length;
+    assert.equal(pathLines, 30_000, `${box}: every point of both approvals is drawn`);
+    assert.ok(update - rewritten <= UPDATE_REQUEST_BOUND, `${box}: the request part is ${update - rewritten} bytes`);
+    assert.ok(update <= UPDATE_BOUND, `${box}: the update is ${update} bytes`);
   }
-  const pathLines = (text.slice(revision.documentLength).match(/^\S+ \S+ [ml]$/gm) ?? []).length;
-  assert.equal(pathLines, 30_000, 'every point of both approvals is drawn');
-  assert.ok(update - rewritten <= UPDATE_REQUEST_BOUND, `the request part is ${update - rewritten} bytes`);
-  assert.ok(update <= UPDATE_BOUND, `the update is ${update} bytes`);
 });
 
 test('[CP-02] a base without a form gains an AcroForm holding one signature field, whose widgets sit in their page /Annots', async () => {
@@ -310,6 +298,52 @@ test('[CP-02] an existing form keeps its fields, keys and flags combined with 3;
       what,
     );
   }
+});
+
+test('[CP-02] /SigFlags keeps every base bit and adds 3; a value that is not a 32-bit flag word is written as 3', async () => {
+  // Request #44 (T036-FIXES): flags are combined with a bitwise OR, never replaced by 3.
+  const cases = [
+    ['4', 7],
+    ['3', 3],
+    ['2147483648', 2_147_483_651],
+    ['4294967295', 4_294_967_295],
+    ['4294967296', 3],
+    ['-1', 3],
+    ['1.5', 3],
+    ['/Four', 3],
+  ];
+  for (const [base, written] of cases) {
+    const document = plainDocument({ catalog: `/AcroForm << /Fields [] /SigFlags ${base} >>` });
+    const revision = await composeSealRevision(simpleRequest(document));
+    const catalog = sectionObjects(revision.bytes, lastSection(revision.bytes)).get(1);
+    assert.equal(Number(/\/SigFlags (\d+)\b/.exec(catalog)?.[1]), written, `/SigFlags ${base}`);
+    assert.equal(roundTripReason(await parsePdf(revision.bytes)), '422 already-signed', `/SigFlags ${base} round trip`);
+  }
+
+  // An indirect /SigFlags, through the actual parse service and the public entry point
+  // (request #45): the report carries a non-negative integer target and nothing else it
+  // could name, at the object cap (catalog, AcroForm, /Fields, /SigFlags, page, /Annots),
+  // and the flags are combined with 3 exactly as a direct value is. Any other target: 3.
+  const indirect = [
+    [4, 4, 7],
+    [2_147_483_648, 2_147_483_648, 2_147_483_651],
+    ['<< /V 4 >>', undefined, 3],
+    ['[4]', undefined, 3],
+    ['-4', undefined, 3],
+  ];
+  for (const [body, reported, written] of indirect) {
+    const document = sigFlagsDocument(body, { indirect: true });
+    const parsed = await parsePdf(document);
+    assert.ok(parsed.ok, `indirect ${body} parses`);
+    assert.deepEqual(parsed.report.objects['8'], reported === undefined ? undefined : { gen: 0, value: reported }, `indirect ${body}: reported`);
+    assert.equal(Object.keys(parsed.report.objects).length, reported === undefined ? 5 : 6, `indirect ${body}: objects`);
+    const revision = await composeSealRevision(simpleRequest(document));
+    const form = sectionObjects(revision.bytes, lastSection(revision.bytes)).get(6);
+    assert.equal(Number(/\/SigFlags (\d+)\b/.exec(form)?.[1]), written, `indirect ${body}: written`);
+    assert.doesNotMatch(form, /\/SigFlags \d+ \d+ R/, 'the flags are written directly');
+  }
+  const control = await composeSealRevision(simpleRequest(sigFlagsDocument(4)));
+  assert.match(sectionObjects(control.bytes, lastSection(control.bytes)).get(6), /\/SigFlags 7\b/, 'the direct control');
 });
 
 test('[CP-06] equal inputs give identical bytes with no clock or randomness; value order is irrelevant; the seal time changes only /M and the revision identifier', async (t) => {

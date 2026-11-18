@@ -18,8 +18,10 @@
 // indirect /Fields or /Annots array is copied inline into the rewritten
 // dictionary, so an array shared elsewhere is never changed. Existing fields,
 // unsigned signature fields and /NeedAppearances are left as they are. A form
-// reference that resolves to nothing is refused (422 dangling_form_reference).
-// Objects are written in ascending number.
+// reference that resolves to nothing is refused (422 dangling_form_reference); a
+// page /Annots that is not an array (422 annots_shape); an AcroForm that is not a
+// dictionary, whose /Fields is not an array, or that is a page receiving a widget
+// (422 acroform_shape). Objects are written in ascending number.
 //
 // The seal field (request #43): /FT /Sig, partial name `opensig-seal-` and the first
 // 16 hex digits of the document digest, one widget kid per manifest field in
@@ -68,6 +70,18 @@
 // - In all, at most UPDATE_BOUND = 90,565,440 bytes. A real base adds only its own
 //   catalog, form and pages, so a maximal request on a small base stays near the
 //   request bound (CP-01).
+// Both constants live in bounds.ts with MAX_SEALED_PDF_BYTES (48 MiB) and the upload
+// predicate (request #44). The composer refuses a composition above the bound as an
+// invariant (422 unsupported_pdf, detail composition_too_large, not retryable),
+// stopping as soon as the objects it writes cross it; an uploaded document cannot
+// reach it once T034 applies the predicate. Numbers are checked only in the objects
+// the composer rewrites (detail number_range, not retryable); the base bytes are
+// never re-read, so a number anywhere else never matters. These five report-only
+// refusals (composition_too_large, number_range, dangling_form_reference,
+// annots_shape, acroform_shape) are the ones the predicate reports for T034 (request
+// #45); after upload each is a broken invariant, 422 unsupported_pdf, not retryable.
+// Rewrites count depth but no nodes: the report's node budget and the size bound
+// already bound them, and a composition-time node limit could strand a document.
 
 import { createHash } from 'node:crypto';
 
@@ -100,7 +114,18 @@ import {
   type Placement,
   type StrokePoint,
 } from './appearance.ts';
-import { certificateInvalid, danglingReference, documentDigestMismatch, inputInvalid, reportInvalid, unsupportedCharacters } from './errors.ts';
+import { withinSealedBound } from './bounds.ts';
+import {
+  acroformShape,
+  annotsShape,
+  certificateInvalid,
+  compositionTooLarge,
+  danglingReference,
+  documentDigestMismatch,
+  inputInvalid,
+  reportInvalid,
+  unsupportedCharacters,
+} from './errors.ts';
 import { checkReport, MAX_OBJECT_NUMBER, typedDict, type CheckedObject, type CheckedPage } from './report.ts';
 import { dictEntries, entryOf, isCalendarDate, pdfAsciiString, pdfDate, pdfRef, refValue, rewriteDict, serializeValue, type Ref, type ValueBudget } from './syntax.ts';
 import { classicSection, streamSection, type XrefEntry } from './xref.ts';
@@ -113,10 +138,6 @@ export const SEAL_FIELD_PREFIX = 'opensig-seal-';
 export const SEAL_REASON = 'Organization seal. The signing time is unsigned server time, not a trusted timestamp.';
 /** A date widget's annotation /Contents text, exactly (request #43). */
 export const DATE_WIDGET_CONTENTS = 'Date from unsigned server time (UTC)';
-/** The update-size bound from the request alone (see the header). */
-export const UPDATE_REQUEST_BOUND = 1_100_000;
-/** The worst-case update size (see the header). */
-export const UPDATE_BOUND = 90_565_440;
 
 /** The seal field's partial name for a document whose SHA-256 is `documentDigest`. */
 export function sealFieldName(documentDigest: string): string {
@@ -194,6 +215,8 @@ export interface CheckedRequest {
   readonly documentDigest: string;
   readonly fields: readonly CheckedField[];
   readonly values: ReadonlyMap<string, CheckedValue>;
+  /** The first typed value outside WinAnsiEncoding, refused with 422 after every 400 rule. */
+  readonly unsupported: string | null;
   readonly sealDate: string;
   readonly signedDataLength: number;
 }
@@ -245,7 +268,7 @@ function checkStrokes(value: unknown, at: string): { strokes: StrokePoint[][]; p
 }
 
 /** Each manifest field's value, from the approval of the field's own recipient. */
-function checkValues(approvals: unknown, fields: readonly CheckedField[]): Map<string, CheckedValue> {
+function checkValues(approvals: unknown, fields: readonly CheckedField[]): { values: Map<string, CheckedValue>; unsupported: string | null } {
   if (!Array.isArray(approvals) || approvals.length < 1 || approvals.length > 2) throw inputInvalid('approvals', 'invalid_count');
   const byKey = new Map(fields.map((field) => [field.key, field] as const));
   const values = new Map<string, CheckedValue>();
@@ -303,9 +326,9 @@ function checkValues(approvals: unknown, fields: readonly CheckedField[]): Map<s
     if (points > MAX_POINTS_PER_APPROVAL) throw inputInvalid(`${at}.field_values`, 'point_budget');
   });
   for (const field of fields) if (!seen.has(field.key)) throw inputInvalid(`${field.at}.key`, 'value_missing');
-  // 422 comes after every 400 rule, as at approval (T010), so the shape is judged first.
-  if (unsupported !== null) throw unsupportedCharacters(unsupported);
-  return values;
+  // The 422 waits until every 400 rule has been judged, including those that need the
+  // parse report (page_out_of_range, field_too_small): composeFromReport throws it (CP-04).
+  return { values, unsupported };
 }
 
 /**
@@ -321,11 +344,14 @@ export function checkRequest(request: unknown): CheckedRequest {
   const { document, fieldManifest, approvals, sealTime, certificateDer } = request;
   if (!(document instanceof Uint8Array) || document.length < 1 || document.length > MAX_DOCUMENT_BYTES) throw inputInvalid('document', 'invalid_document');
   const fields = checkFields(fieldManifest);
-  const values = checkValues(approvals, fields);
+  const { values, unsupported } = checkValues(approvals, fields);
+  // Every remaining 400 rule, then the 500s; the 422 for unsupported characters comes later.
   if (typeof sealTime !== 'string') throw inputInvalid('sealTime', 'invalid_time');
   const sealDate = pdfDate(sealTime);
   if (sealDate === null) throw inputInvalid('sealTime', 'invalid_time');
   if (!(certificateDer instanceof Uint8Array)) throw inputInvalid('certificateDer', 'invalid_certificate');
+  const frozenDigest = isRecord(fieldManifest) ? fieldManifest['document_digest'] : undefined;
+  if (typeof frozenDigest !== 'string' || !DIGEST_PATTERN.test(frozenDigest)) throw inputInvalid('fieldManifest.document_digest', 'invalid_digest');
   let length: number;
   try {
     length = signedDataLength(Uint8Array.from(certificateDer));
@@ -335,10 +361,8 @@ export function checkRequest(request: unknown): CheckedRequest {
   }
   const copy = Uint8Array.from(document);
   const documentDigest = createHash('sha256').update(copy).digest('hex');
-  const frozenDigest = isRecord(fieldManifest) ? fieldManifest['document_digest'] : undefined;
-  if (typeof frozenDigest !== 'string' || !DIGEST_PATTERN.test(frozenDigest)) throw inputInvalid('fieldManifest.document_digest', 'invalid_digest');
   if (frozenDigest !== documentDigest) throw documentDigestMismatch();
-  return Object.freeze({ document: copy, documentDigest, fields: Object.freeze(fields), values, sealDate, signedDataLength: length });
+  return Object.freeze({ document: copy, documentDigest, fields: Object.freeze(fields), values, unsupported, sealDate, signedDataLength: length });
 }
 
 // --- the result --------------------------------------------------------------------------------
@@ -403,14 +427,28 @@ function mergedArray(value: unknown, objects: ReadonlyMap<number, CheckedObject>
       if (found === undefined || found.gen !== ref[1]) throw danglingReference(what);
       resolved = found.value;
     }
-    if (!Array.isArray(resolved)) throw reportInvalid(`${what}-shape`);
+    if (!Array.isArray(resolved)) throw what === 'annots' ? annotsShape() : acroformShape();
     items = resolved;
   }
   return `[${[...items.map((item) => serializeValue(item, budget, 1)), ...additions].join(' ')}]`;
 }
 
-function sigFlagsOf(value: unknown): number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 0x7fffffff ? (value | SIG_FLAGS) >>> 0 : SIG_FLAGS;
+/** The largest /SigFlags value combined rather than replaced: an unsigned 32-bit integer. */
+const MAX_SIG_FLAGS = 0xffff_ffff;
+
+/**
+ * The AcroForm's new /SigFlags (CP-02): an integer from 0 to 4294967295, given
+ * directly or through a reference the report resolves, combined with 3 by bitwise OR
+ * (as an unsigned 32-bit value); any other value is replaced by 3.
+ */
+function sigFlagsOf(value: unknown, objects: ReadonlyMap<number, CheckedObject>): number {
+  const ref = refValue(value);
+  let flags: unknown = value;
+  if (ref !== null) {
+    const found = objects.get(ref[0]);
+    flags = found !== undefined && found.gen === ref[1] ? found.value : undefined;
+  }
+  return typeof flags === 'number' && Number.isSafeInteger(flags) && flags >= 0 && flags <= MAX_SIG_FLAGS ? (flags | SIG_FLAGS) >>> 0 : SIG_FLAGS;
 }
 
 const ASCII = /^[\x00-\x7f]*$/;
@@ -427,17 +465,26 @@ function streamBody(dict: string, content: string): string {
 export function composeFromReport(request: CheckedRequest, report: unknown): ComposedRevision {
   const { document } = request;
   const checked = checkReport(document, request.documentDigest, report);
-  const { objects, budget } = checked;
+  const { objects } = checked;
+  // checkReport bounded every reported value's nodes and depth once. What the rewrites
+  // serialize is bounded by the output bound below, so they count depth only: inline
+  // copies of a shared array never exhaust a node budget an honest document fits.
+  const budget: ValueBudget = { nodes: Number.POSITIVE_INFINITY, maxDepth: checked.budget.maxDepth };
 
   // Pages and placements first: a field on a page the document lacks is a request defect.
-  const placed = request.fields.map((field) => {
+  const located = request.fields.map((field) => {
     const page: CheckedPage | undefined = checked.pages[field.page - 1];
     if (page === undefined) throw inputInvalid(`${field.at}.page`, 'page_out_of_range');
     const placement: Placement | null = placeField(page, field.rect);
     if (placement === null) throw inputInvalid(`${field.at}.rect`, 'field_too_small');
-    const value = request.values.get(field.key);
-    if (value === undefined) throw inputInvalid(`${field.at}.key`, 'value_missing');
-    return { field, page, placement, value };
+    return { field, page, placement };
+  });
+  // Every 400 rule has now been judged: only then the 422 (CP-04).
+  if (request.unsupported !== null) throw unsupportedCharacters(request.unsupported);
+  const placed = located.map((item) => {
+    const value = request.values.get(item.field.key);
+    if (value === undefined) throw inputInvalid(`${item.field.at}.key`, 'value_missing');
+    return { ...item, value };
   });
 
   // Object numbers, in a fixed order from the base's /Size.
@@ -453,8 +500,12 @@ export function composeFromReport(request: CheckedRequest, report: unknown): Com
   const signature = take();
 
   const written = new Map<number, WrittenObject>();
+  // The bound as an invariant: refuse as soon as what is written crosses it.
+  let pending = document.length;
   const write = (num: number, gen: number, body: string, what: string): void => {
     if (written.has(num)) throw reportInvalid(`${what}-rewritten-twice`);
+    pending += body.length;
+    if (!withinSealedBound(pending)) throw compositionTooLarge();
     written.set(num, { num, gen, body });
   };
 
@@ -463,6 +514,9 @@ export function composeFromReport(request: CheckedRequest, report: unknown): Com
   const formValue = entryOf(catalog, 'AcroForm');
   const fieldRef = `${signatureField} 0 R`;
   let acroForm: number;
+  // The AcroForm's own object when it is indirect: if it is also a page that gains widgets,
+  // that object would be written twice, so the form is refused as acroform_shape.
+  let formObject: number | null = null;
   if (formValue === undefined || formValue === null) {
     acroForm = take();
     write(acroForm, 0, `<< /Fields [${fieldRef}] /SigFlags ${SIG_FLAGS} >>`, 'acroform');
@@ -477,9 +531,10 @@ export function composeFromReport(request: CheckedRequest, report: unknown): Com
     } else {
       formEntries = dictEntries(formValue);
     }
-    if (formEntries === null) throw reportInvalid('acroform-shape');
+    if (formEntries === null) throw acroformShape();
+    formObject = formRef === null ? null : formRef[0];
     const fields = mergedArray(entryOf(formEntries, 'Fields'), objects, [fieldRef], 'fields', budget);
-    const flags = String(sigFlagsOf(entryOf(formEntries, 'SigFlags')));
+    const flags = String(sigFlagsOf(entryOf(formEntries, 'SigFlags'), objects));
     const form = rewriteDict(formEntries, [['Fields', fields], ['SigFlags', flags]], budget);
     if (formRef !== null) {
       acroForm = formRef[0];
@@ -497,6 +552,7 @@ export function composeFromReport(request: CheckedRequest, report: unknown): Com
   for (const page of checked.pages) {
     const refs = numbered.filter((item) => item.page.number === page.number).map((item) => `${item.widget} 0 R`);
     if (refs.length === 0) continue;
+    if (page.ref[0] === formObject) throw acroformShape();
     const entries = typedDict(objects, page.ref, 'Page', 'page');
     write(page.ref[0], page.ref[1], rewriteDict(entries, [['Annots', mergedArray(entryOf(entries, 'Annots'), objects, refs, 'annots', budget)]], budget), 'page');
   }
@@ -556,6 +612,7 @@ export function composeFromReport(request: CheckedRequest, report: unknown): Com
   const trailer = { size, root: checked.root, info: checked.info, id, prev: checked.startxref };
   const section = xrefSelf === null ? classicSection(entries, trailer, at) : streamSection(entries, xrefSelf, trailer, at);
 
+  if (!withinSealedBound(document.length + appended.length + section.length)) throw compositionTooLarge();
   const bytes = Buffer.concat([document, appended, section]);
   const second = bytes.length - start;
   bytes.write(byteRangeText(first, start, second), slotAt, 'latin1');

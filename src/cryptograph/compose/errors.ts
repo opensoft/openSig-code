@@ -14,11 +14,19 @@
 //   cannot represent (T010 refuses it at approval; the composer again,
 //   defensively). Not retryable.
 // - 422 unsupported_pdf: a page whose effective CropBox differs from its MediaBox
-//   (detail cropbox_differs, A-008 S2, CP-07), or a form reference (/AcroForm,
-//   /Fields, page /Annots) that resolves to nothing (detail
-//   dangling_form_reference). Not retryable.
+//   (detail cropbox_differs, A-008 S2, CP-07); and the five refusals the composer
+//   can make from the parse report alone (requests #44 and #45), which T034 makes
+//   at upload with the same details (EA-07, bounds.ts estimateSealedSize), so after
+//   upload each is a broken invariant: a composition above MAX_SEALED_PDF_BYTES
+//   (composition_too_large); an exponent-form number in an object the composer
+//   rewrites (number_range); a form reference (/AcroForm, /Fields, page /Annots)
+//   that resolves to nothing (dangling_form_reference); a page /Annots that is not
+//   an array (annots_shape); an AcroForm that is not a dictionary, whose /Fields is
+//   not an array, or that is a page the composer also rewrites (acroform_shape).
+//   Not retryable.
 // - 413, 422, 429 and 500 from the parse service, passed through with the
-//   service's code, reason and detail; retryable for 429 and 500 only.
+//   service's code and reason and a fixed machine detail, never the service's
+//   text; retryable for 429 and 500 only.
 // - The composer's own 500s, not retryable: report-invalid (the parse report fails
 //   the composer's checks, A-009 LBR-4, CP-08), document-digest-mismatch (the
 //   stored document is not the one the manifest froze) and certificate-invalid.
@@ -94,6 +102,20 @@ export function danglingReference(what: string): ComposeError {
   ]);
 }
 
+/** 422 (CP-02; request #45): a page /Annots, inline or by reference, that is not an array. */
+export function annotsShape(): ComposeError {
+  return new ComposeError('unsupported_pdf', 'unsupported-feature', 'annots_shape', 'the document has a page annotation list the composer cannot extend', [
+    { field: 'annots', code: 'annots_shape' },
+  ]);
+}
+
+/** 422 (CP-02; request #45): the AcroForm is not a dictionary, its /Fields is not an array, or it is a page the composer also rewrites. */
+export function acroformShape(): ComposeError {
+  return new ComposeError('unsupported_pdf', 'unsupported-feature', 'acroform_shape', 'the document has a form the composer cannot extend', [
+    { field: 'acroform', code: 'acroform_shape' },
+  ]);
+}
+
 /** 500 (CP-08): the parse report fails the composer's own check `what`. */
 export function reportInvalid(what: string): ComposeError {
   return new ComposeError('internal', 'report-invalid', what, 'the document could not be composed', [{ field: 'report', code: what }]);
@@ -118,10 +140,33 @@ export interface ParseRefusal {
   readonly detail: string;
 }
 
-/** A parse-service refusal, with the service's code, reason and detail; retryable for 429 and 500 only. */
+/** 422 (CP-08, T036-NUMRANGE): an object the composer rewrites holds an exponent-form number (T034's upload detail). */
+export function numberRange(): ComposeError {
+  return new ComposeError('unsupported_pdf', 'number-range', 'number_range', 'the document has a number the composer cannot write', [
+    { field: 'document', code: 'number_range' },
+  ]);
+}
+
+/** 422 (SIZE-BOUND): the composition would exceed MAX_SEALED_PDF_BYTES (T034's upload detail); an invariant. */
+export function compositionTooLarge(): ComposeError {
+  return new ComposeError('unsupported_pdf', 'composition-too-large', 'composition_too_large', 'the sealed document would exceed its size bound', [
+    { field: 'document', code: 'composition_too_large' },
+  ]);
+}
+
+/** Parse-service details that are fixed machine codes and may be carried as they are. */
+const FIXED_PARSE_DETAILS: ReadonlySet<string> = new Set(['cropbox_differs']);
+
+/**
+ * A parse-service refusal, with the service's code and reason; retryable for 429 and
+ * 500 only. `detail` is a fixed machine detail (CP-08, request #44): the service's
+ * detail when it is one of FIXED_PARSE_DETAILS, otherwise the service's reason. The
+ * service's free text (for example "reference to missing object 5") never passes.
+ */
 export function fromParseOutcome(outcome: ParseRefusal): ComposeError {
   const retryable = outcome.code === 'rate_limited' || outcome.code === 'internal';
-  return new ComposeError(outcome.code, outcome.reason, outcome.detail, 'the document could not be composed', [{ field: 'document', code: outcome.reason }], retryable);
+  const detail = FIXED_PARSE_DETAILS.has(outcome.detail) ? outcome.detail : outcome.reason;
+  return new ComposeError(outcome.code, outcome.reason, detail, 'the document could not be composed', [{ field: 'document', code: outcome.reason }], retryable);
 }
 
 /** A parse call that rejected instead of resolving: a parse-service failure, so retryable. */

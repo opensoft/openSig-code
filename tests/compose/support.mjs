@@ -203,6 +203,27 @@ export function formDocument({ form = 'indirect', fields = 'inline', annots = 'i
   return classicDocument(bodies, { trailer: '/ID [<00112233445566778899aabbccddeeff> <00112233445566778899aabbccddeeff>]' });
 }
 
+/**
+ * An ordinary form whose report reaches the object cap (4 + 2 x pages, request #45): catalog
+ * 1 with an indirect AcroForm 6 whose indirect /Fields array 9 holds one unsigned text field
+ * 7, also in page 3's indirect /Annots array 10. `sigFlags` is written directly, or, with
+ * `indirect`, as object 8 holding it (an integer, or any other body).
+ */
+export function sigFlagsDocument(sigFlags, { indirect = false } = {}) {
+  return classicDocument([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>',
+    '<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R /Annots 10 0 R >>',
+    streamBody('', PAGE_TEXT),
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>',
+    `<< /Fields 9 0 R /DA (/Helv 0 Tf 0 g) /SigFlags ${indirect ? '8 0 R' : sigFlags} >>`,
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (existing_text) /Rect [72 600 272 620] /P 3 0 R /F 4 >>',
+    indirect ? String(sigFlags) : '<< >>',
+    '[7 0 R]',
+    '[7 0 R]',
+  ]);
+}
+
 /** Two pages (3 and 4) whose /Annots is one shared indirect array (object 7) holding link 6. */
 export function sharedAnnotsDocument() {
   return classicDocument([
@@ -214,6 +235,72 @@ export function sharedAnnotsDocument() {
     '<< /Type /Annot /Subtype /Link /Rect [72 560 172 580] /Border [0 0 0] >>',
     '[6 0 R]',
   ]);
+}
+
+/** `count` points in 50 strokes, with coordinates spread over 0..10000. */
+export function strokesOf(count) {
+  return Array.from({ length: 50 }, (_, s) => Array.from({ length: count / 50 }, (_, i) => [(i * 7919 + s * 104729) % 10001, (i * 6007 + s * 3001) % 10001]));
+}
+
+/**
+ * The largest request the budgets allow on a document of `pageCount` pages: 20 fields,
+ * spread over the pages in turn (so min(pageCount, 20) widget pages), 10 per recipient;
+ * per approval 15,000 points (10,000 + 5,000 in 50-stroke values) and 8 typed
+ * 80-character values; fields across the page width.
+ */
+export function maximalRequest(document, pageCount, overrides = {}) {
+  const fields = [];
+  const approvals = [];
+  [RECIPIENT_1, RECIPIENT_2].forEach((recipient, a) => {
+    const values = [];
+    for (let i = 0; i < 10; i += 1) {
+      const n = a * 10 + i;
+      const key = `f_${n}`;
+      fields.push(field(key, (n % pageCount) + 1, { x: 0, y: n * 0.05, width: 0.99999, height: 0.0499 }, { recipient, ordinal: a + 1 }));
+      values.push(i === 0 ? drawn(key, strokesOf(10_000)) : i === 1 ? drawn(key, strokesOf(5_000)) : typed(key, 'W'.repeat(80)));
+    }
+    approvals.push(approval(recipient, values));
+  });
+  return composeRequest(document, fields, approvals, overrides);
+}
+
+/**
+ * An adversarial base: 20 pages and the AcroForm's /Fields all name one shared array (5)
+ * holding one name of `length` '(' characters, each written back as three bytes (#28),
+ * so a maximal request makes the composer copy the array 21 times.
+ */
+export function adversarialDocument(length) {
+  const kids = Array.from({ length: 20 }, (_, i) => `${6 + i} 0 R`).join(' ');
+  return classicDocument([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>',
+    `<< /Type /Pages /Kids [${kids}] /Count 20 /MediaBox [0 0 612 792] >>`,
+    streamBody('', ''),
+    '<< /Fields 5 0 R >>',
+    `[/${'#28'.repeat(length)}]`,
+    ...Array.from({ length: 20 }, () => '<< /Type /Page /Parent 2 0 R /Contents 3 0 R /Annots 5 0 R >>'),
+  ]);
+}
+
+/**
+ * Two pages (3 and 4) with an indirect /Annots array (6) on page 4 holding link 7;
+ * `numbers` places a number entry `/X <value>` on 'catalog', 'page2', 'annots' (as an
+ * extra array item) or 'info' (object 8, never reported).
+ */
+export function numberDocument(numbers = {}) {
+  const x = (where) => (numbers[where] === undefined ? '' : ` /X ${numbers[where]}`);
+  return classicDocument(
+    [
+      `<< /Type /Catalog /Pages 2 0 R${x('catalog')} >>`,
+      '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>',
+      '<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>',
+      `<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Annots 6 0 R${x('page2')} >>`,
+      streamBody('', 'q 0.5 w 72 72 m 540 72 l S Q'),
+      `[7 0 R${numbers.annots === undefined ? '' : ` ${numbers.annots}`}]`,
+      '<< /Type /Annot /Subtype /Link /Rect [72 560 172 580] /Border [0 0 0] >>',
+      `<< /Producer (synthetic)${x('info')} >>`,
+    ],
+    { trailer: '/Info 8 0 R' },
+  );
 }
 
 /** A plain one-page document (catalog 1, pages 2, page 3, font 4, contents 5). */

@@ -32,21 +32,43 @@
 //    `sealTime` reproduces the same approved_composition_digest (SC-003).
 // 5. The signed revision is the last one, and its cross-reference section is of
 //    the base's last kind (`xrefKind`), whose /Prev is the base's startxref.
+// 6. `bytes.length` <= MAX_SEALED_PDF_BYTES (48 MiB): the composer refuses anything
+//    larger (422 unsupported_pdf composition_too_large, not retryable). The /Sig dictionary is one
+//    object whose /ByteRange and /Contents are direct, with at most 4 KiB of text on
+//    each side of the /Contents hex string (CP-05). byteRangeText() is the
+//    fixed-width /ByteRange writer, for T037's synthetic /Sig.
+// 7. For T034 (EA-07): estimateSealedSize(outcome.report) gives the worst-case
+//    sealed size and every refusal the composer could make from the report alone
+//    (composition_too_large, number_range, dangling_form_reference, annots_shape,
+//    acroform_shape), with object references only; the composer makes each as 422
+//    unsupported_pdf with the same detail, not retryable. bounds.ts imports nothing.
 
 import { parsePdf, type ParseOutcome } from '../../pdf/service.ts';
 import { checkRequest, composeFromReport, type ComposedRevision, type ComposeRequest } from './compose.ts';
 import { fromParseOutcome, parseRejected } from './errors.ts';
 
 export {
+  estimateSealedSize,
+  MAX_SEALED_PDF_BYTES,
+  SEAL_REFUSAL_DETAILS,
+  UPDATE_BOUND,
+  UPDATE_REQUEST_BOUND,
+  withinSealedBound,
+  type ObjectRef,
+  type SealableReport,
+  type SealedSizeEstimate,
+  type SealRefusal,
+  type SealRefusalDetail,
+} from './bounds.ts';
+export {
   BYTE_RANGE_WIDTH,
+  byteRangeText,
   DATE_WIDGET_CONTENTS,
   SEAL_FIELD_PREFIX,
   SEAL_REASON,
   SIG_FLAGS,
   sealFieldName,
   signedRanges,
-  UPDATE_BOUND,
-  UPDATE_REQUEST_BOUND,
   WIDGET_FLAGS,
   type ApprovalInput,
   type ComposedRevision,

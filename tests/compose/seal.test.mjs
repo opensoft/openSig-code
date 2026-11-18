@@ -13,7 +13,7 @@ import { test } from 'node:test';
 import { signedDataLength } from '../../src/cryptograph/cms/index.ts';
 import { checkRequest } from '../../src/cryptograph/compose/compose.ts';
 import { ComposeError, composeSealRevision, signedRanges } from '../../src/cryptograph/compose/index.ts';
-import { fixture, lastSection, latin1, literalOf, sectionObjects, sha256, simpleRequest, syntheticCertificate } from './support.mjs';
+import { fixture, largestCertificate, lastSection, latin1, literalOf, sectionObjects, sha256, simpleRequest, syntheticCertificate } from './support.mjs';
 
 test('[CP-05] the /Sig dictionary is ETSI.CAdES.detached, labels /M as unsigned server time, and holds exact /Contents and /ByteRange placeholders', async () => {
   const base = fixture('single-page.pdf');
@@ -58,6 +58,24 @@ test('[CP-05] the /Sig dictionary is ETSI.CAdES.detached, labels /M as unsigned 
   const [splicedHead, splicedTail] = signedRanges({ bytes: spliced, byteRange: revision.byteRange });
   assert.ok(Buffer.from(splicedHead).equals(Buffer.from(head)));
   assert.ok(Buffer.from(splicedTail).equals(Buffer.from(tail)));
+});
+
+test('[CP-05] the /Sig dictionary is one object with a direct /ByteRange and /Contents, and under 4 KiB of text on each side of the hex string (T037, A4)', async () => {
+  // T037 relies on this layout to find and fill the placeholder (request #44, T036-FIXES).
+  for (const certificateDer of [syntheticCertificate(), largestCertificate()]) {
+    const revision = await composeSealRevision(simpleRequest(fixture('single-page.pdf'), 1, { certificateDer }));
+    const text = latin1(revision.bytes);
+    const begin = lastSection(revision.bytes).entries.get(revision.objects.signature).offset;
+    const end = text.indexOf('endobj', begin) + 'endobj'.length;
+    const [, first, start] = revision.byteRange;
+    assert.ok(begin < first && start < end, 'the hex string lies inside the /Sig object');
+    const object = text.slice(begin, end);
+    assert.equal(object.match(/\bobj\b/g).length, 1, 'one object');
+    assert.match(object, /\/ByteRange \[/, 'a direct /ByteRange');
+    assert.equal(text.slice(first - '/Contents '.length, first), '/Contents ', 'a direct /Contents');
+    assert.ok(first - begin < 4096, `${first - begin} bytes before the hex string`);
+    assert.ok(end - start < 4096, `${end - start} bytes after it`);
+  }
 });
 
 test('[CP-05] the /Contents placeholder follows the configured certificate, and a bad seal time or certificate is refused', async () => {

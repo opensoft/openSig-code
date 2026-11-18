@@ -17,7 +17,8 @@
 // - page geometry is consistent with its rotation, and an effective CropBox that
 //   differs from the MediaBox is refused with 422 cropbox_differs (CP-07);
 // - every reported value is shape-checked within the parser's depth limit and the
-//   report node budget (syntax.ts serializeValue).
+//   report node budget (syntax.ts checkValue); numbers are judged only where the
+//   composer writes them (request #44).
 //
 // A failure is 500 report-invalid (or 422 cropbox_differs), never a repaired guess.
 
@@ -25,7 +26,7 @@ import { createHash } from 'node:crypto';
 
 import { DEFAULT_PARSER_LIMITS, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_PAGES, reportBudget } from '../../pdf/limits.ts';
 import { cropboxDiffers, reportInvalid } from './errors.ts';
-import { dictEntries, entryOf, isRefPair, nameValue, serializeValue, type Ref, type ValueBudget } from './syntax.ts';
+import { checkValue, dictEntries, entryOf, isRefPair, nameValue, type Ref, type ValueBudget } from './syntax.ts';
 
 /** The largest indirect object number (ISO 32000-1:2008, Annex C, Table C.1). */
 export const MAX_OBJECT_NUMBER = 8_388_607;
@@ -174,7 +175,9 @@ export function checkReport(document: Uint8Array, documentDigest: string, report
   const objectsValue = report['objects'];
   if (!isRecord(objectsValue)) throw reportInvalid('objects-shape');
   const keys = Object.keys(objectsValue);
-  if (keys.length > 3 + 2 * pages.length) throw reportInvalid('objects-count');
+  // The catalog, the AcroForm, its /Fields and an indirect /SigFlags integer, plus a page and
+  // its /Annots per page: the parse service's own cap (src/pdf/service.ts validObjects; request #45).
+  if (keys.length > 4 + 2 * pages.length) throw reportInvalid('objects-count');
   const budget: ValueBudget = { nodes: reportBudget(DEFAULT_PARSER_LIMITS).nodes, maxDepth: DEFAULT_PARSER_LIMITS.maxDepth };
   const objects = new Map<number, CheckedObject>();
   for (const key of keys) {
@@ -184,8 +187,9 @@ export function checkReport(document: Uint8Array, documentDigest: string, report
     const gen = entry['gen'];
     if (!isCount(gen) || gen > 65535) throw reportInvalid('object-shape');
     const value: unknown = entry['value'];
-    // Shape, depth and node budget of the whole value, before anything reads it.
-    serializeValue(value, budget);
+    // Shape, depth and node budget of the whole value, before anything reads it. Numbers
+    // are judged only in what the composer writes (request #44, T036-NUMRANGE).
+    checkValue(value, budget);
     objects.set(Number(key), Object.freeze({ gen, value }));
   }
 

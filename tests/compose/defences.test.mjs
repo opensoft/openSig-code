@@ -13,7 +13,22 @@ import { test } from 'node:test';
 import { checkRequest, composeFromReport } from '../../src/cryptograph/compose/compose.ts';
 import { ComposeError, composeSealRevision, fromParseOutcome } from '../../src/cryptograph/compose/index.ts';
 import { parsePdf } from '../../src/pdf/service.ts';
-import { approval, composeRequest, composeSources, field, fixture, lastSection, plainDocument, RECIPIENT_1, sectionObjects, simpleRequest, typed } from './support.mjs';
+import {
+  approval,
+  composeRequest,
+  composeSources,
+  drawn,
+  field,
+  fixture,
+  lastSection,
+  numberDocument,
+  plainDocument,
+  RECIPIENT_1,
+  sectionObjects,
+  simpleRequest,
+  typed,
+  ZIGZAG,
+} from './support.mjs';
 
 const honestReport = async (bytes) => {
   const outcome = await parsePdf(bytes);
@@ -127,7 +142,8 @@ test('[CP-08] every report member the composer uses is checked against the docum
     ['page-ref', (r) => (r.pages[0].ref = [70, 0])],
     ['page-type', (r) => (r.pages[0].ref = [1, 0])],
     ['page-missing', (r) => (r.pages[0].ref = [4, 1])],
-    ['objects-count', (r) => ['2', '3', '5', '6'].forEach((key) => (r.objects[key] = { gen: 0, value: null }))],
+    // One more than 4 + 2 x pages: the catalog, AcroForm, /Fields and an indirect /SigFlags, plus a page and its /Annots.
+    ['objects-count', (r) => ['2', '3', '5', '6', '7'].forEach((key) => (r.objects[key] = { gen: 0, value: null }))],
     ['object-number', (r) => (r.objects['70'] = r.objects['1'])],
     ['object-number', (r) => (r.objects['01'] = r.objects['1'])],
     ['object-shape', (r) => (r.objects['1'].gen = 70000)],
@@ -140,16 +156,42 @@ test('[CP-08] every report member the composer uses is checked against the docum
     ['value-shape', (r) => (catalog(r).Bad = { dict: {}, name: 'x' })],
     ['value-shape', (r) => (catalog(r).Bad = 'text')],
     ['number-not-finite', (r) => (catalog(r).Bad = Number.POSITIVE_INFINITY)],
-    ['number-range', (r) => (catalog(r).Bad = 1e-7)],
-    ['number-range', (r) => (catalog(r).Bad = 1e21)],
-    ['acroform-shape', (r) => (catalog(r).AcroForm = [1, 2])],
-    ['page-rewritten-twice', (r) => (catalog(r).AcroForm = { ref: [4, 0] })],
-    ['annots-shape', (r) => (page(r).Annots = { name: 'NotAnArray' })],
   ];
   for (const [detail, mutate] of cases) {
     const lying = structuredClone(report);
     mutate(lying);
     assert.throws(() => composeFromReport(request, lying), reportInvalid(detail), detail);
+  }
+  // An exponent-form number in an object the composer rewrites (here the catalog and the widget
+  // page) is 422 number_range, not 500: T034 refuses such a document at upload (request #44).
+  for (const [where, mutate] of [
+    ['catalog 1e-7', (r) => (catalog(r).Bad = 1e-7)],
+    ['catalog 1e21', (r) => (catalog(r).Bad = 1e21)],
+    ['page 1e-7', (r) => (page(r).Bad = 1e-7)],
+  ]) {
+    const lying = structuredClone(report);
+    mutate(lying);
+    assert.throws(
+      () => composeFromReport(request, lying),
+      (error) => error instanceof ComposeError && error.status === 422 && error.code === 'unsupported_pdf' && error.detail === 'number_range' && error.retryable === false,
+      where,
+    );
+  }
+  // Form shapes the composer cannot extend are 422 unsupported_pdf with the predicate's
+  // details (request #45), never 500: T034 refuses such a document at upload.
+  for (const [detail, mutate] of [
+    ['acroform_shape', (r) => (catalog(r).AcroForm = [1, 2])],
+    ['acroform_shape', (r) => (catalog(r).AcroForm = { dict: { Fields: { name: 'NotAnArray' } } })],
+    ['acroform_shape', (r) => (catalog(r).AcroForm = { ref: [4, 0] })],
+    ['annots_shape', (r) => (page(r).Annots = { name: 'NotAnArray' })],
+  ]) {
+    const lying = structuredClone(report);
+    mutate(lying);
+    assert.throws(
+      () => composeFromReport(request, lying),
+      (error) => error instanceof ComposeError && error.status === 422 && error.code === 'unsupported_pdf' && error.detail === detail && error.retryable === false,
+      detail,
+    );
   }
   // A reference the report does not resolve is a dangling form reference (422), never followed.
   for (const [what, mutate] of [
@@ -165,6 +207,33 @@ test('[CP-08] every report member the composer uses is checked against the docum
       what,
     );
   }
+});
+
+test('[CP-08] numbers are judged only in the objects the composer rewrites: an exponent-form number elsewhere composes, one it writes is 422 number_range', async () => {
+  // Request #44 (T036-NUMRANGE), through the parse service. numberDocument: catalog 1, page 2
+  // is object 4 with an indirect /Annots array 6, Info 8.
+  const rect = { x: 0.1, y: 0.7, width: 0.35, height: 0.08 };
+  const onPage = (document, page) => composeRequest(document, [field('sig_1', page, rect)], [approval(RECIPIENT_1, [drawn('sig_1', ZIGZAG)])]);
+  const refused = (error) =>
+    error instanceof ComposeError && error.status === 422 && error.code === 'unsupported_pdf' && error.detail === 'number_range' && error.retryable === false;
+  const composes = async (document, page, what) => {
+    const revision = await composeSealRevision(onPage(document, page));
+    assert.ok(revision.bytes.length > document.length, what);
+  };
+
+  // The recheck's document: /X 0.0000001 on page 2, which gets no widget, so it is never written.
+  const page2 = numberDocument({ page2: '0.0000001' });
+  await composes(page2, 1, 'a number on a page that is not written');
+  await assert.rejects(composeSealRevision(onPage(page2, 2)), refused, 'the widget page is written');
+  // The catalog is written whenever the base has no form.
+  await assert.rejects(composeSealRevision(onPage(numberDocument({ catalog: '0.0000001' }), 1)), refused, 'catalog');
+  // Page 2's indirect /Annots array is copied inline only when page 2 is written.
+  const annots = numberDocument({ annots: '0.0000001' });
+  await composes(annots, 1, 'a number in an /Annots array that is not copied');
+  await assert.rejects(composeSealRevision(onPage(annots, 2)), refused, 'the /Annots array is copied');
+  // The Info dictionary is never written; plain decimals compose everywhere.
+  await composes(numberDocument({ info: '0.0000001' }), 2, 'info');
+  await composes(numberDocument({ page2: '0.000001', catalog: '0.000001', annots: '0.000001' }), 2, 'plain decimals');
 });
 
 test('[CP-08] every refusal carries its contract code, its status and retryable, which is true only for 429 rate_limited and the parse service\'s 500s', async () => {
@@ -214,10 +283,16 @@ test('[CP-08] every refusal carries its contract code, its status and retryable,
     ['internal', 'service-failure', true],
     ['internal', 'sandbox-unavailable', true],
   ].map(([code, reason, retryable]) => {
-    const error = fromParseOutcome({ code, reason, detail: 'synthetic' });
-    return [error.code === code, error.status === statusOf[code], error.reason === reason, error.retryable === retryable];
+    const error = fromParseOutcome({ code, reason, detail: 'reference to missing object 5' });
+    return [error.code === code, error.status === statusOf[code], error.reason === reason, error.retryable === retryable, error.detail === reason];
   });
-  for (const checks of mapped) assert.deepEqual(checks, [true, true, true, true]);
+  for (const checks of mapped) assert.deepEqual(checks, [true, true, true, true, true]);
+  // detail is a fixed machine code, never the parse service's text (request #44, T036-FIXES):
+  // through the parse service, a dangling /AcroForm's text names its object; the detail does not.
+  const dangling = await refusal(() => composeSealRevision(simpleRequest(plainDocument({ catalog: '/AcroForm 99 0 R' }))));
+  assert.deepEqual([dangling.status, dangling.code, dangling.reason, dangling.detail], [422, 'unsupported_pdf', 'malformed', 'malformed']);
+  assert.ok(!/\d/.test(dangling.detail) && !dangling.message.includes('99'), 'no document text in detail or message');
+  assert.equal(fromParseOutcome({ code: 'unsupported_pdf', reason: 'unsupported-feature', detail: 'cropbox_differs' }).detail, 'cropbox_differs', 'a fixed detail passes through');
 });
 
 test('[CP-08] report values are data: a __proto__ key is written as a PDF name, and the caller\'s buffer is copied before parsing', async () => {
