@@ -21,8 +21,12 @@ export function loadCaseManifest() {
   return JSON.parse(readFileSync(MANIFEST_URL, 'utf8'));
 }
 
-/** Synthetic approval-evidence digest: SHA-256 of a descriptor label. */
-export function syntheticDigest(label) {
+/**
+ * Synthetic approval-evidence digest: SHA-256 of a descriptor label. Internal:
+ * consumers read entry.expectedApprovalEvidenceDigest and never re-derive it
+ * (request #41, T012-EVDIGEST).
+ */
+function syntheticDigest(label) {
   return sha256(Buffer.from(`opensig-oracle synthetic approval manifest:${label}`, 'utf8'));
 }
 
@@ -96,6 +100,17 @@ function applyMutation(signed, sigRev, der, mutation) {
       const value = (Number.parseInt(s.slice(at, at + 2), 16) ^ 0x01).toString(16).padStart(2, '0').toUpperCase();
       return replaceAt(signed, at, value);
     }
+    case 'flip-range-edge': {
+      // Request #41 (T012-EDGES): the first and last byte of each signed range.
+      // Whitespace is swapped for other whitespace so the syntax still parses.
+      const at = { 'range1-first': 0, 'range1-last': contentsStart - 1, 'range2-first': contentsEnd, 'range2-last': signed.length - 1 }[mutation.edge];
+      if (at === undefined) throw new Error(`unknown range edge ${mutation.edge}`);
+      const old = signed[at];
+      const swap = { 0x20: 0x0a, 0x0a: 0x0d, 0x0d: 0x0a };
+      const out = Buffer.from(signed);
+      out[at] = swap[old] ?? old ^ 0x01;
+      return out;
+    }
     case 'truncate-tail':
       return Buffer.from(signed.subarray(0, signed.length - mutation.bytes));
     case 'truncate-inside-contents':
@@ -129,10 +144,13 @@ export function buildCase(work, material, d) {
     der = spliced.der;
   }
   const signed = embedCms(prepared, sigRev.layout, der);
+  const evidenceLabel = d.check?.expected_approval_evidence_label;
   return {
     descriptor: d,
     bytes: applyMutation(signed, sigRev, der, d.mutation),
     originalDigest: sha256Hex(signed),
+    // Request #41 (T012-EVDIGEST): lowercase hex, or null when no evidence check is requested.
+    expectedApprovalEvidenceDigest: evidenceLabel === undefined ? null : syntheticDigest(evidenceLabel).toString('hex'),
     der,
     ranges,
     controls,

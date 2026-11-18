@@ -18,11 +18,16 @@ export const sha256 = (bytes) => createHash('sha256').update(bytes).digest();
 export const sha256Hex = (bytes) => sha256(bytes).toString('hex');
 
 /**
- * options.anchors: trust-anchor certificate paths ([] = none).
+ * options.anchors: trust-anchor certificate paths (omitted or [] = none; a non-array is refused).
  * options.expectedArtifactDigest: lowercase hex of the recorded original, or null.
  * options.expectedApprovalEvidenceDigest: lowercase hex, or null (not requested).
  */
 export function checkPdf(work, bytes, { anchors = [], expectedArtifactDigest = null, expectedApprovalEvidenceDigest = null } = {}) {
+  // Request #41 (T012-ANCHORS): anchors are a list of certificate paths. An
+  // omitted value means none; anything that is not a list is refused, never trusted.
+  if (!Array.isArray(anchors) || !anchors.every((p) => typeof p === 'string' && p.length > 0)) {
+    throw new TypeError('anchors must be an array of certificate file paths');
+  }
   for (const value of [expectedArtifactDigest, expectedApprovalEvidenceDigest]) {
     if (value !== null && !/^[0-9a-f]{64}$/.test(value)) throw new Error('expected digests are lowercase hex SHA-256');
   }

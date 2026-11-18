@@ -31,6 +31,15 @@ At test runtime the oracle:
 
 `case_count` is the count check that T014 repeats.
 
+Each entry from `buildCorpus` carries two expected digests, so consumers never re-derive them (request #41):
+
+- `originalDigest`: the signed file before any mutation;
+- `expectedApprovalEvidenceDigest`: lowercase hex, or `null` when the case requests no evidence check.
+
+`checkPdf` refuses an `anchors` value that is not an array of certificate paths. An omitted value means no anchors.
+
+When the structure check fails, the ByteRange's revision boundary falls back to the end of the file (plan.md OC-08). A second range that ends exactly at the file length passes; any other end fails.
+
 ## Mutants for Phase B, and the cases that kill them
 
 | Mutant | Killed by |
@@ -39,7 +48,7 @@ At test runtime the oracle:
 | ByteRange not checked against `/Contents` or the file length | OC-06-a..c, OC-07-a |
 | Verification over the whole file instead of the ranges | OC-01-a and every valid case; OC-01-c explicitly |
 | Integrity from messageDigest alone, without OpenSSL | OC-04-b |
-| Trust checked with `-noverify`, or against the default store | OC-05-a, OC-05-c |
+| Trust checked with `-noverify` | OC-05-a, OC-05-c |
 | Classic xref, `startxref` or `/Prev` not checked | OC-08-a..c |
 | Acceptance with `artifact_match !== false` instead of `=== true` | every accepted case, re-checked without its recorded digest |
 | Artifact digest or `/Contents` padding not checked | OC-04-a |
@@ -51,3 +60,9 @@ At test runtime the oracle:
 | Hybrid files rejected as unsupported | OC-01-f; the hybrid unit test |
 | The `/XRefStm` ignored, or its offset left unchecked | OC-08-f; the hybrid unit test |
 | The hidden stream's entries not merged or not checked | the hybrid unit test (a bad type-2 entry in the hidden stream) |
+| The shared range concatenation drops the last byte (R2) | OC-02-f (the range edges, request #41) |
+| `anchors: null` falls through to `-noverify` | the OC-05 refusal subtest |
+| The entry's expected evidence digest is missing, or wrong | OC-09-a, OC-09-b; the OC-09 entry subtest |
+| The end-of-file fallback accepts a range ending one byte short | OC-08-g |
+
+No test shows that trust ignores the default CA stores. A mutant that drops `-no-CApath` or `-no-CAstore` is equivalent on any bench whose default stores lack the runtime CA. The guard is the fixed arguments of the trust call: `-CAfile` with only the case's anchors (or `-no-CAfile`), plus `-no-CApath`, `-no-CAstore` and `-purpose any`.

@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { test } from 'node:test';
-import { buildCorpus, loadCaseManifest, prepareMaterial, syntheticDigest } from './lib/corpus.mjs';
+import { buildCorpus, loadCaseManifest, prepareMaterial } from './lib/corpus.mjs';
 import { createWorkDir, modeOf, removeWorkDir } from './lib/openssl.mjs';
 import { checkPdf, sha256Hex, verifiesOver } from './lib/oracle.mjs';
 
@@ -27,11 +27,11 @@ function runCase(work, material, entry) {
   const d = entry.descriptor;
   const anchors = material.anchors[d.anchors];
   assert.ok(anchors, `${d.id}: unknown anchor set ${d.anchors}`);
-  const label = d.check?.expected_approval_evidence_label;
+  // Request #41: both expected digests are read from the corpus entry, never re-derived.
   const report = checkPdf(work, entry.bytes, {
     anchors,
     expectedArtifactDigest: entry.originalDigest,
-    expectedApprovalEvidenceDigest: label === undefined ? null : syntheticDigest(label).toString('hex'),
+    expectedApprovalEvidenceDigest: entry.expectedApprovalEvidenceDigest,
   });
   const why = `${d.id}: ${summary(report)}`;
   for (const field of REPORT_FIELDS) assert.equal(report[field], d.expected[field], `${field} — ${why}`);
@@ -50,7 +50,7 @@ function runCase(work, material, entry) {
     // Request #39 Q3: acceptance needs a supplied, matching digest; without one it is never accepted.
     const bare = checkPdf(work, entry.bytes, {
       anchors,
-      expectedApprovalEvidenceDigest: label === undefined ? null : syntheticDigest(label).toString('hex'),
+      expectedApprovalEvidenceDigest: entry.expectedApprovalEvidenceDigest,
     });
     assert.equal(bare.artifact_match, null, `${d.id}: no recorded digest supplied`);
     assert.equal(bare.accepted_as_original, false, `${d.id}: accepted without a recorded digest`);
@@ -81,7 +81,8 @@ test('[OC-LIFECYCLE] runtime material is owner-only (0700 directory, 0600 keys) 
     for (const path of material.privateKeyPaths) assert.equal(modeOf(path), 0o600, 'private key file mode');
     const corpus = buildCorpus(work, material, manifest); // throws: run stopped, nothing skipped
 
-    await t.test('[OC-01] the descriptor set is complete and counted', () => {
+    // Request #41 (N9): the count check carries the recorded extra ID, not a required one.
+    await t.test('[OC-LIFECYCLE] the descriptor set is complete and the built corpus matches case_count', () => {
       assert.equal(manifest.schema, 'opensig.integrity-oracle.cases/1');
       assert.equal(manifest.cases.length, manifest.case_count, 'descriptor count check');
       assert.equal(corpus.length, manifest.case_count, 'built corpus count check');
@@ -91,10 +92,37 @@ test('[OC-LIFECYCLE] runtime material is owner-only (0700 directory, 0600 keys) 
       for (const id of CASE_IDS) assert.ok(manifest.cases.some((d) => d.case === id), `${id} has a descriptor`);
     });
 
+    await t.test('[OC-09] every corpus entry carries expectedApprovalEvidenceDigest: lowercase hex when the case requests the check, else null', () => {
+      for (const entry of corpus) {
+        const d = entry.descriptor;
+        assert.ok(Object.hasOwn(entry, 'expectedApprovalEvidenceDigest'), `${d.id}: field present`);
+        if (d.check?.expected_approval_evidence_label === undefined) {
+          assert.equal(entry.expectedApprovalEvidenceDigest, null, `${d.id}: no evidence check requested`);
+        } else {
+          assert.match(entry.expectedApprovalEvidenceDigest ?? '', /^[0-9a-f]{64}$/, `${d.id}: lowercase hex digest`);
+        }
+      }
+      assert.ok(corpus.filter((e) => e.expectedApprovalEvidenceDigest !== null).length >= 4, 'OC-09 cases carry digests');
+    });
+
     for (const entry of corpus) {
       const d = entry.descriptor;
       await t.test(`[${d.case}] ${d.id}: ${d.title}`, () => runCase(work, material, entry));
     }
+
+    await t.test('[OC-05] anchors that are not a list are refused (null, string, object); an omitted value means none', () => {
+      const entry = corpus.find((e) => e.descriptor.id === 'OC-05-a'); // self-signed signer
+      assert.ok(entry, 'OC-05-a entry');
+      const opts = { expectedArtifactDigest: entry.originalDigest };
+      for (const anchors of [null, material.anchors['self-signed-cert'][0], { 'self-signed-cert': material.anchors['self-signed-cert'] }]) {
+        assert.throws(() => checkPdf(work, entry.bytes, { ...opts, anchors }),
+          { name: 'TypeError', message: /^anchors must be an array/ }, `anchors ${anchors === null ? 'null' : typeof anchors} refused`);
+      }
+      for (const report of [checkPdf(work, entry.bytes, opts), checkPdf(work, entry.bytes, { ...opts, anchors: [] })]) {
+        assert.equal(report.integrity, 'valid');
+        assert.equal(report.trust, 'untrusted', 'no anchors never yields trusted');
+      }
+    });
   } finally {
     removeWorkDir(work);
   }
