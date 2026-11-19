@@ -20,6 +20,13 @@
 // start-up is held, a launcher that ends before its captured child (the orphan path), and a
 // channel to the worker from which the live process tree of each usable launcher is read.
 // Every kill case also checks that no process of the sandbox is left when the parse settles.
+//
+// PL-11's real-parser CPU case (A-010 PL11-CPUCAL, requests #72 and #73) asks a CPU limit far
+// below the heavy parse's natural cost. The parent samples the sandbox's CPU every 10 ms, so a
+// parse whose own cost sits at the limit can cross it within its last sample and complete, which
+// the ruled semantics allow. The RLIMIT_CPU backstop (2 s at that limit) lies above the parse's
+// cost, so the case needs the parent's CPU check. Its call's elapsed time is logged and carried
+// in its messages.
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -38,6 +45,12 @@ import { fixtureBytes, REPO } from './support.mjs';
 const PDF_DIR = join(REPO, 'src', 'pdf');
 const HEAVY = heavyDocument(100_000);
 const HEAVY_LIMITS = { maxObjects: 1_000_000 };
+/**
+ * The real-parser CPU case's limit (row PL11-CPUCAL, request #72): about a quarter of the heavy
+ * parse's lowest recorded whole call, and above node's expected start-up, so the kill falls in
+ * the parse and does not depend on which 10 ms sample comes last.
+ */
+const HEAVY_CPU_MS = 250;
 
 /** The configured wall-time limit under test, and the deadline: one default wall period. */
 const WALL_MS = 300;
@@ -271,7 +284,11 @@ function liveWorkers() {
 }
 
 function resourceRejection(outcome, detail, label, survivors = liveWorkers) {
-  assert.equal(outcome.ok, false, `${label} must be killed`);
+  assert.equal(
+    outcome.ok,
+    false,
+    `${label} must be killed: ${JSON.stringify({ ok: outcome.ok, status: outcome.status ?? null, reason: outcome.reason ?? null, detail: outcome.detail ?? null })}`,
+  );
   assert.equal(outcome.reason, 'resource-limit', `${label}: ${outcome.reason} ${outcome.detail}`);
   assert.equal(outcome.detail, detail, label);
   assert.equal(outcome.status, 422);
@@ -333,7 +350,14 @@ test('[PL-11] memory limits kill the parse child: V8 heap and resident memory', 
 });
 
 test('[PL-11] CPU and wall-time limits kill the parse child', async (t) => {
-  resourceRejection(await parsePdf(HEAVY, { limits: HEAVY_LIMITS, service: { heapMiB: 512, cpuMs: 1_000, wallMs: 60_000 } }), 'cpu', 'CPU 1000 ms');
+  // The CPU limit sits far below the heavy parse's natural cost (row PL11-CPUCAL). The call is
+  // timed and hang-guarded, and its elapsed time goes into the diagnostic and every message.
+  const cpuCall = await timedParse(
+    () => parsePdf(HEAVY, { limits: HEAVY_LIMITS, service: { heapMiB: 512, cpuMs: HEAVY_CPU_MS, wallMs: 60_000 } }),
+    `the heavy document's parse at cpuMs ${HEAVY_CPU_MS}`,
+  );
+  t.diagnostic(`real parser, cpuMs ${HEAVY_CPU_MS}: the parse call took ${ms(cpuCall.elapsed)} (diagnostic)`);
+  resourceRejection(cpuCall.outcome, 'cpu', `CPU ${HEAVY_CPU_MS} ms (parse call ${ms(cpuCall.elapsed)})`);
   assertTimingOrder();
   const { outcome, elapsed } = await timedParse(
     () => parsePdf(HEAVY, { limits: HEAVY_LIMITS, service: { heapMiB: 512, cpuMs: 60_000, wallMs: WALL_MS } }),
