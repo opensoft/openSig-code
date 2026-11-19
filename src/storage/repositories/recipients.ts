@@ -31,7 +31,7 @@
 
 import type { CapabilityOwner, Database, Row, TenantStore } from '../db/index.ts';
 import { StorageUsageError } from '../db/index.ts';
-import { canonicalize, type JsonValue } from '../../domain/canonical/index.ts';
+import { canonicalBytes, type JsonValue } from '../../domain/canonical/index.ts';
 import type { ConsentText } from '../../domain/consent/index.ts';
 import { MAX_METADATA_BYTES } from '../audit/index.ts';
 
@@ -443,10 +443,6 @@ function revocationMetadata(scope: RevocationMetadata, invitationIds: readonly s
   return { ...scope, invitation_ids: [...invitationIds], session_ids: [...sessionIds] };
 }
 
-function canonicalBytes(metadata: RevocationMetadata): number {
-  return Buffer.byteLength(canonicalize(metadata), 'utf8');
-}
-
 /**
  * The metadata of the recipient.capabilities_revoked events that record
  * `revoked` (row REVOKE-META, request #50; T010's decline uses it too, row
@@ -468,12 +464,16 @@ function canonicalBytes(metadata: RevocationMetadata): number {
  * metadata, since nothing was revoked. An id that cannot fit even alone with the
  * scope throws, as the audit writer would; an id is at most 64 characters, so a
  * valid scope never reaches that.
+ *
+ * Sizes are the canonical module's own canonicalBytes(metadata).byteLength,
+ * which is the UTF-8 byte length of canonicalize(metadata): exactly what the
+ * audit writer checks against MAX_METADATA_BYTES.
  */
 export function splitRevocationMetadata(scope: RevocationMetadata, revoked: CapabilityIds, maxBytes: number = MAX_METADATA_BYTES): RevocationMetadata[] {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new StorageUsageError('the revocation metadata limit must be a positive integer');
   if (revoked.invitationIds.length === 0 && revoked.sessionIds.length === 0) return [];
   const whole = revocationMetadata(scope, revoked.invitationIds, revoked.sessionIds);
-  if (canonicalBytes(whole) <= maxBytes) return [whole];
+  if (canonicalBytes(whole).byteLength <= maxBytes) return [whole];
   const parts: RevocationMetadata[] = [];
   let invitations: string[] = [];
   let sessions: string[] = [];
@@ -484,7 +484,7 @@ export function splitRevocationMetadata(scope: RevocationMetadata, revoked: Capa
   for (const [kind, id] of sequence) {
     const nextInvitations = kind === 'invitation' ? [...invitations, id] : invitations;
     const nextSessions = kind === 'session' ? [...sessions, id] : sessions;
-    if (canonicalBytes(revocationMetadata(scope, nextInvitations, nextSessions)) <= maxBytes) {
+    if (canonicalBytes(revocationMetadata(scope, nextInvitations, nextSessions)).byteLength <= maxBytes) {
       invitations = nextInvitations;
       sessions = nextSessions;
       continue;
@@ -493,7 +493,7 @@ export function splitRevocationMetadata(scope: RevocationMetadata, revoked: Capa
     parts.push(revocationMetadata(scope, invitations, sessions));
     invitations = kind === 'invitation' ? [id] : [];
     sessions = kind === 'session' ? [id] : [];
-    if (canonicalBytes(revocationMetadata(scope, invitations, sessions)) > maxBytes) throw new StorageUsageError('one revoked id does not fit the audit metadata limit');
+    if (canonicalBytes(revocationMetadata(scope, invitations, sessions)).byteLength > maxBytes) throw new StorageUsageError('one revoked id does not fit the audit metadata limit');
   }
   if (invitations.length > 0 || sessions.length > 0) parts.push(revocationMetadata(scope, invitations, sessions));
   return parts;
