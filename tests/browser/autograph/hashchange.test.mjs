@@ -28,7 +28,9 @@
 //              attributes, a live region, a console message or page error, a request URL or
 //              header, or the server log; only the explicit challenge and code requests carry
 //              it, in their JSON bodies (the contract's ChallengeRequest and SessionCreate).
-// Tokens are never printed: diagnostics carry booleans and counts only.
+// Tokens and codes are never printed: diagnostics and assertion messages carry only ids, masked
+// addresses, digests, booleans and counts (row AG08-ORACLE, request #70). The sessions are told
+// apart by their envelope and recipient ids, never by masked addresses, which can be equal.
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
@@ -236,6 +238,20 @@ test('[AG-08] a tab on /sign follows an invitation link: the invitation step, th
     // A's explicit action, A's code, A's session and review (A's document).
     const reviewMark = world.lines.length;
     const stateA = await codeToReview(page, a.recipients[0]);
+    // A's session names A's envelope and A's recipient, by id (row AG08-ORACLE).
+    const idsA = {
+      envelopeId: stateA.envelope_id,
+      expectedEnvelopeId: a.envelope.id,
+      recipientId: stateA.recipient.id,
+      expectedRecipientId: a.envelope.recipients[0].id,
+      ordinal: stateA.recipient.ordinal,
+      masked: stateA.recipient.email_masked,
+      documentDigest: stateA.document.digest,
+      expectedDocumentDigest: a.entry.sha256,
+    };
+    t.diagnostic(`A's session: ${JSON.stringify(idsA)}`);
+    assert.equal(stateA.envelope_id, a.envelope.id, `A's session names A's envelope: ${JSON.stringify(idsA)}`);
+    assert.equal(stateA.recipient.id, a.envelope.recipients[0].id, `A's session is A's recipient: ${JSON.stringify(idsA)}`);
     assert.equal(await page.locator('#document-digest').textContent(), a.entry.sha256, "A's review shows A's document");
     // The viewer loads the document once the bytes are checked; let that request finish first.
     assert.equal(await serverOperations(reviewMark, 'readRecipientDocument', 2), true, "A's document was read twice (checked bytes, then the viewer)");
@@ -264,7 +280,27 @@ test('[AG-08] a tab on /sign follows an invitation link: the invitation step, th
 
     // B's own explicit action and code: B's session shows B's document, never A's.
     const stateB = await codeToReview(page, b.recipients[0]);
-    assert.notEqual(stateB.recipient.email_masked, stateA.recipient.email_masked, "B's session is B's recipient");
+    // B's session names B's envelope and B's recipient, by id, and not A's recipient (row AG08-ORACLE).
+    // The masked addresses of two random identities can be equal, so they are reported, never compared.
+    const idsB = {
+      envelopeId: stateB.envelope_id,
+      expectedEnvelopeId: b.envelope.id,
+      recipientId: stateB.recipient.id,
+      expectedRecipientId: b.envelope.recipients[0].id,
+      recipientIdOfA: stateA.recipient.id,
+      ordinal: stateB.recipient.ordinal,
+      masked: stateB.recipient.email_masked,
+      maskedOfA: stateA.recipient.email_masked,
+      documentDigest: stateB.document.digest,
+      expectedDocumentDigest: b.entry.sha256,
+      envelopeIsB: stateB.envelope_id === b.envelope.id,
+      sameRecipientId: stateB.recipient.id === stateA.recipient.id,
+      sameMask: stateB.recipient.email_masked === stateA.recipient.email_masked,
+    };
+    t.diagnostic(`B's session: ${JSON.stringify(idsB)}`);
+    assert.equal(stateB.envelope_id, b.envelope.id, `B's session names B's envelope: ${JSON.stringify(idsB)}`);
+    assert.equal(stateB.recipient.id, b.envelope.recipients[0].id, `B's session is B's recipient: ${JSON.stringify(idsB)}`);
+    assert.notEqual(stateB.recipient.id, stateA.recipient.id, `B's session is not A's recipient: ${JSON.stringify(idsB)}`);
     assert.equal(stateB.document.digest, b.entry.sha256, "B's session binds B's document");
     assert.equal(await page.locator('#document-digest').textContent(), b.entry.sha256, "B's review shows B's document, not A's");
 
