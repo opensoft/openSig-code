@@ -233,7 +233,8 @@ export async function startWorld() {
         digest: put.digest,
         bytes: pdf.length,
         pages,
-        parseReport: { pages: pages.length, network_sandbox: 'netns+fs-enforced (local)' },
+        // The page list T034's upload stores (request #53): each manifest page with its own MediaBox and an equal CropBox.
+        parseReport: { pages: entry.pages.map((page, index) => ({ ...pages[index], media_box: [...page.media_box], crop_box: [...page.media_box] })), network_sandbox: 'netns+fs-enforced (local)' },
       }).body;
       const prepared = service.prepare(request, created.id, { expected_version: uploaded.version, fields: chosen }).body;
       const sent = (await composition.ceremony.run(() => service.send(request, prepared.id, { expected_version: prepared.version }))).body;
