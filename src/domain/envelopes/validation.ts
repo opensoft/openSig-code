@@ -5,10 +5,12 @@
 // ordinals, expiry bounds, field placement, the parse-service document
 // summary) and a defensive repeat of the shapes they depend on. Each failure is
 // an EnvelopeError with the contract's code: rule and shape violations are
-// invalid_request (400), a field outside its page is field_out_of_bounds (422).
+// invalid_request (400), a field outside its page, or one the composer could not
+// place on it (detail field_too_small, placement.ts), is field_out_of_bounds (422).
 
 import type { JsonValue } from '../../domain/canonical/index.ts';
 import { EnvelopeError, invalid } from './errors.ts';
+import { placeable, type StoredPage } from './placement.ts';
 
 export const ID_PATTERN = /^[A-Za-z0-9_-]{16,64}$/;
 export const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
@@ -238,14 +240,24 @@ export function checkDocument(input: unknown): DocumentInput {
 
 export interface FieldContext {
   readonly recipientsCount: number;
-  readonly pageCount: number;
+  /** The revision's stored page geometry, one entry per page (placement.ts storedPages). */
+  readonly pages: readonly StoredPage[];
 }
 
 /**
  * Prepare's fields: 1..20, unique keys, each on a page of the document and
  * inside it (x + width <= 1, y + height <= 1; otherwise field_out_of_bounds),
- * each for a declared recipient, and at least one signature field per
+ * placeable by the composer's own rule over the stored page geometry
+ * (otherwise field_out_of_bounds, detail field_too_small; requests #46 and
+ * #49), each for a declared recipient, and at least one signature field per
  * recipient.
+ *
+ * First refusal wins, one detail. Fields are judged in request order. Within a
+ * field: its shape and rules (400 invalid_request, ending with empty_rect for
+ * a width or height of 0), then page_out_of_range (422), then outside_page
+ * (422), then field_too_small (422). The per-recipient signature rule (400)
+ * comes after every field. A field is placed only once it is known to be on a
+ * page and inside it, as the composer places only such fields.
  */
 export function checkFields(value: unknown, context: FieldContext): FieldInput[] {
   if (!Array.isArray(value) || value.length < 1 || value.length > MAX_FIELDS) throw invalid('fields', 'invalid_count');
@@ -272,11 +284,15 @@ export function checkFields(value: unknown, context: FieldContext): FieldInput[]
       return n;
     }) as [number, number, number, number];
     if (width <= 0 || height <= 0) throw invalid(`${at}.rect`, 'empty_rect');
-    if (page > context.pageCount) {
+    const stored = context.pages[page - 1];
+    if (stored === undefined) {
       throw new EnvelopeError('field_out_of_bounds', 'a field is outside the document', [{ field: `${at}.page`, code: 'page_out_of_range' }]);
     }
     if (x + width > 1 || y + height > 1) {
       throw new EnvelopeError('field_out_of_bounds', 'a field is outside its page', [{ field: `${at}.rect`, code: 'outside_page' }]);
+    }
+    if (!placeable(stored, { x, y, width, height })) {
+      throw new EnvelopeError('field_out_of_bounds', 'a field is too small to place on its page', [{ field: `${at}.rect`, code: 'field_too_small' }]);
     }
     return { key, recipient_ordinal: ordinal, page, type, rect: { x, y, width, height } };
   });

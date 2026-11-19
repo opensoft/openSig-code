@@ -22,6 +22,11 @@
 // request's own rules, then the envelope's existence in the tenant, then
 // expiry (a pre-reservation envelope whose expires_at has passed is expired
 // and the request refused), then its state, then the expected version.
+// Prepare then reads the stored revision and its page geometry and validates
+// the fields (checkFields; its field_too_small placement check, requests #46
+// and #49, is part of that step), all before its first write. A refusal throws
+// inside the transaction, so it writes nothing and records no idempotency
+// response: a retry with the same key runs again and is refused again.
 
 import { randomBytes } from 'node:crypto';
 
@@ -47,6 +52,7 @@ import {
   openConfirmation,
   revokeOutstandingCapabilities,
   setRecipientProgress,
+  storedPageGeometry,
   type EnvelopeAggregate,
   type EnvelopeChanges,
   type EnvelopeRecord,
@@ -428,8 +434,11 @@ export class EnvelopeService {
       if (envelope.baseRevisionId === null) throw new EnvelopeError('state_conflict', 'the envelope has no document to prepare');
       const revision = getRevision(store, envelopeId, envelope.baseRevisionId);
       if (revision === undefined) throw new EnvelopeError('internal', 'the envelope document revision is missing');
+      // The stored page geometry (media_box, rotate) is the placement authority (requests #46, #49
+      // and #53); a missing or inconsistent page list is a broken invariant (500 internal, logged).
+      const pages = storedPageGeometry(revision);
       const recipients = listRecipients(store, envelopeId);
-      const fields = checkFields(checked.fields, { recipientsCount: envelope.recipientsCount, pageCount: revision.pages.length });
+      const fields = checkFields(checked.fields, { recipientsCount: envelope.recipientsCount, pages });
       const recipientIds = new Map(recipients.map((recipient) => [recipient.ordinal, recipient.id]));
       const iso = now.toISOString();
       const manifestFields = fields.map((field) => {

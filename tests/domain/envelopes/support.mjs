@@ -86,13 +86,37 @@ export function createInput(recipients = 1, overrides = {}) {
   return { source: { app: 'manual', record: 'synthetic-record-0001', version: 'v1' }, recipients: list, ...overrides };
 }
 
-export function documentInput(pages = 1, label = 'document') {
+/**
+ * A synthetic accepted document whose pages have the given rotations and
+ * MediaBoxes ([llx, lly, urx, ury] in points), recorded as T034's upload records
+ * one: the displayed geometry (width and height after /Rotate, each the plain
+ * difference of the box corners, as the parse service reports them) and a parse
+ * summary carrying each page's media_box, crop_box (equal; S2) and rotate.
+ */
+export function documentWithBoxes(boxes, label = 'document') {
+  const pages = boxes.map(({ rotate, media_box: box }, index) => {
+    const across = box[2] - box[0];
+    const up = box[3] - box[1];
+    const upright = rotate % 180 === 0;
+    return { number: index + 1, width: upright ? across : up, height: upright ? up : across, rotate };
+  });
   return {
     digest: hex(`${label}-${randomBytes(4).toString('hex')}`),
     bytes: 2048,
-    pages: Array.from({ length: pages }, (_, index) => ({ number: index + 1, width: 612, height: 792, rotate: index % 2 === 0 ? 0 : 90 })),
-    parseReport: { pages, network_sandbox: 'netns+fs-enforced (local)' },
+    pages,
+    parseReport: {
+      pages: pages.map((page, index) => ({ ...page, media_box: [...boxes[index].media_box], crop_box: [...boxes[index].media_box] })),
+      network_sandbox: 'netns+fs-enforced (local)',
+    },
   };
+}
+
+/** Letter pages, displayed 612 x 792: even indexes upright, odd ones rotated 90 (MediaBox 792 x 612). */
+export function documentInput(pages = 1, label = 'document') {
+  return documentWithBoxes(
+    Array.from({ length: pages }, (_, index) => (index % 2 === 0 ? { rotate: 0, media_box: [0, 0, 612, 792] } : { rotate: 90, media_box: [0, 0, 792, 612] })),
+    label,
+  );
 }
 
 export function fieldsFor(recipients = 1) {

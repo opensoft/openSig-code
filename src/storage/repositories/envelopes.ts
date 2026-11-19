@@ -13,6 +13,7 @@
 import type { Row, TenantStore, Values } from '../db/index.ts';
 import { StorageUsageError } from '../db/index.ts';
 import { isEnvelopeState, isRecipientStatus, type EnvelopeState, type RecipientStatus } from '../../domain/envelopes/states.ts';
+import type { StoredPage } from '../../domain/envelopes/placement.ts';
 import type { Actor, DocumentInput, PageGeometry, Rect, Source } from '../../domain/envelopes/validation.ts';
 
 export interface EnvelopeRecord {
@@ -376,6 +377,57 @@ export function copyRevision(store: TenantStore, source: RevisionRecord, id: str
 export function getRevision(store: TenantStore, envelopeId: string, revisionId: string): RevisionRecord | undefined {
   const row = store.get('document_revisions', { envelope_id: envelopeId, id: revisionId });
   return row === undefined ? undefined : revisionFromRow(row);
+}
+
+const isRotation = (value: unknown): value is PageGeometry['rotate'] => value === 0 || value === 90 || value === 180 || value === 270;
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * The stored page geometry placement reads at prepare (A-010 requests #46, #49 and #53): for
+ * each displayed page of `revision`, in order, the rotation and MediaBox its stored parse
+ * report holds (the page list T034's upload stores). That list must agree with the stored
+ * displayed geometry (page_geometry_json) page by page:
+ *   - number: as many pages, each numbered by its place;
+ *   - rotation: the same /Rotate;
+ *   - displayed size: the report page's width and height, and its MediaBox's width and
+ *     height under its rotation, both exactly the stored displayed width and height (the
+ *     composer's own page-geometry rule, src/cryptograph/compose/report.ts);
+ * and its MediaBox must be four finite numbers with urx > llx and ury > lly. A missing page
+ * list, or any disagreement, is a broken invariant, never repaired: StorageUsageError, which
+ * no envelope handler maps, so the server answers 500 internal and logs it
+ * (handler_exception). Width and height only detect the inconsistency; nothing is ever
+ * placed from them.
+ */
+export function storedPageGeometry(revision: RevisionRecord): StoredPage[] {
+  const broken = (what: string): StorageUsageError => new StorageUsageError(`document_revisions.parse_report_json ${what}`);
+  let report: unknown;
+  try {
+    report = JSON.parse(revision.parseReportJson);
+  } catch {
+    throw broken('holds no page list');
+  }
+  const list = isRecord(report) ? report['pages'] : undefined;
+  if (!Array.isArray(list)) throw broken('holds no page list');
+  if (list.length !== revision.pages.length) throw broken('disagrees with the stored geometry in number of pages');
+  return list.map((entry: unknown, index): StoredPage => {
+    const displayed: unknown = revision.pages[index];
+    const at = `page ${index + 1}`;
+    if (!isRecord(entry) || !isRecord(displayed)) throw broken(`${at} is not a page`);
+    if (entry['number'] !== index + 1 || displayed['number'] !== index + 1) throw broken(`${at} disagrees with the stored geometry in number`);
+    const rotate = entry['rotate'];
+    if (!isRotation(rotate) || rotate !== displayed['rotate']) throw broken(`${at} disagrees with the stored geometry in rotation`);
+    const box = entry['media_box'];
+    if (!Array.isArray(box) || box.length !== 4 || !box.every((n: unknown) => typeof n === 'number' && Number.isFinite(n))) throw broken(`${at} holds no usable media_box`);
+    const [llx, lly, urx, ury] = box as [number, number, number, number];
+    if (!(urx > llx && ury > lly)) throw broken(`${at} holds no usable media_box`);
+    const [shownWidth, shownHeight] = rotate % 180 === 0 ? [urx - llx, ury - lly] : [ury - lly, urx - llx];
+    const width = displayed['width'];
+    const height = displayed['height'];
+    if (entry['width'] !== width || entry['height'] !== height || shownWidth !== width || shownHeight !== height) {
+      throw broken(`${at} disagrees with the stored geometry in displayed size`);
+    }
+    return { rotate, media_box: [llx, lly, urx, ury] };
+  });
 }
 
 /** Freeze a revision at prepare; a frozen revision is immutable (schema trigger of 0002). */
