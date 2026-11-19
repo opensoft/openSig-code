@@ -132,7 +132,9 @@ export function testSide(env, { clock = () => new Date() } = {}) {
       const pdf = syntheticPdf();
       const put = blobs.put(ALPHA.id, pdf);
       const pages = [{ number: 1, width: 612, height: 792, rotate: 0 }];
-      const document = { digest: put.digest, bytes: pdf.length, pages, parseReport: { pages: 1, network_sandbox: 'netns+fs-enforced (local)' } };
+      // The page list T034's upload stores (request #53): the upright page's MediaBox and an equal CropBox.
+      const report = { pages: [{ ...pages[0], media_box: [0, 0, 612, 792], crop_box: [0, 0, 612, 792] }], network_sandbox: 'netns+fs-enforced (local)' };
+      const document = { digest: put.digest, bytes: pdf.length, pages, parseReport: report };
       const idempotency = key === undefined ? undefined : { key, request: { expected_version: envelope.version, document_digest: put.digest, document_bytes: pdf.length } };
       return { envelope: service.uploadDocument(req(actor, idempotency), envelope.id, envelope.version, document).body, pdf };
     },
