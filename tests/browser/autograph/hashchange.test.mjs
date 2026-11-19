@@ -28,13 +28,16 @@
 //              attributes, a live region, a console message or page error, a request URL or
 //              header, or the server log; only the explicit challenge and code requests carry
 //              it, in their JSON bodies (the contract's ChallengeRequest and SessionCreate).
-// Tokens and codes are never printed: diagnostics and assertion messages carry only ids, masked
-// addresses, digests, booleans and counts (row AG08-ORACLE, request #70). The sessions are told
-// apart by their envelope and recipient ids, never by masked addresses, which can be equal.
+// Tokens, codes and full addresses are never printed: diagnostics and assertion messages carry
+// only ids, masked addresses, digests, booleans and counts (row AG08-ORACLE, requests #70 and #71).
+// The sessions are told apart by their envelope and recipient ids, never by comparing their masked
+// addresses, which can be equal. Each session's shown mask must equal the product's own maskEmail
+// of the address the test created for that recipient (request #71).
 
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 
+import { maskEmail } from '../../../src/api/recipients/index.ts';
 import { focused, launchBrowser, openPage, responseTo, sessionCookie, step, tabTo, verified } from './browser.mjs';
 import { CHALLENGE_PATH, SESSION_PATH, startWorld } from './world.mjs';
 
@@ -193,8 +196,11 @@ async function codeToReview(page, recipient) {
 }
 
 test('[AG-08] a tab on /sign follows an invitation link: the invitation step, the address scrubbed at once, no history entry holding the token, no request until the explicit action; a second link restarts cleanly to its own steps; the token leaks nowhere', async (t) => {
-  const a = await world.sentEnvelope({ document: 'agreement-multipage.pdf', recipients: [world.address('hash-a')] });
-  const b = await world.sentEnvelope({ document: 'single-page.pdf', recipients: [world.address('hash-b')] });
+  // The test keeps the addresses it creates, to check each session's shown mask (request #71).
+  const addressA = world.address('hash-a');
+  const a = await world.sentEnvelope({ document: 'agreement-multipage.pdf', recipients: [addressA] });
+  const addressB = world.address('hash-b');
+  const b = await world.sentEnvelope({ document: 'single-page.pdf', recipients: [addressB] });
   assert.notEqual(a.entry.sha256, b.entry.sha256, 'A and B carry different documents');
   const { page, context, requests, close } = await openPage(browser);
   const consoleText = [];
@@ -238,7 +244,8 @@ test('[AG-08] a tab on /sign follows an invitation link: the invitation step, th
     // A's explicit action, A's code, A's session and review (A's document).
     const reviewMark = world.lines.length;
     const stateA = await codeToReview(page, a.recipients[0]);
-    // A's session names A's envelope and A's recipient, by id (row AG08-ORACLE).
+    // A's session names A's envelope and A's recipient, by id, and shows the mask of A's own address
+    // (row AG08-ORACLE; request #71).
     const idsA = {
       envelopeId: stateA.envelope_id,
       expectedEnvelopeId: a.envelope.id,
@@ -246,12 +253,14 @@ test('[AG-08] a tab on /sign follows an invitation link: the invitation step, th
       expectedRecipientId: a.envelope.recipients[0].id,
       ordinal: stateA.recipient.ordinal,
       masked: stateA.recipient.email_masked,
+      expectedMasked: maskEmail(addressA),
       documentDigest: stateA.document.digest,
       expectedDocumentDigest: a.entry.sha256,
     };
     t.diagnostic(`A's session: ${JSON.stringify(idsA)}`);
     assert.equal(stateA.envelope_id, a.envelope.id, `A's session names A's envelope: ${JSON.stringify(idsA)}`);
     assert.equal(stateA.recipient.id, a.envelope.recipients[0].id, `A's session is A's recipient: ${JSON.stringify(idsA)}`);
+    assert.equal(stateA.recipient.email_masked, maskEmail(addressA), `A's session shows the mask of A's own address: ${JSON.stringify(idsA)}`);
     assert.equal(await page.locator('#document-digest').textContent(), a.entry.sha256, "A's review shows A's document");
     // The viewer loads the document once the bytes are checked; let that request finish first.
     assert.equal(await serverOperations(reviewMark, 'readRecipientDocument', 2), true, "A's document was read twice (checked bytes, then the viewer)");
@@ -280,8 +289,9 @@ test('[AG-08] a tab on /sign follows an invitation link: the invitation step, th
 
     // B's own explicit action and code: B's session shows B's document, never A's.
     const stateB = await codeToReview(page, b.recipients[0]);
-    // B's session names B's envelope and B's recipient, by id, and not A's recipient (row AG08-ORACLE).
-    // The masked addresses of two random identities can be equal, so they are reported, never compared.
+    // B's session names B's envelope and B's recipient, by id, and not A's recipient (row AG08-ORACLE),
+    // and shows the mask of B's own address (request #71). The masked addresses of two random identities
+    // can be equal, so A's and B's are reported, never compared with each other.
     const idsB = {
       envelopeId: stateB.envelope_id,
       expectedEnvelopeId: b.envelope.id,
@@ -290,6 +300,7 @@ test('[AG-08] a tab on /sign follows an invitation link: the invitation step, th
       recipientIdOfA: stateA.recipient.id,
       ordinal: stateB.recipient.ordinal,
       masked: stateB.recipient.email_masked,
+      expectedMasked: maskEmail(addressB),
       maskedOfA: stateA.recipient.email_masked,
       documentDigest: stateB.document.digest,
       expectedDocumentDigest: b.entry.sha256,
@@ -301,6 +312,7 @@ test('[AG-08] a tab on /sign follows an invitation link: the invitation step, th
     assert.equal(stateB.envelope_id, b.envelope.id, `B's session names B's envelope: ${JSON.stringify(idsB)}`);
     assert.equal(stateB.recipient.id, b.envelope.recipients[0].id, `B's session is B's recipient: ${JSON.stringify(idsB)}`);
     assert.notEqual(stateB.recipient.id, stateA.recipient.id, `B's session is not A's recipient: ${JSON.stringify(idsB)}`);
+    assert.equal(stateB.recipient.email_masked, maskEmail(addressB), `B's session shows the mask of B's own address: ${JSON.stringify(idsB)}`);
     assert.equal(stateB.document.digest, b.entry.sha256, "B's session binds B's document");
     assert.equal(await page.locator('#document-digest').textContent(), b.entry.sha256, "B's review shows B's document, not A's");
 
