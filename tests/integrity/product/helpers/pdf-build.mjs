@@ -66,8 +66,11 @@ function paeth(a, b, c) {
   return pb <= pc ? b : c;
 }
 
-/** PNG-predict `data` in rows of `columns` bytes; filters[r] picks each row's filter (default Up). */
-export function pngEncode(data, columns, filters = []) {
+/**
+ * PNG-predict `data` in rows of `columns` bytes; filters[r] picks each row's
+ * filter (default Up); `bpp` is the bytes per pixel (/Colors at 8 bits).
+ */
+export function pngEncode(data, columns, filters = [], bpp = 1) {
   const rows = data.length / columns;
   const out = Buffer.alloc(rows * (columns + 1));
   for (let r = 0; r < rows; r += 1) {
@@ -75,9 +78,9 @@ export function pngEncode(data, columns, filters = []) {
     out[r * (columns + 1)] = filter;
     for (let i = 0; i < columns; i += 1) {
       const x = data[r * columns + i];
-      const left = i > 0 ? data[r * columns + i - 1] : 0;
+      const left = i >= bpp ? data[r * columns + i - bpp] : 0;
       const up = r > 0 ? data[(r - 1) * columns + i] : 0;
-      const upLeft = i > 0 && r > 0 ? data[(r - 1) * columns + i - 1] : 0;
+      const upLeft = i >= bpp && r > 0 ? data[(r - 1) * columns + i - bpp] : 0;
       let v = x;
       if (filter === 1) v = x - left;
       else if (filter === 2) v = x - up;
@@ -91,14 +94,18 @@ export function pngEncode(data, columns, filters = []) {
 
 /** The object stream holding objects 1 to 3, as text (a deflated body is carried as latin1). */
 function objectStream(options) {
-  const o2 = OBJ1.length + 1;
+  // objStmTight: object 1's value is `true` (a regular byte) and the header has
+  // no trailing space, so its last offset runs right up to /First.
+  const first = options.objStmTight ? 'true' : OBJ1;
+  const o2 = first.length + 1;
   const o3 = o2 + OBJ2.length + 1;
   const nums = [1, 2, 3];
   if (options.objStmHeaderOverride) nums[options.objStmHeaderOverride.index] = options.objStmHeaderOverride.num;
-  const header = `${nums[0]} 0 ${nums[1]} ${o2} ${nums[2]} ${o3} `;
-  const data = `${header}${OBJ1} ${OBJ2} ${OBJ3}`;
+  const header = `${nums[0]} 0 ${nums[1]} ${o2} ${nums[2]} ${o3}${options.objStmTight ? '' : ' '}`;
+  const data = `${header}${first} ${OBJ2} ${OBJ3}`;
   const body = options.objStmFlate ? deflateSync(Buffer.from(data, 'latin1')).toString('latin1') : data;
-  const filter = options.objStmFlate ? ' /Filter /FlateDecode' : '';
+  let filter = options.objStmFlate ? ' /Filter /FlateDecode' : '';
+  if (options.objStmFilterName) filter = ` /Filter /${options.objStmFilterName}`;
   const length = options.objStmIndirectLength ? '7 0 R' : String(body.length);
   const text = `<< /Type /ObjStm /N ${options.objStmCount ?? 3} /First ${header.length} /Length ${length}${filter} >>\nstream\n${body}\nendstream`;
   return { text, bodyLength: body.length };
@@ -121,6 +128,14 @@ function contentObject() {
  *   header pair of the object stream (stream and hybrid bases);
  * - objStmFlate: the object stream's data FlateDecoded (stream and hybrid);
  * - objStmCount: the /N written for the object stream (default 3, its pair count);
+ * - objStmTight: object 1's value is `true` and the header ends at /First with
+ *   no space, so its last offset runs right up to a regular byte;
+ * - objStmFilterName: the object stream's /Filter name (data left as it is);
+ * - xrefWidths: the cross-reference stream's /W (stream bases; default [1 4 2]);
+ * - xrefPng: { colors, columns } for the PNG predictor (stream-flate; default
+ *   one colour, one row per entry);
+ * - xrefDictExtra: text added to the cross-reference stream dictionary (stream);
+ * - hiddenShadowsInUse: the hybrid's hidden stream also lists object 4;
  * - objStmIndirectLength: the object stream's /Length as `7 0 R`, object 7
  *   holding it (stream bases only; /Size becomes 8);
  * - xrefStmDelta, startxrefDelta: added to the written offsets;
@@ -199,8 +214,13 @@ export function buildBase(options = {}) {
   const widths = [1, 4, 2];
   if (xref === 'hybrid') {
     const stm = options.hiddenType2StreamOverride ?? 5;
-    const rows = xrefRows([[2, stm, index(1, 0)], [2, stm, index(2, 1)], [2, stm, index(3, 2)]], widths);
-    w.write(`6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 2] /Index [1 3] /Length ${rows.length} >>\nstream\n`);
+    const hiddenRows = [[2, stm, index(1, 0)], [2, stm, index(2, 1)], [2, stm, index(3, 2)]];
+    // hiddenShadowsInUse: the hidden stream also lists object 4, in use in the
+    // table, as compressed in object 4 (not an object stream); the table's
+    // in-use entry must win (B1 (c)).
+    if (options.hiddenShadowsInUse) hiddenRows.push([2, 4, 0]);
+    const rows = xrefRows(hiddenRows, widths);
+    w.write(`6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 2] /Index [1 ${hiddenRows.length}] /Length ${rows.length} >>\nstream\n`);
     w.write(rows);
     w.write('\nendstream\nendobj\n');
     const xrefAt = w.offset;
@@ -227,13 +247,18 @@ export function buildBase(options = {}) {
   ];
   if (off7 !== null) entries.push([1, off7, 0]);
   const size = entries.length;
-  let body = xrefRows(entries, widths);
-  let filter = '';
+  const streamWidths = options.xrefWidths ?? widths;
+  const rowWidth = streamWidths[0] + streamWidths[1] + streamWidths[2];
+  let body = xrefRows(entries, streamWidths);
+  let filter = options.xrefDictExtra ?? '';
   if (xref === 'stream-flate') {
-    body = deflateSync(pngEncode(body, 7, options.pngRowFilters ?? []));
-    filter = ' /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 >>';
+    const png = options.xrefPng ?? { colors: 1, columns: rowWidth };
+    body = deflateSync(pngEncode(body, png.colors * png.columns, options.pngRowFilters ?? [], png.colors));
+    const parms = png.colors === 1 ? `/Columns ${png.columns}` : `/Colors ${png.colors} /Columns ${png.columns}`;
+    filter = ` /Filter /FlateDecode /DecodeParms << /Predictor 12 ${parms} >>`;
   }
-  w.write(`6 0 obj\n<< /Type /XRef /Size ${size} /W [1 4 2] /Root 1 0 R /Length ${body.length}${filter} >>\nstream\n`);
+  const w0 = `[${streamWidths.join(' ')}]`;
+  w.write(`6 0 obj\n<< /Type /XRef /Size ${size} /W ${w0} /Root 1 0 R /Length ${body.length}${filter} >>\nstream\n`);
   w.write(body);
   w.write(`\nendstream\nendobj\nstartxref\n${off6 + (options.startxrefDelta ?? 0)}\n%%EOF\n`);
   if (options.trailingBytes) w.write(options.trailingBytes);
@@ -308,8 +333,10 @@ export function appendSignaturePlaceholder(doc, options = {}) {
   const num = doc.size;
   const text =
     `<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached /ByteRange ${PLACEHOLDER} ` +
-    `/Contents <${'0'.repeat(hexDigits)}> /M (D:20261118000000Z) >>`;
-  const updated = appendUpdate(doc, [{ num, text }], options);
+    `/Contents <${'0'.repeat(hexDigits)}> /M (D:20261118000000Z)${options.sigDictExtra ?? ''} >>`;
+  // options.extraObjects(num): more objects for the same revision, numbered after the signature.
+  const extra = options.extraObjects ? options.extraObjects(num) : [];
+  const updated = appendUpdate(doc, [{ num, text }, ...extra], options);
   const bytes = Buffer.from(updated.bytes);
   const objectAt = bytes.lastIndexOf(`\n${num} 0 obj`);
   const rangeAt = bytes.indexOf(PLACEHOLDER, objectAt);
@@ -319,6 +346,32 @@ export function appendSignaturePlaceholder(doc, options = {}) {
   const range = options.byteRange ? options.byteRange({ l1: lt, o2, length: bytes.length }) : natural;
   bytes.write(`[${range.map(pad10).join(' ')}]`, rangeAt, 'latin1');
   return { ...updated, bytes, byteRange: range, contentsStart: lt, contentsEnd: o2, hexDigits };
+}
+
+/**
+ * Append one update whose cross-reference section is a stream with the given
+ * /W and rows: `objects` ([{ num, text }]) are written first, then the stream
+ * object numbered `xnum` (default doc.size) with /Index from `groups`
+ * ([{ first, rows: [[type, field2, field3], ...] }]), or from `rowsFor`, called
+ * with the written offsets and the stream's own offset.
+ */
+export function appendXrefStreamSection(doc, { objects = [], widths, groups, rowsFor, xnum = doc.size }) {
+  const w = new Writer(doc.bytes);
+  if (!endsWithEol(doc.bytes)) w.write('\n');
+  const offsets = new Map();
+  for (const { num, text } of objects) {
+    offsets.set(num, w.offset);
+    w.write(`${num} 0 obj\n${text}\nendobj\n`);
+  }
+  const xrefAt = w.offset;
+  const list = groups ?? rowsFor(offsets, xrefAt);
+  const index = list.map((g) => `${g.first} ${g.rows.length}`).join(' ');
+  const body = Buffer.concat(list.map((g) => xrefRows(g.rows, widths)));
+  const size = Math.max(doc.size, xnum + 1, ...list.map((g) => g.first + g.rows.length));
+  w.write(`${xnum} 0 obj\n<< /Type /XRef /Size ${size} /W [${widths.join(' ')}] /Index [${index}] /Root ${doc.root} /Prev ${doc.startxref} /Length ${body.length} >>\nstream\n`);
+  w.write(body);
+  w.write(`\nendstream\nendobj\nstartxref\n${xrefAt}\n%%EOF\n`);
+  return { bytes: w.bytes(), kind: 'stream', startxref: xrefAt, size, root: doc.root };
 }
 
 /** The bytes the stated ranges cover, in order. */

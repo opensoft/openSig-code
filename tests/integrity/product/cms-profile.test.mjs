@@ -208,3 +208,72 @@ test('[VB-10] inputs outside what T014 evaluates are indeterminate, never valid'
   assert.equal(unsigned.integrity, 'invalid', 'a PDF with no seal is evaluated and fails');
   assert.equal(checkOf(unsigned, 'signature-dictionary').detail, 'no-byte-range');
 });
+
+// ---------------------------------------------------------------------------
+// Request #58 (1), (2) and (4), builder-only (no capability).
+//
+// Mutants killed here: signatures counted by text; a second signature
+// dictionary, a /DocMDP or /UR3 key, or a signature field's foreign /V ignored;
+// unsigned bytes after the final %%EOF leaving coverage complete (the
+// reviewer's R1); three SignerInfos or nine certificates read as invalid.
+// ---------------------------------------------------------------------------
+
+test('[VB-07] the one signature is found by dictionary: a string spelling /ByteRange and /Contents is no signature (request #58 (1))', () => {
+  const sealed = sealSynthetic({
+    signer: pki.leaf,
+    extraObjects: (n) => [{ num: n + 1, text: '<< /Producer (/ByteRange [0 1 2 3] /Contents <00>) >>' }],
+  });
+  const outcome = verify(sealed.bytes);
+  assert.equal(checkOf(outcome, 'signature-dictionary').result, 'pass');
+  assert.equal(outcome.integrity, 'valid');
+  assert.equal(outcome.revision_coverage, 'complete');
+  for (const v of [(n) => `${n} 0 R`, () => 'null']) {
+    const field = sealSynthetic({ signer: pki.leaf, extraObjects: (n) => [{ num: n + 1, text: `<< /FT /Sig /T (seal) /V ${v(n)} >>` }] });
+    assert.equal(verify(field.bytes).integrity, 'valid', v(7));
+  }
+});
+
+test('[VB-07] a second signature dictionary, a /DocMDP or /UR3 key, or a signature field whose /V is another value gives indeterminate (request #58 (1))', () => {
+  const cases = [
+    ['a second /Type /Sig', () => '<< /Type /Sig >>'],
+    ['a /DocTimeStamp', () => '<< /Type /DocTimeStamp >>'],
+    ['a second /ByteRange with /Contents', () => '<< /ByteRange [0 0 0 0] /Contents <00> >>'],
+    ['a nested second signature', () => '<< /Annots [ << /Subtype /Widget /V << /Type /Sig >> >> ] >>'],
+    ['a /DocMDP key', () => '<< /Perms << /DocMDP 2 0 R >> >>'],
+    ['a /UR3 key', () => '<< /Perms << /UR3 2 0 R >> >>'],
+    ['a field /V naming another object', () => '<< /FT /Sig /T (seal) /V 2 0 R >>'],
+    ['a field /V that is a string', () => '<< /FT /Sig /T (seal) /V (text) >>'],
+  ];
+  for (const [label, text] of cases) {
+    const sealed = sealSynthetic({ signer: pki.leaf, extraObjects: (n) => [{ num: n + 1, text: text(n) }] });
+    const outcome = verify(sealed.bytes);
+    assert.equal(outcome.integrity, 'indeterminate', label);
+    assert.equal(checkOf(outcome, 'signature-dictionary').detail, 'multiple-signatures', label);
+    assert.equal(outcome.accepted_as_original, false, label);
+  }
+});
+
+test('[VB-07] unsigned bytes after the final %%EOF never leave coverage complete: indeterminate without a later revision, incomplete with one (R1, request #58 (2))', () => {
+  const sealed = sealSynthetic({ signer: pki.leaf });
+  const expectedArtifactDigest = sha256Hex(sealed.bytes);
+  assert.equal(verify(sealed.bytes, { expectedArtifactDigest }).revision_coverage, 'complete');
+  const trailing = Buffer.concat([sealed.bytes, Buffer.from('% an unsigned trailing note\n', 'latin1')]);
+  const loose = verify(trailing, { expectedArtifactDigest });
+  assert.equal(checkOf(loose, 'revision-structure').result, 'pass');
+  assert.equal(loose.revision_coverage, 'indeterminate');
+  assert.equal(loose.accepted_as_original, false);
+  const later = verify(appendUpdate(docFromBytes(sealed.bytes), [{ num: 9, text: '<< /Producer (later) >>' }]).bytes, { expectedArtifactDigest });
+  assert.equal(later.revision_coverage, 'incomplete');
+  assert.equal(later.accepted_as_original, false);
+});
+
+test('[VB-10] three SignerInfos, or nine certificates, give integrity indeterminate, never invalid (request #58 (4))', () => {
+  const three = verify(sealSynthetic({ signer: pki.leaf, variant: { signerCount: 3 } }).bytes);
+  assert.equal(three.integrity, 'indeterminate');
+  assert.equal(checkOf(three, 'cms-structure').detail, 'multiple-signer-infos');
+  const nine = verify(sealSynthetic({ signer: pki.leaf, variant: { extraCertificates: 8 }, hexDigits: 65536 }).bytes);
+  assert.equal(nine.integrity, 'indeterminate');
+  assert.equal(checkOf(nine, 'cms-structure').detail, 'too-many-certificates');
+  const eight = verify(sealSynthetic({ signer: pki.leaf, variant: { extraCertificates: 7 }, hexDigits: 65536 }).bytes);
+  assert.equal(eight.integrity, 'valid');
+});

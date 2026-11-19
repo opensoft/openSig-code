@@ -16,15 +16,22 @@
 // Mutants killed here: a verifier bound that drifts from T036's; any structure
 // limit below T033's (fewer sections, entries, nesting or inflate budget); a
 // T033 limit added without a decision here; a file at the bound refused, or one
-// byte over it evaluated; and a header-skip bound below the input bound
+// byte over it evaluated; a restated T033 ceiling that is not T033's ceiling,
+// or a verifier limit below one (request #58 (3)); and a header-skip bound below the input bound
 // (request #56 B6: the assertion kills any such bound, the file whose one
 // skipped run nearly fills the input bound kills one more than 1 KiB below it).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MAX_SEALED_PDF_BYTES, readRevisionStructure, VERIFIER_LIMITS, verifyPdf } from '../../../src/verifier/index.ts';
+import {
+  MAX_SEALED_PDF_BYTES,
+  readRevisionStructure,
+  T033_PARSER_CEILINGS,
+  VERIFIER_LIMITS,
+  verifyPdf,
+} from '../../../src/verifier/index.ts';
 import { MAX_SEALED_PDF_BYTES as T036_MAX_SEALED_PDF_BYTES } from '../../../src/cryptograph/compose/bounds.ts';
-import { DEFAULT_PARSER_LIMITS, MAX_DOCUMENT_BYTES } from '../../../src/pdf/limits.ts';
+import { DEFAULT_PARSER_LIMITS, MAX_DOCUMENT_BYTES, resolveParserLimits } from '../../../src/pdf/limits.ts';
 import { checkOf } from './helpers/agreement.mjs';
 import { buildBase } from './helpers/pdf-build.mjs';
 
@@ -104,4 +111,20 @@ test('[VB-06] the header-skip bound is at least MAX_SEALED_PDF_BYTES (request #5
   assert.ok(run > MAX_SEALED_PDF_BYTES - 1024, `the skipped run is ${run} bytes`);
   const structure = readRevisionStructure(doc.bytes);
   assert.equal(structure.ok, true, structure.ok ? '' : structure.detail);
+});
+
+test('[VB-06] each restated T033 ceiling is proven against resolveParserLimits, and each verifier limit is at least it (request #58 (3))', () => {
+  assert.deepEqual(Object.keys(T033_PARSER_CEILINGS).sort(), ['maxDepth', 'maxInflatedBytes', 'maxObjects', 'maxRatio', 'maxXrefSections']);
+  // T033 exports no ceilings; resolveParserLimits accepts an override up to its ceiling and throws above it.
+  for (const [key, ceiling] of Object.entries(T033_PARSER_CEILINGS)) {
+    assert.doesNotThrow(() => resolveParserLimits({ [key]: ceiling }), key);
+    assert.throws(() => resolveParserLimits({ [key]: ceiling + 1 }), TypeError, key);
+  }
+  assert.ok(VERIFIER_LIMITS.maxRevisions >= T033_PARSER_CEILINGS.maxXrefSections + 1);
+  assert.ok(VERIFIER_LIMITS.maxXrefEntries >= T033_PARSER_CEILINGS.maxObjects);
+  assert.ok(VERIFIER_LIMITS.maxNestingDepth >= T033_PARSER_CEILINGS.maxDepth);
+  assert.ok(VERIFIER_LIMITS.maxXrefInflatedBytes >= T033_PARSER_CEILINGS.maxInflatedBytes);
+  // T033 caps no container below the input, and reads number tokens of up to 32 characters.
+  assert.equal(VERIFIER_LIMITS.maxContainerItems, MAX_SEALED_PDF_BYTES);
+  assert.equal(VERIFIER_LIMITS.maxNumberChars, 32);
 });

@@ -48,7 +48,7 @@ import {
   CONTENTS_PADDING_DETAILS,
   extractCms,
   isHexStringToken,
-  locateByteRange,
+  locateSignature,
   SIGNATURE_DICTIONARY_DETAILS,
   statedRanges,
 } from './byte-range.ts';
@@ -241,7 +241,7 @@ export function verifyPdf(input: Uint8Array, options: VerifyOptions): Verificati
   checks.set('revision-structure', structure.ok ? 'pass' : 'fail', structure.ok ? null : structure.detail);
 
   // Signature dictionary, ByteRange, CMS.
-  const located = locateByteRange(input);
+  const located = locateSignature(input, structure);
   let dictionaryStep: Step;
   let byteRangeStep: Step = 'not-run';
   let extractionStep: Step = 'not-run';

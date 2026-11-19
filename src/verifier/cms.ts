@@ -25,9 +25,10 @@
 // - signingCertificateV2 present or not: `signingCertificateV2Present`;
 // - a signature time-stamp token in unsignedAttrs: `timestampTokenPresent`;
 // - the opensig-approval-evidence-digest attribute (VB-03): `evidence`.
-// Outside what T014 evaluates (integrity `indeterminate`): more than one
-// SignerInfo, a non-certificate CertificateChoice, a digest other than SHA-256,
-// another signature algorithm, a non-RSA or sub-2048-bit signer key.
+// Outside what T014 evaluates (integrity `indeterminate`, never `invalid`;
+// VB-10, request #58 (4)): two or more SignerInfos, more than maxCertificates
+// certificates, a non-certificate CertificateChoice, a digest other than
+// SHA-256, another signature algorithm, a non-RSA or sub-2048-bit signer key.
 
 import { Buffer } from 'node:buffer';
 import { constants, createHash, verify as verifySignature, X509Certificate } from 'node:crypto';
@@ -75,6 +76,7 @@ export const CMS_DETAILS = [
   'not-detached',
   'no-signer-info',
   'multiple-signer-infos',
+  'too-many-certificates',
   'certificate-choice-unsupported',
   'certificate-too-large',
   'certificate-unparsable',
@@ -223,7 +225,9 @@ function evaluate(der: Uint8Array, contentDigest: Uint8Array, result: Mutable<Cm
   if (parts[i]?.tag === TAG.CONTEXT_1) i += 1; // crls: revocation is not checked
   const infosTlv = expectTag(parts[i++], TAG.SET);
   if (i !== parts.length) malformed('signed-data-shape');
-  const infos = children(der, infosTlv, 2);
+  // Every SignerInfo is counted (each takes at least two bytes of the bounded
+  // CMS), so two or more is unsupported, never malformed (VB-10).
+  const infos = children(der, infosTlv, VERIFIER_LIMITS.maxCmsBytes);
   if (infos.length === 0) malformed('no-signer-info');
   if (infos.length > 1) unsupported('multiple-signer-infos');
 
@@ -297,7 +301,11 @@ function evaluate(der: Uint8Array, contentDigest: Uint8Array, result: Mutable<Cm
 
 function readCertificates(der: Uint8Array, tlv: Tlv): CertificateFields[] {
   const out: CertificateFields[] = [];
-  for (const item of children(der, tlv, VERIFIER_LIMITS.maxCertificates)) {
+  // Every certificate is counted first (each takes at least two bytes of the
+  // bounded CMS); more than maxCertificates is unsupported, never malformed (VB-10).
+  const items = children(der, tlv, VERIFIER_LIMITS.maxCmsBytes);
+  if (items.length > VERIFIER_LIMITS.maxCertificates) unsupported('too-many-certificates');
+  for (const item of items) {
     if (item.tag !== TAG.SEQUENCE) unsupported('certificate-choice-unsupported');
     const encoding = encodingOf(der, item);
     if (encoding.length > VERIFIER_LIMITS.maxCertificateBytes) malformed('certificate-too-large');

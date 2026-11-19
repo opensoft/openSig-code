@@ -1,36 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The verifier's own revision-structure reader (T014). It walks the
-// cross-reference chain of an incrementally updated PDF and reports where each
-// revision ends, so the ByteRange check can find the signed revision and the
-// coverage verdict can tell whether that revision is the last.
+// cross-reference chain of an incrementally updated PDF, reports where each
+// revision ends (so the ByteRange check can find the signed revision and the
+// coverage verdict can tell whether that revision is the last), and finds the
+// signature dictionaries among the effective objects (request #58 (1)).
 //
-// It accepts at least every cross-reference section start and object header
-// that T033's parser accepts (request #49, row T014-XREFSTART; VB-06), so a base
-// T033 accepted and T036 composed never fails here on its layout alone:
+// It accepts at least every base T033's parser accepts (requests #49, #55, #56,
+// #57 and #58; row T014-XREFSTART; VB-06), so a base T033 accepted and T036
+// composed never fails here on its layout alone:
 // - a section start (the final startxref, each /Prev, each /XRefStm) may name
-//   white-space or comments before `xref` or before the stream object's header.
-//   T033 skips them only before an object header, not before `xref`; the T014
-//   line accepts both, a harmless superset;
+//   white-space or comments before `xref` or before the stream object's header
+//   (T033 skips them only before an object header; the T014 line also accepts
+//   them before `xref`, a harmless superset);
 // - a table is read as tokens: white-space and comments may come anywhere
 //   between and around them, including directly after `xref`; numbers have 1 to
 //   15 digits with leading zeros allowed; a generation is at most 65535; each
-//   entry ends with exactly the keyword `n` or `f`;
-// - an object header read at an offset (each section object and each type-1
-//   entry check) may be preceded by white-space and comments, and its tokens
-//   may be separated by white-space and comments;
+//   entry ends with exactly the keyword `n` or `f`. Within one section the FIRST
+//   entry for an object number wins, a free one included (T033's addLocal);
+// - an object header read at an offset may be preceded by white-space and
+//   comments, and its tokens may be separated by them;
+// - dictionary values follow T033's readValue (pdf-syntax.ts): numbers of up to
+//   32 characters, integral reals wherever an integer is required, comments
+//   inside `n g R`, and no item cap below the input bound;
 // - the final `startxref` is the last one in the final tailWindowBytes, then
 //   white-space or comments, 1 to 15 digits, white-space, `%%EOF`. Bytes after
 //   that %%EOF belong to the last revision, which ends at the end of the file
-//   (T033 allows only white-space there; tolerating more keeps OC-02-f, whose
-//   flipped final byte the oracle reads, and is again a superset);
+//   (T033 allows only white-space there; tolerating more keeps OC-02-f, and
+//   unsigned bytes there never leave coverage complete, request #58 (2));
 // - stream data is /Length bytes, then white-space and comments, then
 //   `endstream`.
 //
-// What it reads (request #39, Parts E and F): classic tables, cross-reference
-// streams (uncompressed, or FlateDecode with the PNG predictors; filter bytes
-// 0..4, any other fails) and hybrids (a table trailer's /XRefStm names a hidden
-// stream whose entries belong to the same section and are checked too).
+// Cross-reference streams (T033's readXrefStream): /W is three non-negative
+// integers, not all zero; /W[0] = 0 makes the type 1, and /W[1] = 0 is allowed;
+// types other than 1 and 2 are free entries. Structural streams (cross-reference
+// streams and object streams, T033's decodeStructuralStream) have no filter
+// when /Filter is absent, null or [], with /DecodeParms then ignored; otherwise
+// exactly one FlateDecode with no predictor or a PNG predictor (/BitsPerComponent
+// 8, /Colors 1 to 4, any /Columns of at least 1). Inflated bytes count against
+// one total budget, at least T033's ceiling. Hybrids: a table trailer's
+// /XRefStm names a hidden stream whose entries belong to the same section.
 //
 // What it checks (request #56 B1: base-structure checks mirror T033; the
 // security checks in byte-range.ts and verify.ts stay strict and read only the
@@ -40,26 +49,26 @@
 // - the final startxref, every /Prev and every /XRefStm reach a section of the
 //   right kind. /Prev is followed as T033 follows it (B3): a non-negative offset
 //   within the file, in either direction, no section revisited, and at most
-//   maxRevisions sections (at least T033's limit);
-// - only EFFECTIVE entries are checked (B2): the newest entry for each object
-//   number, newest section first, as T033's addEntry keeps them; inside a
-//   hybrid section the precedence is an in-use table entry, then the /XRefStm
-//   entry, then a free table entry (B1 (c)). An effective in-use entry reaches
-//   a header with its own number and generation (its offset bounded only by
-//   the file, B1 (b)); an effective type-2 entry names an object stream
-//   (/Type /ObjStm) whose effective entry is in use, its index is below that
-//   stream's /N (B1 (d) restored), and the stream's header pair at that index
-//   names the entry's own object number, as T033's readCompressed checks
-//   (request #57 item 4). Object streams are decoded (no filter, or
-//   FlateDecode with or without a PNG predictor) under the same inflate budget
-//   as cross-reference streams. Superseded entries are never read.
+//   maxRevisions sections;
+// - only EFFECTIVE entries are checked (B2): the first entry for each object
+//   number, newest section first (T033's addEntry). Inside a hybrid section the
+//   precedence is the section's in-use table entry, then its /XRefStm entry,
+//   then its free table entry (B1 (c)). Entries are counted as T033 counts
+//   them: the distinct effective entries, and separately each section's own,
+//   never the sum (request #58 (3)).
+// - every effective in-use entry reaches a header with its own number and
+//   generation (its offset bounded only by the file, B1 (b)), and its object
+//   parses; every effective type-2 entry names an object stream (/Type /ObjStm)
+//   whose own effective entry is in use, its index is below /N (B1 (d)), the
+//   header pair at that index (the header ends at /First) names the entry's
+//   own object number (request #57 item 4), and its object parses.
+// - signatures by DICTIONARY over every effective object, nested dictionaries
+//   and stream dictionaries included, never by text (request #58 (1)).
 // It does not read an earlier revision's own startxref value (B1 (a)). Revision
 // ends are found in file order: each revision ends after the first %%EOF past
 // its section and at most one end-of-line, before the next section by
 // position; one without a %%EOF has an unmarked end, at which no signature can
-// end; the last by position ends at the file length. Coverage then depends only
-// on whether the signed range reaches the file length, never on the chain's
-// direction.
+// end; the last by position ends at the file length.
 //
 // Every loop and size is bounded (VERIFIER_LIMITS). A failure names one detail.
 
@@ -84,6 +93,7 @@ import {
   readUnsignedInt,
   skipWhitespaceAndComments,
   SyntaxFault,
+  type ByteRangeKey,
   type IndirectObject,
   type PdfValue,
 } from './pdf-syntax.ts';
@@ -108,6 +118,7 @@ export const STRUCTURE_DETAILS = [
   'xrefstm-not-xref-stream',
   'xref-entry-mismatch',
   'xref-type2-not-object-stream',
+  'object-malformed',
   'revision-order',
 ] as const;
 
@@ -128,8 +139,18 @@ export interface Revision {
   readonly eofEnd: number | null;
 }
 
+/**
+ * The signature dictionaries among the effective objects (request #58 (1)).
+ * `one` carries the file offsets of the one dictionary's /ByteRange key and
+ * value, or null when it has no /ByteRange.
+ */
+export type SignatureScan =
+  | { readonly state: 'none' }
+  | { readonly state: 'one'; readonly byteRange: ByteRangeKey | null }
+  | { readonly state: 'unsupported'; readonly detail: 'multiple-signatures' | 'signature-compressed' };
+
 export type StructureResult =
-  | { readonly ok: true; readonly revisions: readonly Revision[] }
+  | { readonly ok: true; readonly revisions: readonly Revision[]; readonly signature: SignatureScan }
   | { readonly ok: false; readonly detail: StructureDetail };
 
 class StructureFault extends Error {
@@ -155,24 +176,30 @@ interface Entry {
   readonly field3: number;
 }
 
-interface Section {
+/** A section's own entries: the first for each object number (T033's addLocal). */
+type LocalEntries = Map<number, Entry>;
+
+interface SectionInfo {
   readonly offset: number;
   readonly start: number;
   readonly kind: 'table' | 'stream';
   readonly prev: number | null;
   readonly hiddenStreamOffset: number | null;
-  /** The table's or the stream's own entries, in their order. */
-  readonly entries: readonly Entry[];
-  /** A hybrid table's hidden-stream entries (empty otherwise). */
-  readonly hidden: readonly Entry[];
+}
+
+interface Section extends SectionInfo {
+  readonly local: LocalEntries;
+  /** A hybrid table's hidden-stream entries, or null. */
+  readonly hidden: LocalEntries | null;
 }
 
 interface Budget {
-  entries: number;
   /** Inflated bytes still allowed across all decoded cross-reference and object streams. */
   inflated: number;
   /** White-space and comment bytes skipped so far around object headers. */
   skipped: number;
+  /** Bytes of effective objects parsed so far. */
+  parsed: number;
 }
 
 const HEADER_LENGTH = 8; // `%PDF-x.y`
@@ -181,18 +208,20 @@ const MAX_GENERATION = 65535;
 /** Read the revision structure of `bytes`. Never throws on malformed input. */
 export function readRevisionStructure(bytes: Uint8Array): StructureResult {
   try {
-    return { ok: true, revisions: walk(bytes) };
+    const { revisions, signature } = walk(bytes);
+    return { ok: true, revisions, signature };
   } catch (error) {
     if (error instanceof StructureFault) return { ok: false, detail: error.detail };
     throw error;
   }
 }
 
-function walk(bytes: Uint8Array): Revision[] {
+function walk(bytes: Uint8Array): { revisions: Revision[]; signature: SignatureScan } {
   if (bytes.length > VERIFIER_LIMITS.maxInputBytes) fault('input-too-large');
   checkHeader(bytes);
-  const budget: Budget = { entries: 0, inflated: VERIFIER_LIMITS.maxXrefInflatedBytes, skipped: 0 };
-  const newestFirst: Section[] = [];
+  const budget: Budget = { inflated: VERIFIER_LIMITS.maxXrefInflatedBytes, skipped: 0, parsed: 0 };
+  const sections: SectionInfo[] = [];
+  const effective = new Map<number, Entry>();
   // B3: /Prev in either direction, as T033 follows it; no section is visited
   // twice, whether named by the same offset or reached at the same position.
   const seenOffsets = new Set<number>();
@@ -200,20 +229,27 @@ function walk(bytes: Uint8Array): Revision[] {
   let offset = finalStartxref(bytes);
   let origin: 'startxref' | 'prev' = 'startxref';
   for (;;) {
-    if (newestFirst.length >= VERIFIER_LIMITS.maxRevisions) fault('too-many-revisions');
+    if (sections.length >= VERIFIER_LIMITS.maxRevisions) fault('too-many-revisions');
     if (seenOffsets.has(offset)) fault('prev-revisited');
     seenOffsets.add(offset);
     const section = readSection(bytes, offset, origin, budget);
     if (seenStarts.has(section.start)) fault('prev-revisited');
     seenStarts.add(section.start);
-    newestFirst.push(section);
+    mergeSection(effective, section);
+    sections.push({
+      offset: section.offset,
+      start: section.start,
+      kind: section.kind,
+      prev: section.prev,
+      hiddenStreamOffset: section.hiddenStreamOffset,
+    });
     if (section.prev === null) break;
     offset = section.prev;
     origin = 'prev';
   }
-  const revisions = locateRevisions(bytes, newestFirst);
-  checkEffectiveEntries(bytes, newestFirst, budget);
-  return revisions;
+  const revisions = locateRevisions(bytes, sections);
+  const signature = checkEffectiveObjects(bytes, effective, budget);
+  return { revisions, signature };
 }
 
 function spend(budget: Budget, skipped: number): void {
@@ -269,15 +305,35 @@ function readSection(bytes: Uint8Array, offset: number, origin: 'startxref' | 'p
   }
   const stream = readXrefStream(bytes, offset, budget);
   if (stream === null) fault(notXref);
-  return {
-    offset,
-    start: stream.start,
-    kind: 'stream',
-    prev: stream.prev,
-    hiddenStreamOffset: null,
-    entries: stream.entries,
-    hidden: [],
+  return { offset, start: stream.start, kind: 'stream', prev: stream.prev, hiddenStreamOffset: null, local: stream.local, hidden: null };
+}
+
+/** T033's addLocal: the first entry for an object number in a section wins; a section's own count is bounded. */
+function addLocal(local: LocalEntries, entry: Entry): void {
+  if (local.has(entry.num)) return;
+  local.set(entry.num, entry);
+  if (local.size > VERIFIER_LIMITS.maxXrefEntries) fault('too-many-xref-entries');
+}
+
+/**
+ * T033's addEntry, newest section first: the first entry for an object number
+ * wins. In a hybrid section, the in-use table entry comes before the /XRefStm
+ * entry, and the /XRefStm entry before a free table entry (B1 (c)). The
+ * distinct effective entries are bounded.
+ */
+function mergeSection(effective: Map<number, Entry>, section: Section): void {
+  const keep = (entry: Entry): void => {
+    if (effective.has(entry.num)) return;
+    effective.set(entry.num, entry);
+    if (effective.size > VERIFIER_LIMITS.maxXrefEntries) fault('too-many-xref-entries');
   };
+  if (section.hidden === null) {
+    for (const entry of section.local.values()) keep(entry);
+    return;
+  }
+  for (const entry of section.local.values()) if (entry.type === 1) keep(entry);
+  for (const entry of section.hidden.values()) keep(entry);
+  for (const entry of section.local.values()) if (entry.type === 0) keep(entry);
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +342,7 @@ function readSection(bytes: Uint8Array, offset: number, origin: 'startxref' | 'p
 
 function readTableSection(bytes: Uint8Array, offset: number, start: number, budget: Budget): Section {
   const end = bytes.length;
-  const entries: Entry[] = [];
+  const local: LocalEntries = new Map();
   let p = start + 4;
   for (;;) {
     p = skipWhitespaceAndComments(bytes, p, end);
@@ -296,12 +352,11 @@ function readTableSection(bytes: Uint8Array, offset: number, start: number, budg
     if (first === null) fault('xref-table-malformed');
     const count = readUnsignedInt(bytes, skipWhitespaceAndComments(bytes, first.next, end), end);
     if (count === null) fault('xref-table-malformed');
-    budget.entries += count.value;
-    if (budget.entries > VERIFIER_LIMITS.maxXrefEntries) fault('too-many-xref-entries');
     p = count.next;
+    // Each entry takes at least five bytes, so the input bounds this loop.
     for (let i = 0; i < count.value; i += 1) {
       const read = readTableEntry(bytes, p, first.value + i);
-      entries.push(read.entry);
+      addLocal(local, read.entry);
       p = read.next;
     }
   }
@@ -315,16 +370,16 @@ function readTableSection(bytes: Uint8Array, offset: number, start: number, budg
   if (trailer.kind !== 'dict') fault('trailer-malformed');
   const prev = optionalOffset(trailer, 'Prev', 'trailer-malformed');
   const hiddenStreamOffset = optionalOffset(trailer, 'XRefStm', 'trailer-malformed');
-  let hidden: readonly Entry[] = [];
+  let hidden: LocalEntries | null = null;
   if (hiddenStreamOffset !== null) {
     // B1 (c): bounded only by the file; its entries are kept apart so that the
-    // hybrid precedence in effectiveEntries can apply.
+    // hybrid precedence in mergeSection can apply.
     if (hiddenStreamOffset >= end) fault('xrefstm-not-xref-stream');
     const stream = readXrefStream(bytes, hiddenStreamOffset, budget);
     if (stream === null) fault('xrefstm-not-xref-stream');
-    hidden = stream.entries;
+    hidden = stream.local;
   }
-  return { offset, start, kind: 'table', prev, hiddenStreamOffset, entries, hidden };
+  return { offset, start, kind: 'table', prev, hiddenStreamOffset, local, hidden };
 }
 
 /** One entry as three tokens: offset, generation (at most 65535), and exactly `n` or `f`. */
@@ -358,7 +413,7 @@ function readXrefStream(
   bytes: Uint8Array,
   offset: number,
   budget: Budget,
-): { start: number; prev: number | null; entries: Entry[] } | null {
+): { start: number; prev: number | null; local: LocalEntries } | null {
   let object: IndirectObject | null;
   try {
     object = readIndirectObject(bytes, offset);
@@ -374,9 +429,9 @@ function readXrefStream(
   const length = intValue(dictEntry(object.value, 'Length'));
   if (length === null) fault('xref-stream-malformed');
   const raw = streamBody(bytes, object.streamStart, length, budget, XREF_STREAM_FAULTS);
-  const decoded = decodeStream(object.value, raw, budget, XREF_STREAM_FAULTS, () => rowWidth(object.value));
-  const entries = xrefStreamEntries(object.value, decoded, budget);
-  return { start: object.header.start, prev: optionalOffset(object.value, 'Prev', 'xref-stream-malformed'), entries };
+  const decoded = decodeStream(object.value, raw, budget, XREF_STREAM_FAULTS);
+  const local = xrefStreamEntries(object.value, decoded);
+  return { start: object.header.start, prev: optionalOffset(object.value, 'Prev', 'xref-stream-malformed'), local };
 }
 
 /** The details one stream decode reports: a cross-reference stream's own, or those of an object stream a type-2 entry names. */
@@ -417,36 +472,26 @@ function streamBody(bytes: Uint8Array, start: number, length: number, budget: Bu
 }
 
 /**
- * No filter, or FlateDecode with no predictor or a PNG predictor (one byte per
- * pixel). Inflated bytes count against one total budget over every decoded
- * stream, as T033's maxInflatedBytes does. `columns`, when given, yields the
- * only /Columns accepted (a cross-reference stream's row width), read only
- * when a predictor is present.
+ * T033's decodeStructuralStream: no filter when /Filter is absent, null or an
+ * empty array, and /DecodeParms is then ignored; otherwise exactly one
+ * FlateDecode (a name or a one-element array) with /Predictor 1 or a PNG
+ * predictor 10 to 15 (/BitsPerComponent 8, /Colors 1 to 4, /Columns at least
+ * 1; each row is Colors x Columns bytes plus its tag byte). Inflated bytes
+ * count against one total budget over every decoded stream.
  */
-function decodeStream(
-  dict: PdfValue,
-  raw: Uint8Array,
-  budget: Budget,
-  faults: DecodeFaults,
-  columns: (() => number) | null,
-): Uint8Array {
+function decodeStream(dict: PdfValue, raw: Uint8Array, budget: Budget, faults: DecodeFaults): Uint8Array {
   const filter = dictEntry(dict, 'Filter');
+  if (filter === undefined || filter.kind === 'null' || (filter.kind === 'array' && filter.items.length === 0)) return raw;
   let filterName: string | null = null;
-  if (filter !== undefined) {
-    if (filter.kind === 'name') filterName = filter.value;
-    else if (filter.kind === 'array' && filter.items.length === 1) filterName = nameValue(filter.items[0]);
-    if (filterName !== 'FlateDecode') fault(faults.filter);
-  }
+  if (filter.kind === 'name') filterName = filter.value;
+  else if (filter.kind === 'array' && filter.items.length === 1) filterName = nameValue(filter.items[0]);
+  if (filterName !== 'FlateDecode') fault(faults.filter);
   let parms = dictEntry(dict, 'DecodeParms');
   if (parms !== undefined && parms.kind === 'array') {
     if (parms.items.length !== 1) fault(faults.malformed);
     parms = parms.items[0];
   }
   if (parms !== undefined && parms.kind !== 'dict' && parms.kind !== 'null') fault(faults.malformed);
-  if (filterName === null) {
-    if (parms !== undefined && parms.kind === 'dict') fault(faults.malformed);
-    return raw;
-  }
   let decoded: Uint8Array;
   try {
     if (budget.inflated < 1) fault(faults.tooLarge);
@@ -461,27 +506,26 @@ function decodeStream(
   const predictor = intValue(dictEntry(parms, 'Predictor')) ?? 1;
   if (predictor === 1) return decoded;
   if (predictor < 10 || predictor > 15) fault(faults.predictor);
-  const stated = intValue(dictEntry(parms, 'Columns')) ?? 1;
-  const colors = intValue(dictEntry(parms, 'Colors')) ?? 1;
   const bits = intValue(dictEntry(parms, 'BitsPerComponent')) ?? 8;
-  if (colors !== 1 || bits !== 8) fault(faults.predictor);
-  if (columns !== null && stated !== columns()) fault(faults.malformed);
-  return undoPngPredictor(decoded, stated, faults);
+  const colors = intValue(dictEntry(parms, 'Colors')) ?? 1;
+  const columns = intValue(dictEntry(parms, 'Columns')) ?? 1;
+  if (bits !== 8 || colors < 1 || colors > 4 || columns < 1) fault(faults.predictor);
+  return undoPngPredictor(decoded, colors * columns, colors, faults);
 }
 
-/** PNG row filters 0 None, 1 Sub, 2 Up, 3 Average, 4 Paeth; one byte per pixel. */
-function undoPngPredictor(data: Uint8Array, columns: number, faults: DecodeFaults): Uint8Array {
-  const rowLength = columns + 1;
-  if (columns < 1 || data.length % rowLength !== 0) fault(faults.malformed);
+/** PNG row filters 0 None, 1 Sub, 2 Up, 3 Average, 4 Paeth; `bpp` bytes per pixel. */
+function undoPngPredictor(data: Uint8Array, rowBytes: number, bpp: number, faults: DecodeFaults): Uint8Array {
+  const rowLength = rowBytes + 1;
+  if (data.length % rowLength !== 0) fault(faults.malformed);
   const rows = data.length / rowLength;
-  const out = new Uint8Array(rows * columns);
+  const out = new Uint8Array(rows * rowBytes);
   for (let r = 0; r < rows; r += 1) {
     const filter = byteAt(data, r * rowLength);
-    for (let i = 0; i < columns; i += 1) {
+    for (let i = 0; i < rowBytes; i += 1) {
       const x = byteAt(data, r * rowLength + 1 + i);
-      const left = i > 0 ? byteAt(out, r * columns + i - 1) : 0;
-      const up = r > 0 ? byteAt(out, (r - 1) * columns + i) : 0;
-      const upLeft = i > 0 && r > 0 ? byteAt(out, (r - 1) * columns + i - 1) : 0;
+      const left = i >= bpp ? byteAt(out, r * rowBytes + i - bpp) : 0;
+      const up = r > 0 ? byteAt(out, (r - 1) * rowBytes + i) : 0;
+      const upLeft = i >= bpp && r > 0 ? byteAt(out, (r - 1) * rowBytes + i - bpp) : 0;
       let v: number;
       if (filter === 0) v = x;
       else if (filter === 1) v = x + left;
@@ -489,7 +533,7 @@ function undoPngPredictor(data: Uint8Array, columns: number, faults: DecodeFault
       else if (filter === 3) v = x + ((left + up) >> 1);
       else if (filter === 4) v = x + paeth(left, up, upLeft);
       else return fault(faults.pngFilter);
-      out[r * columns + i] = v & 0xff;
+      out[r * rowBytes + i] = v & 0xff;
     }
   }
   return out;
@@ -504,6 +548,7 @@ function paeth(a: number, b: number, c: number): number {
   return pb <= pc ? b : c;
 }
 
+/** /W: three non-negative integers, each at most maxXrefFieldWidth, not all zero (T033's readXrefStream). */
 function widths(dict: PdfValue): [number, number, number] {
   const w = dictEntry(dict, 'W');
   if (w === undefined || w.kind !== 'array' || w.items.length !== 3) fault('xref-stream-malformed');
@@ -514,16 +559,11 @@ function widths(dict: PdfValue): [number, number, number] {
   for (const width of [a, b, c]) {
     if (width < 0 || width > VERIFIER_LIMITS.maxXrefFieldWidth) fault('xref-stream-malformed');
   }
-  if (b === 0) fault('xref-stream-malformed');
+  if (a + b + c === 0) fault('xref-stream-malformed');
   return [a, b, c];
 }
 
-function rowWidth(dict: PdfValue): number {
-  const [a, b, c] = widths(dict);
-  return a + b + c;
-}
-
-function xrefStreamEntries(dict: PdfValue, data: Uint8Array, budget: Budget): Entry[] {
+function xrefStreamEntries(dict: PdfValue, data: Uint8Array): LocalEntries {
   const [w1, w2, w3] = widths(dict);
   const row = w1 + w2 + w3;
   const size = intValue(dictEntry(dict, 'Size'));
@@ -543,22 +583,22 @@ function xrefStreamEntries(dict: PdfValue, data: Uint8Array, budget: Budget): En
   }
   let total = 0;
   for (const [, count] of pairs) total += count;
-  budget.entries += total;
-  if (budget.entries > VERIFIER_LIMITS.maxXrefEntries) fault('too-many-xref-entries');
+  // The rows must fill the decoded data exactly, so its length bounds the loop.
   if (data.length !== total * row) fault('xref-stream-malformed');
-  const entries: Entry[] = [];
+  const local: LocalEntries = new Map();
   let p = 0;
   for (const [first, count] of pairs) {
     for (let i = 0; i < count; i += 1) {
       const type = w1 === 0 ? 1 : readField(data, p, w1);
-      const field2 = readField(data, p + w1, w2);
+      const field2 = w2 === 0 ? 0 : readField(data, p + w1, w2);
       const field3 = w3 === 0 ? 0 : readField(data, p + w1 + w2, w3);
       p += row;
-      // Types above 2 are references to the null object (ISO 32000, 7.5.8.3).
-      if (type === 0 || type === 1 || type === 2) entries.push({ num: first + i, type, field2, field3 });
+      // Types other than 1 and 2 (0, and 3 or above) are free (T033).
+      const kind: 0 | 1 | 2 = type === 1 ? 1 : type === 2 ? 2 : 0;
+      addLocal(local, { num: first + i, type: kind, field2, field3 });
     }
   }
-  return entries;
+  return local;
 }
 
 /**
@@ -573,7 +613,7 @@ function readField(data: Uint8Array, at: number, width: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Revision ends and entry checks
+// Revision ends
 // ---------------------------------------------------------------------------
 
 /**
@@ -581,7 +621,7 @@ function readField(data: Uint8Array, at: number, width: number): number {
  * revision's region runs from its section to the next section by position,
  * not to the next in the chain. Duplicate starts were refused by walk.
  */
-function locateRevisions(bytes: Uint8Array, newestFirst: readonly Section[]): Revision[] {
+function locateRevisions(bytes: Uint8Array, newestFirst: readonly SectionInfo[]): Revision[] {
   const sections = [...newestFirst].sort((a, b) => a.start - b.start);
   const revisions: Revision[] = [];
   for (let k = 0; k < sections.length; k += 1) {
@@ -614,74 +654,81 @@ function locateRevisions(bytes: Uint8Array, newestFirst: readonly Section[]): Re
   return revisions;
 }
 
-/**
- * B2: the effective entry for each object number is the first one met, newest
- * section first, as T033's addEntry keeps it. Inside a hybrid section the
- * order is the table's in-use entries, then the /XRefStm entries, then the
- * table's free entries (B1 (c)). Superseded entries are never read.
- */
-function effectiveEntries(newestFirst: readonly Section[]): Map<number, Entry> {
-  const effective = new Map<number, Entry>();
-  const keep = (entry: Entry): void => {
-    if (!effective.has(entry.num)) effective.set(entry.num, entry);
-  };
-  for (const section of newestFirst) {
-    if (section.kind === 'table') {
-      for (const entry of section.entries) if (entry.type === 1) keep(entry);
-      for (const entry of section.hidden) keep(entry);
-      for (const entry of section.entries) if (entry.type === 0) keep(entry);
-    } else {
-      for (const entry of section.entries) keep(entry);
-    }
-  }
-  return effective;
-}
+// ---------------------------------------------------------------------------
+// Effective objects: entry checks and the signature scan
+// ---------------------------------------------------------------------------
 
 /**
- * An object stream already read: its object number, its /N, its decoded data,
- * and the object numbers of the header pairs parsed so far (read on demand, up
- * to the highest index an entry names).
+ * An object stream already read: its object number, /N, /First, decoded data,
+ * and the header pairs parsed so far (read on demand, in order, up to the
+ * highest index an entry names).
  */
 interface ObjectStream {
   readonly num: number;
   readonly count: number;
+  readonly first: number;
   readonly data: Uint8Array;
-  readonly numbers: number[];
+  readonly pairs: Array<readonly [number, number]>;
   pos: number;
 }
 
-function checkEffectiveEntries(bytes: Uint8Array, newestFirst: readonly Section[], budget: Budget): void {
-  const effective = effectiveEntries(newestFirst);
+/**
+ * Every effective entry, as T033's parseObjects reads it: an in-use entry's
+ * header and object, and a compressed entry's object stream, header pair and
+ * object. Each object, with every dictionary nested in it, goes to the
+ * signature scan.
+ */
+function checkEffectiveObjects(bytes: Uint8Array, effective: ReadonlyMap<number, Entry>, budget: Budget): SignatureScan {
+  const scan = new SignatureCollector();
   const objectStreams = new Map<number, ObjectStream>(); // keyed by the stream's offset
   for (const entry of effective.values()) {
-    if (entry.type === 1) checkInUseEntry(bytes, entry, budget);
-    else if (entry.type === 2) checkCompressedEntry(bytes, entry, effective, objectStreams, budget);
+    if (entry.type === 1) {
+      const object = readInUseObject(bytes, entry, budget);
+      scan.object(entry.num, object.gen, object.value, false);
+    } else if (entry.type === 2) {
+      scan.object(entry.num, 0, readCompressedObject(bytes, entry, effective, objectStreams, budget), true);
+    }
   }
+  return scan.result();
 }
 
-/** B1 (b): the offset is bounded only by the file; the header there carries the entry's number and generation. */
-function checkInUseEntry(bytes: Uint8Array, entry: Entry, budget: Budget): void {
+function charge(budget: Budget, parsed: number): void {
+  budget.parsed += parsed;
+  if (budget.parsed > VERIFIER_LIMITS.maxObjectParseBytes) fault('too-much-work');
+}
+
+/** B1 (b): the offset is bounded only by the file; the header there carries the entry's number and generation, and the object parses. */
+function readInUseObject(bytes: Uint8Array, entry: Entry, budget: Budget): { gen: number; value: PdfValue } {
   const header = readObjectHeader(bytes, entry.field2);
   if (header === null) fault('xref-entry-mismatch');
   spend(budget, header.skipped);
   if (header.num !== entry.num || header.gen !== entry.field3) fault('xref-entry-mismatch');
+  let parsed: { value: PdfValue; next: number };
+  try {
+    parsed = parseValue(bytes, header.next, bytes.length);
+  } catch (error) {
+    if (error instanceof SyntaxFault) fault('object-malformed');
+    throw error;
+  }
+  charge(budget, parsed.next - header.next);
+  return { gen: header.gen, value: parsed.value };
 }
 
 /**
  * An effective type-2 entry names an object stream whose own effective entry is
  * in use and reaches a /Type /ObjStm stream object with that number; its index
- * is below that stream's /N (B1 (d), restored); and the header pair at that
- * index names the entry's own object number, as T033's readCompressed requires
- * (request #57 item 4, under #56 B1). Each stream object is read and decoded
- * once, cached by offset together with its number.
+ * is below /N (B1 (d)); the header pair at that index names the entry's own
+ * object number (request #57 item 4); and the object at /First plus the pair's
+ * offset parses. Each stream object is read and decoded once, cached by offset
+ * together with its number.
  */
-function checkCompressedEntry(
+function readCompressedObject(
   bytes: Uint8Array,
   entry: Entry,
   effective: ReadonlyMap<number, Entry>,
   objectStreams: Map<number, ObjectStream>,
   budget: Budget,
-): void {
+): PdfValue {
   const stream = effective.get(entry.field2);
   if (stream === undefined || stream.type !== 1) fault('xref-type2-not-object-stream');
   let read = objectStreams.get(stream.field2);
@@ -691,7 +738,19 @@ function checkCompressedEntry(
   }
   if (read.num !== entry.field2) fault('xref-type2-not-object-stream');
   if (entry.field3 >= read.count) fault('xref-type2-not-object-stream');
-  if (headerNumber(read, entry.field3) !== entry.num) fault('xref-entry-mismatch');
+  const [number, offset] = headerPair(read, entry.field3);
+  if (number !== entry.num) fault('xref-entry-mismatch');
+  const at = read.first + offset;
+  if (at >= read.data.length) fault('xref-type2-not-object-stream');
+  let parsed: { value: PdfValue; next: number };
+  try {
+    parsed = parseValue(read.data, at, read.data.length);
+  } catch (error) {
+    if (error instanceof SyntaxFault) fault('object-malformed');
+    throw error;
+  }
+  charge(budget, parsed.next - at);
+  return parsed.value;
 }
 
 function readObjectStream(
@@ -711,10 +770,13 @@ function readObjectStream(
   if (nameValue(dictEntry(object.value, 'Type')) !== 'ObjStm') fault('xref-type2-not-object-stream');
   const count = intValue(dictEntry(object.value, 'N'));
   if (count === null || count < 0) fault('xref-type2-not-object-stream');
+  const first = intValue(dictEntry(object.value, 'First'));
+  if (first === null || first < 0) fault('xref-type2-not-object-stream');
   const length = streamLength(bytes, dictEntry(object.value, 'Length'), effective, budget);
   const raw = streamBody(bytes, object.streamStart, length, budget, OBJECT_STREAM_FAULTS);
-  const data = decodeStream(object.value, raw, budget, OBJECT_STREAM_FAULTS, null);
-  return { num: object.num, count, data, numbers: [], pos: 0 };
+  const data = decodeStream(object.value, raw, budget, OBJECT_STREAM_FAULTS);
+  if (first > data.length) fault('xref-type2-not-object-stream');
+  return { num: object.num, count, first, data, pairs: [], pos: 0 };
 }
 
 /**
@@ -749,22 +811,85 @@ function streamLength(
 }
 
 /**
- * The object number of header pair `index` (pairs of unsigned integers,
- * separated by white-space and comments, from the start of the decoded data).
- * Pairs are parsed once, in order, and only as far as an entry needs; each
- * consumes at least one byte, so the work is bounded by the data's length.
+ * Header pair `index`: two unsigned integers (object number, then offset),
+ * separated by white-space and comments, read from the start of the decoded
+ * data in a region that ends at /First, so the last number may run right up
+ * to /First (T033's loadObjectStream). Pairs are parsed once, in order, and
+ * only as far as an entry needs; each consumes at least one byte, so /First
+ * bounds the work.
  */
-function headerNumber(stream: ObjectStream, index: number): number {
+function headerPair(stream: ObjectStream, index: number): readonly [number, number] {
   const data = stream.data;
-  while (stream.numbers.length <= index) {
-    const num = readUnsignedInt(data, skipWhitespaceAndComments(data, stream.pos, data.length), data.length);
+  const end = stream.first;
+  while (stream.pairs.length <= index) {
+    const num = readUnsignedInt(data, skipWhitespaceAndComments(data, stream.pos, end), end);
     if (num === null) fault('xref-type2-not-object-stream');
-    const offset = readUnsignedInt(data, skipWhitespaceAndComments(data, num.next, data.length), data.length);
+    const offset = readUnsignedInt(data, skipWhitespaceAndComments(data, num.next, end), end);
     if (offset === null) fault('xref-type2-not-object-stream');
-    stream.numbers.push(num.value);
+    stream.pairs.push([num.value, offset.value]);
     stream.pos = offset.next;
   }
-  const number = stream.numbers[index];
-  if (number === undefined) return fault('xref-type2-not-object-stream');
-  return number;
+  const pair = stream.pairs[index];
+  if (pair === undefined) return fault('xref-type2-not-object-stream');
+  return pair;
+}
+
+interface FoundSignature {
+  readonly dict: PdfValue & { readonly kind: 'dict' };
+  /** The object's number when the dictionary is the object's own value, else null. */
+  readonly num: number | null;
+  readonly gen: number;
+  readonly compressed: boolean;
+}
+
+/**
+ * Signatures by DICTIONARY, as T033's classifyValue finds them (request #58
+ * (1)): every dictionary in every effective object is examined, nested ones
+ * and stream dictionaries included; string contents are never scanned. A
+ * dictionary is a signature when /Type is /Sig or /DocTimeStamp, or when it has
+ * both /ByteRange and /Contents. More than one, any /DocMDP or /UR3 key, or a
+ * /FT /Sig field whose non-null /V is not the one signature dictionary, is
+ * `multiple-signatures`.
+ */
+class SignatureCollector {
+  private readonly found: FoundSignature[] = [];
+  private more = false;
+  private permissions = false;
+  private readonly fieldValues: PdfValue[] = [];
+
+  object(num: number, gen: number, value: PdfValue, compressed: boolean): void {
+    this.visit(value, num, gen, compressed, true);
+  }
+
+  private visit(value: PdfValue, num: number, gen: number, compressed: boolean, top: boolean): void {
+    if (value.kind === 'array') {
+      for (const item of value.items) this.visit(item, num, gen, compressed, false);
+      return;
+    }
+    if (value.kind !== 'dict') return;
+    const type = nameValue(value.entries.get('Type'));
+    if (type === 'Sig' || type === 'DocTimeStamp' || (value.entries.has('ByteRange') && value.entries.has('Contents'))) {
+      if (this.found.length < 2) this.found.push({ dict: value, num: top ? num : null, gen, compressed });
+      else this.more = true;
+    }
+    if (value.entries.has('DocMDP') || value.entries.has('UR3')) this.permissions = true;
+    if (nameValue(value.entries.get('FT')) === 'Sig') {
+      const v = value.entries.get('V');
+      if (v !== undefined && v.kind !== 'null') this.fieldValues.push(v);
+    }
+    for (const item of value.entries.values()) this.visit(item, num, gen, compressed, false);
+  }
+
+  result(): SignatureScan {
+    const [one, second] = this.found;
+    if (second !== undefined || this.more || this.permissions) return { state: 'unsupported', detail: 'multiple-signatures' };
+    for (const v of this.fieldValues) {
+      if (one === undefined) return { state: 'unsupported', detail: 'multiple-signatures' };
+      const same = v.kind === 'ref' ? one.num !== null && v.num === one.num && v.gen === one.gen : v === one.dict;
+      if (!same) return { state: 'unsupported', detail: 'multiple-signatures' };
+    }
+    if (one === undefined) return { state: 'none' };
+    if (one.compressed) return { state: 'unsupported', detail: 'signature-compressed' };
+    return { state: 'one', byteRange: one.dict.byteRangeKey };
+  }
 }

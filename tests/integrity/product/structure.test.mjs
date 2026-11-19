@@ -19,7 +19,7 @@ import { Buffer } from 'node:buffer';
 import { readFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 import { readRevisionStructure, VERIFIER_LIMITS } from '../../../src/verifier/index.ts';
-import { appendUpdate, buildBase } from './helpers/pdf-build.mjs';
+import { appendUpdate, appendXrefStreamSection, buildBase } from './helpers/pdf-build.mjs';
 
 function ok(bytes) {
   const result = readRevisionStructure(bytes);
@@ -283,6 +283,7 @@ function codeOf(relative) {
 
 test('[VB-06] the composed cases cannot skip: no skip, todo, catch or capability probe (B5)', () => {
   const composed = codeOf('./structure-composed.test.mjs');
+  const sealed = codeOf('./strand-sealed.test.mjs');
   const helper = codeOf('./helpers/product-compose.mjs');
   const forbidden = [
     /\bskip\b/,
@@ -295,10 +296,18 @@ test('[VB-06] the composed cases cannot skip: no skip, todo, catch or capability
     /\bbwrap\b|\bbubblewrap\b|\bunshare\b/,
     /\bexistsSync\b|\baccessSync\b|\bspawn|\bexec/,
   ];
-  for (const [name, code] of [['structure-composed.test.mjs', composed], ['helpers/product-compose.mjs', helper]]) {
+  const files = [
+    ['structure-composed.test.mjs', composed],
+    ['strand-sealed.test.mjs', sealed],
+    ['helpers/product-compose.mjs', helper],
+  ];
+  for (const [name, code] of files) {
     for (const pattern of forbidden) assert.doesNotMatch(code, pattern, `${name} must not contain ${pattern}`);
   }
   assert.equal(composed.match(/^test\(/gm)?.length, 4, 'the four composed cases');
+  assert.equal(sealed.match(/^test\(/gm)?.length, 5, 'the five sealed strand-path cases (request #58)');
+  assert.ok((sealed.match(/await sealAndVerify\(/g)?.length ?? 0) >= 5, 'every strand-path case seals and verifies');
+  assert.match(sealed, /^import \{ sealWithProduct, syntheticEvidenceDigest \} from '\.\/helpers\/product-seal\.mjs';$/m, 'a static import');
   assert.ok((composed.match(/await composeAndRead\(t, /g)?.length ?? 0) >= 4, 'every case composes and reads');
   assert.match(composed, /^import \{ composeWithProduct \} from '\.\/helpers\/product-compose\.mjs';$/m, 'a static import');
   assert.match(helper, /^import \{ composeSealRevision \} from /m, 'a static import');
@@ -315,4 +324,109 @@ test('[VB-06] an effective type-2 entry whose object-stream header names another
   failsWith(buildBase({ xref: 'hybrid', objStmHeaderOverride: { index: 0, num: 2 } }).bytes, 'xref-entry-mismatch');
   // Only effective entries: once an update rewrites object 2, its compressed entry is never read.
   ok(appendUpdate(buildBase({ xref: 'stream', objStmHeaderOverride: { index: 1, num: 9 } }), [{ num: 2, text: PAGES }]).bytes);
+});
+
+// ---------------------------------------------------------------------------
+// Request #58 (5): the recheck's read-only findings against 0c20abd, builder-only
+// (no capability). The sealed strand paths P1 to P5 are in strand-sealed.test.mjs.
+//
+// Mutants killed here: numbers capped at 15 digits; integral reals refused;
+// comments refused inside references; the in-use entry preferred within a
+// section; types of 3 or above dropped instead of free; /W[1] = 0 refused;
+// /Filter null or [] refused, or /DecodeParms read without a filter; PNG
+// /Colors other than 1 refused or /Columns tied to /W; the object-stream header
+// read past /First; entries summed across sections; the container cap kept;
+// and the reviewer's R4 and R5.
+// ---------------------------------------------------------------------------
+
+const BASE_TRAILER = 'trailer\n<< /Size 5 /Root 1 0 R >>';
+
+/** `text` with its one occurrence of `from` replaced, as bytes. */
+function editedBytes(text, from, to) {
+  const count = text.split(from).length - 1;
+  assert.equal(count, 1, `the edit site occurs ${count} times`);
+  return Buffer.from(text.replace(from, () => to), 'latin1');
+}
+
+test('[VB-06] trailer numbers of up to 32 characters, integral reals and comments inside references are read as T033 reads them (request #58)', () => {
+  const text = buildBase().bytes.toString('latin1');
+  const real = `-${'1'.repeat(10)}.${'2'.repeat(20)}`;
+  ok(editedBytes(text, BASE_TRAILER, `trailer\n<< /Size 5.0 /Root 1 0 % c\nR /N1 1234567890123456 /N2 ${real} >>`));
+  failsWith(editedBytes(text, BASE_TRAILER, `trailer\n<< /Size 5 /Root 1 0 R /N3 ${'1'.repeat(33)} >>`), 'trailer-malformed');
+  failsWith(editedBytes(text, BASE_TRAILER, 'trailer\n<< /Size 5 /Root 1 0 R /Prev 1.5 >>'), 'trailer-malformed');
+  const base = buildBase();
+  const updated = appendUpdate(base, [{ num: 5, text: '<< >>' }]).bytes.toString('latin1');
+  assert.equal(ok(editedBytes(updated, `/Prev ${base.startxref} >>`, `/Prev ${base.startxref}.0 >>`)).length, 2);
+});
+
+test('[VB-06] within one table section the first entry for an object number wins, a free one included (request #58)', () => {
+  const text = buildBase().bytes.toString('latin1');
+  ok(editedBytes(text, BASE_TRAILER, '5 1\n0000000000 00000 f \n5 1\n0000099999 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R >>'));
+  failsWith(
+    editedBytes(text, BASE_TRAILER, '5 1\n0000099999 00000 n \n5 1\n0000000000 00000 f \ntrailer\n<< /Size 6 /Root 1 0 R >>'),
+    'xref-entry-mismatch',
+  );
+});
+
+test('[VB-06] cross-reference stream types of 3 or above are free and shadow older entries; /W[0] = 0 and /W[1] = 0 are allowed (request #58)', () => {
+  const bad = buildBase({ xref: 'stream', entryDelta: { num: 4, delta: 2 } });
+  failsWith(bad.bytes, 'xref-entry-mismatch');
+  ok(appendXrefStreamSection(bad, { widths: [1, 4, 2], groups: [{ first: 4, rows: [[3, 0, 0]] }] }).bytes);
+  ok(appendXrefStreamSection(bad, { widths: [1, 4, 2], groups: [{ first: 4, rows: [[255, 9, 9]] }] }).bytes);
+  const stream = buildBase({ xref: 'stream' });
+  const objects = [{ num: 7, text: '<< /Producer (w0) >>' }];
+  const typeOne = appendXrefStreamSection(stream, {
+    objects,
+    xnum: 8,
+    widths: [0, 4, 2],
+    rowsFor: (offsets, at) => [{ first: 7, rows: [[0, offsets.get(7), 0], [0, at, 0]] }],
+  });
+  ok(typeOne.bytes);
+  ok(appendXrefStreamSection(stream, { widths: [1, 0, 1], groups: [{ first: 7, rows: [[0, 0, 0]] }] }).bytes);
+  failsWith(appendXrefStreamSection(stream, { widths: [0, 0, 0], groups: [{ first: 7, rows: [[0, 0, 0]] }] }).bytes, 'xref-stream-malformed');
+});
+
+test('[VB-06] /Filter null or [] means no filter with /DecodeParms ignored; PNG /Colors 1 to 4 with any /Columns (request #58)', () => {
+  ok(buildBase({ xref: 'stream', xrefDictExtra: ' /Filter null' }).bytes);
+  ok(buildBase({ xref: 'stream', xrefDictExtra: ' /Filter []' }).bytes);
+  ok(buildBase({ xref: 'stream', xrefDictExtra: ' /DecodeParms << /Predictor 12 /Columns 7 >>' }).bytes);
+  ok(buildBase({ xref: 'stream', xrefDictExtra: ' /Filter [] /DecodeParms << /Predictor 99 >>' }).bytes);
+  failsWith(buildBase({ xref: 'stream', xrefDictExtra: ' /Filter /LZWDecode' }).bytes, 'xref-stream-filter-unsupported');
+  ok(buildBase({ xref: 'stream-flate', xrefPng: { colors: 1, columns: 49 } }).bytes);
+  ok(buildBase({ xref: 'stream-flate', xrefWidths: [1, 4, 3], xrefPng: { colors: 2, columns: 28 }, pngRowFilters: [1] }).bytes);
+  ok(buildBase({ xref: 'stream-flate', xrefWidths: [1, 4, 4], xrefPng: { colors: 3, columns: 21 }, pngRowFilters: [4] }).bytes);
+  ok(buildBase({ xref: 'stream-flate', xrefWidths: [1, 4, 3], xrefPng: { colors: 4, columns: 14 }, pngRowFilters: [3] }).bytes);
+  failsWith(buildBase({ xref: 'stream-flate', xrefWidths: [1, 4, 3], xrefPng: { colors: 5, columns: 8 } }).bytes, 'xref-stream-predictor-unsupported');
+});
+
+test('[VB-06] an object-stream header is read up to /First, so its last offset may touch a regular byte there (request #58)', () => {
+  ok(buildBase({ xref: 'stream', objStmTight: true }).bytes);
+  ok(buildBase({ xref: 'stream-flate', objStmTight: true, objStmFlate: true }).bytes);
+});
+
+test('[VB-06] an object stream with a filter T033 refuses fails the structure (R4)', () => {
+  failsWith(buildBase({ xref: 'stream', objStmFilterName: 'LZWDecode' }).bytes, 'xref-type2-not-object-stream');
+  failsWith(buildBase({ xref: 'stream', objStmFilterName: 'ASCIIHexDecode' }).bytes, 'xref-type2-not-object-stream');
+});
+
+test('[VB-06] in a hybrid section the in-use table entry beats the hidden-stream entry for the same object (R5, B1 (c))', () => {
+  ok(buildBase({ xref: 'hybrid', hiddenShadowsInUse: true }).bytes);
+});
+
+test('[VB-06] entries are counted as distinct effective entries and per section, never summed across sections (request #58 (3))', () => {
+  const n = 600_000;
+  const rows = Array.from({ length: n }, () => [0, 0, 0]);
+  const first = appendXrefStreamSection(buildBase({ xref: 'stream' }), { widths: [1, 1, 0], groups: [{ first: 0, rows }], xnum: n });
+  ok(appendXrefStreamSection(first, { widths: [1, 1, 0], groups: [{ first: 0, rows }], xnum: n + 1 }).bytes);
+  failsWith(appendXrefStreamSection(first, { widths: [1, 1, 0], groups: [{ first: n, rows }], xnum: 2 * n + 1 }).bytes, 'too-many-xref-entries');
+  const one = Array.from({ length: VERIFIER_LIMITS.maxXrefEntries + 1 }, () => [0, 0, 0]);
+  failsWith(
+    appendXrefStreamSection(buildBase({ xref: 'stream' }), { widths: [1, 1, 0], groups: [{ first: 0, rows: one }], xnum: one.length }).bytes,
+    'too-many-xref-entries',
+  );
+});
+
+test('[VB-06] a dictionary or array holds more than 2,097,152 items, as T033 caps none (request #58)', () => {
+  const text = buildBase().bytes.toString('latin1');
+  ok(editedBytes(text, BASE_TRAILER, `trailer\n<< /Size 5 /Root 1 0 R /OpensigList [${'0 '.repeat(2_097_153)}] >>`));
 });

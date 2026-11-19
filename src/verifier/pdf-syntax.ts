@@ -39,7 +39,7 @@ export class SyntaxFault extends Error {
 
 export type PdfValue =
   | { readonly kind: 'int'; readonly value: number }
-  | { readonly kind: 'real' }
+  | { readonly kind: 'real'; readonly value: number }
   | { readonly kind: 'bool' }
   | { readonly kind: 'null' }
   | { readonly kind: 'name'; readonly value: string }
@@ -48,7 +48,13 @@ export type PdfValue =
   | { readonly kind: 'ref'; readonly num: number; readonly gen: number }
   | { readonly kind: 'keyword'; readonly value: string }
   | { readonly kind: 'array'; readonly items: readonly PdfValue[] }
-  | { readonly kind: 'dict'; readonly entries: ReadonlyMap<string, PdfValue> };
+  | { readonly kind: 'dict'; readonly entries: ReadonlyMap<string, PdfValue>; readonly byteRangeKey: ByteRangeKey | null };
+
+/** Where a dictionary's /ByteRange key sits: the offset of its solidus, and the offset just after the name. */
+export interface ByteRangeKey {
+  readonly at: number;
+  readonly valueAt: number;
+}
 
 const CR = 0x0d;
 const LF = 0x0a;
@@ -163,7 +169,12 @@ export function eolLength(bytes: Uint8Array, pos: number): number {
   return b === LF ? 1 : 0;
 }
 
-/** Decimal digits only (no sign), at most maxIntegerDigits, not followed by a regular byte. */
+/**
+ * Decimal digits only (no sign), at most maxIntegerDigits, not followed by a
+ * regular byte; `end` itself counts as not regular, so a number may run right
+ * up to the end of a region (T033's readUnsigned over an object stream's
+ * header, which ends at /First).
+ */
 export function readUnsignedInt(bytes: Uint8Array, pos: number, end: number): { value: number; next: number } | null {
   let p = pos;
   let value = 0;
@@ -172,7 +183,7 @@ export function readUnsignedInt(bytes: Uint8Array, pos: number, end: number): { 
     value = value * 10 + (byteAt(bytes, p) - 0x30);
     p += 1;
   }
-  if (p === pos || isRegular(byteAt(bytes, p))) return null;
+  if (p === pos || (p < end && isRegular(byteAt(bytes, p)))) return null;
   return { value, next: p };
 }
 
@@ -260,15 +271,18 @@ function readDict(c: Cursor, depth: number): PdfValue {
   const start = c.pos;
   c.pos += 2;
   const entries = new Map<string, PdfValue>();
+  let byteRangeKey: ByteRangeKey | null = null;
   for (;;) {
     c.pos = skipWhitespaceAndComments(c.bytes, c.pos, c.end);
     if (c.pos >= c.end) throw new SyntaxFault('unterminated', start);
     if (byteAt(c.bytes, c.pos) === 0x3e && byteAt(c.bytes, c.pos + 1) === 0x3e) {
       c.pos += 2;
-      return { kind: 'dict', entries };
+      return { kind: 'dict', entries, byteRangeKey };
     }
     if (byteAt(c.bytes, c.pos) !== 0x2f) throw new SyntaxFault('unexpected-byte', c.pos);
+    const keyAt = c.pos;
     const key = readName(c);
+    if (key.kind === 'name' && key.value === 'ByteRange') byteRangeKey = { at: keyAt, valueAt: c.pos };
     if (key.kind !== 'name') throw new SyntaxFault('bad-name', c.pos);
     if (entries.has(key.value)) throw new SyntaxFault('duplicate-key', c.pos);
     if (entries.size >= VERIFIER_LIMITS.maxContainerItems) throw new SyntaxFault('too-many-items', c.pos);
@@ -296,6 +310,13 @@ function readArray(c: Cursor, depth: number): PdfValue {
   }
 }
 
+/**
+ * A number token as T033's readValue reads one: an optional sign, digits, an
+ * optional point and digits (`+12`, `-.5`, `3.`, `0012.50`), at most
+ * maxNumberChars characters, followed by a byte that is not regular. A
+ * non-negative integral number may open an indirect reference `num gen R`,
+ * with white-space and comments skipped before the generation and before `R`.
+ */
 function readNumberOrRef(c: Cursor): PdfValue {
   const start = c.pos;
   let p = c.pos;
@@ -308,27 +329,25 @@ function readNumberOrRef(c: Cursor): PdfValue {
     if (isDigit(b)) digits += 1;
     else if (b === 0x2e && !real) real = true;
     else break;
-    if (digits > VERIFIER_LIMITS.maxIntegerDigits) throw new SyntaxFault('number-too-long', start);
     p += 1;
+    if (p - start > VERIFIER_LIMITS.maxNumberChars) throw new SyntaxFault('number-too-long', start);
   }
   if (digits === 0 || isRegular(byteAt(c.bytes, p))) throw new SyntaxFault('unexpected-byte', start);
   c.pos = p;
-  if (real) return { kind: 'real' };
-  let value = 0;
-  for (let i = signed ? start + 1 : start; i < p; i += 1) value = value * 10 + (byteAt(c.bytes, i) - 0x30);
-  if (byteAt(c.bytes, start) === 0x2d) value = -value;
-  if (signed) return { kind: 'int', value };
-  // An unsigned integer may open an indirect reference: `num gen R`.
-  const genStart = skipWhitespace(c.bytes, p, c.end);
-  if (genStart === p) return { kind: 'int', value };
+  const value = Number(Buffer.from(c.bytes.buffer, c.bytes.byteOffset + start, p - start).toString('latin1'));
+  if (!Number.isFinite(value)) throw new SyntaxFault('unexpected-byte', start);
+  const number: PdfValue = real ? { kind: 'real', value } : { kind: 'int', value };
+  if (!Number.isInteger(value) || value < 0) return number;
+  const genStart = skipWhitespaceAndComments(c.bytes, p, c.end);
+  if (genStart === p) return number;
   const gen = readUnsignedInt(c.bytes, genStart, c.end);
-  if (gen === null) return { kind: 'int', value };
-  const r = skipWhitespace(c.bytes, gen.next, c.end);
+  if (gen === null) return number;
+  const r = skipWhitespaceAndComments(c.bytes, gen.next, c.end);
   if (r > gen.next && r < c.end && byteAt(c.bytes, r) === 0x52 && !isRegular(byteAt(c.bytes, r + 1))) {
     c.pos = r + 1;
     return { kind: 'ref', num: value, gen: gen.value };
   }
-  return { kind: 'int', value };
+  return number;
 }
 
 function readKeyword(c: Cursor): PdfValue {
@@ -411,8 +430,16 @@ export function dictEntry(value: PdfValue, key: string): PdfValue | undefined {
   return value.kind === 'dict' ? value.entries.get(key) : undefined;
 }
 
+/**
+ * An integer value: an integer token, or an integral real such as `123.0`,
+ * which T033 accepts wherever it needs an integer (its isNonNegativeInteger
+ * tests the parsed number). Callers check the sign and range they need.
+ */
 export function intValue(value: PdfValue | undefined): number | null {
-  return value !== undefined && value.kind === 'int' ? value.value : null;
+  if (value === undefined) return null;
+  if (value.kind === 'int') return value.value;
+  if (value.kind === 'real' && Number.isInteger(value.value)) return value.value;
+  return null;
 }
 
 export function nameValue(value: PdfValue | undefined): string | null {

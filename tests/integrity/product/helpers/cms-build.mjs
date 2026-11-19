@@ -114,14 +114,19 @@ export function buildSignedData({ content, signer, chain = [], variant = {} }) {
     octets(signature),
     ...unsigned,
   );
-  const certificates = [...(variant.omitSignerCertificate ? [] : [signer.der]), ...chain.map((c) => c.der)];
+  const extraCertificates = Array.from({ length: variant.extraCertificates ?? 0 }, () => signer.der);
+  const certificates = [...(variant.omitSignerCertificate ? [] : [signer.der]), ...chain.map((c) => c.der), ...extraCertificates];
   const encap = variant.attached ? seq(oid(OIDS.data), ctx(0, octets(content))) : seq(oid(OIDS.data));
   const signedData = seq(
     integer(version),
     set(algorithm(digestOid, 'absent')),
     encap,
     ctx(0, ...certificates),
-    variant.twoSigners ? setRaw(signerInfo, signerInfo) : set(signerInfo),
+    variant.twoSigners
+      ? setRaw(signerInfo, signerInfo)
+      : variant.signerCount
+        ? setRaw(...Array.from({ length: variant.signerCount }, () => signerInfo))
+        : set(signerInfo),
   );
   const typeOid = oid(OIDS.signedData);
   const typeTlv = variant.nonMinimalLength ? rawTlv(0x06, [0x81, contentOf(typeOid).length], contentOf(typeOid)) : typeOid;
@@ -129,12 +134,14 @@ export function buildSignedData({ content, signer, chain = [], variant = {} }) {
 }
 
 /**
- * A synthetic sealed PDF: T014's own base, a signature placeholder, and a
- * test-local CMS over the stated ranges. options.byteRange may state a wrong
- * range before signing, so the signature over the stated ranges stays valid.
+ * A synthetic sealed PDF: T014's own base (or `base`, a doc), a signature
+ * placeholder, and a test-local CMS over the stated ranges. options.byteRange
+ * may state a wrong range before signing, so the signature over the stated
+ * ranges stays valid. extraObjects(sigNum) and sigDictExtra add objects to the
+ * signature's revision and keys to its dictionary, before signing.
  */
-export function sealSynthetic({ signer, chain = [], variant = {}, xref = 'table', hexDigits = 16384, byteRange } = {}) {
-  const layout = appendSignaturePlaceholder(buildBase({ xref }), { hexDigits, byteRange });
+export function sealSynthetic({ signer, chain = [], variant = {}, xref = 'table', hexDigits = 16384, byteRange, base, extraObjects, sigDictExtra } = {}) {
+  const layout = appendSignaturePlaceholder(base ?? buildBase({ xref }), { hexDigits, byteRange, extraObjects, sigDictExtra });
   const der = buildSignedData({ content: signedContent(layout), signer, chain, variant });
   return { bytes: embedCms(layout, der), der, layout };
 }

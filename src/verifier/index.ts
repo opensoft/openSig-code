@@ -22,7 +22,7 @@ export { buildVerificationReport, REPORT_LIMITS, REPORT_SCHEMA, VERIFIER } from 
 export type { ReportCheck, ReportResult, VerificationReport } from './report.ts';
 export { VerifierConfigError, CONFIG_ERROR_CODES } from './errors.ts';
 export type { ConfigErrorCode } from './errors.ts';
-export { MAX_SEALED_PDF_BYTES, VERIFIER_LIMITS } from './limits.ts';
+export { MAX_SEALED_PDF_BYTES, T033_PARSER_CEILINGS, VERIFIER_LIMITS } from './limits.ts';
 export { splitPemCertificates } from './trust.ts';
 export { readRevisionStructure, STRUCTURE_DETAILS } from './structure.ts';
-export type { Revision, StructureDetail, StructureResult } from './structure.ts';
+export type { Revision, SignatureScan, StructureDetail, StructureResult } from './structure.ts';

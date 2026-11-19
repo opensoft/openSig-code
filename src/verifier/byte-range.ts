@@ -2,13 +2,22 @@
 //
 // The verifier's own ByteRange locator and /Contents checks (T014).
 //
-// Locating. The seal is found by its /ByteRange key, never by the field's name
-// (request #43, Q11). The file must hold exactly one /ByteRange name token. None
-// fails the signature-dictionary check; two or more is a multi-signature input,
-// outside the product profile (FR-002 refuses signed uploads), and is reported
-// as one T014 cannot evaluate. The locator is lexical on purpose: it does not
-// need the surrounding dictionary to parse, so a damaged signed byte next to
-// /Contents cannot hide the range; that damage is caught by the digest.
+// Locating (request #58 (1); VB-07). With the revision structure read, the seal
+// is the one signature DICTIONARY among the effective objects, found by
+// structure.ts as T033 finds one (/Type /Sig or /DocTimeStamp, or both
+// /ByteRange and /Contents), never by text: a string that spells /ByteRange is
+// not a signature. More than one, any /DocMDP or /UR3, or a /FT /Sig field
+// whose /V is another value is a multi-signature input, outside the product
+// profile, reported as one T014 cannot evaluate; so is a signature dictionary
+// inside an object stream, whose offsets are not file offsets. None fails the
+// signature-dictionary check. The range is then read at that dictionary's own
+// /ByteRange key.
+//
+// With the structure check failed, no effective objects exist, so the OC-08
+// end-of-file fallback keeps the lexical locator: exactly one /ByteRange name
+// token, and two or more is a multi-signature input. Such a file never reaches
+// coverage `complete` (coverage needs the structure), and T033 refuses it, so
+// no base T033 accepts depends on this path.
 //
 // The ByteRange [o1 l1 o2 l2] passes only when:
 // - o1 is 0, both ranges are non-empty and the gap [l1, o2) is non-empty;
@@ -31,7 +40,12 @@ import { DerFault, readTlv } from './der.ts';
 import { byteAt, hexValue, indexOfAscii, isRegular, readUnsignedInt, skipWhitespace } from './pdf-syntax.ts';
 import type { StructureResult } from './structure.ts';
 
-export const SIGNATURE_DICTIONARY_DETAILS = ['no-byte-range', 'byte-range-malformed', 'multiple-signatures'] as const;
+export const SIGNATURE_DICTIONARY_DETAILS = [
+  'no-byte-range',
+  'byte-range-malformed',
+  'multiple-signatures',
+  'signature-compressed',
+] as const;
 export const BYTE_RANGE_DETAILS = [
   'range1-not-at-zero',
   'byte-range-malformed',
@@ -59,10 +73,27 @@ export interface ByteRangeField {
 export type LocateResult =
   | { readonly state: 'pass'; readonly field: ByteRangeField }
   | { readonly state: 'fail'; readonly detail: 'no-byte-range' | 'byte-range-malformed' }
-  | { readonly state: 'unsupported'; readonly detail: 'multiple-signatures' };
+  | { readonly state: 'unsupported'; readonly detail: 'multiple-signatures' | 'signature-compressed' };
 
 const KEY = '/ByteRange';
 
+/**
+ * The seal's /ByteRange: through the one signature dictionary structure.ts
+ * found among the effective objects, or, with the structure check failed, by
+ * the lexical fallback.
+ */
+export function locateSignature(bytes: Uint8Array, structure: StructureResult): LocateResult {
+  if (!structure.ok) return locateByteRange(bytes);
+  const scan = structure.signature;
+  if (scan.state === 'none') return { state: 'fail', detail: 'no-byte-range' };
+  if (scan.state === 'unsupported') return { state: 'unsupported', detail: scan.detail };
+  if (scan.byteRange === null) return { state: 'fail', detail: 'no-byte-range' };
+  const field = parseRangeArray(bytes, scan.byteRange.at, scan.byteRange.valueAt);
+  if (field === null) return { state: 'fail', detail: 'byte-range-malformed' };
+  return { state: 'pass', field };
+}
+
+/** The OC-08 fallback: exactly one /ByteRange name token in the file. */
 export function locateByteRange(bytes: Uint8Array): LocateResult {
   const positions: number[] = [];
   let from = 0;
@@ -75,14 +106,15 @@ export function locateByteRange(bytes: Uint8Array): LocateResult {
   const [only, second] = positions;
   if (only === undefined) return { state: 'fail', detail: 'no-byte-range' };
   if (second !== undefined) return { state: 'unsupported', detail: 'multiple-signatures' };
-  const field = parseRangeArray(bytes, only);
+  const field = parseRangeArray(bytes, only, only + KEY.length);
   if (field === null) return { state: 'fail', detail: 'byte-range-malformed' };
   return { state: 'pass', field };
 }
 
-function parseRangeArray(bytes: Uint8Array, keyOffset: number): ByteRangeField | null {
+/** `[o1 l1 o2 l2]` at `valueAt`: four unsigned integers of at most 15 digits (strict; a security check). */
+function parseRangeArray(bytes: Uint8Array, keyOffset: number, valueAt: number): ByteRangeField | null {
   const end = bytes.length;
-  let p = skipWhitespace(bytes, keyOffset + KEY.length, end);
+  let p = skipWhitespace(bytes, valueAt, end);
   if (byteAt(bytes, p) !== 0x5b) return null;
   p += 1;
   const values: number[] = [];
