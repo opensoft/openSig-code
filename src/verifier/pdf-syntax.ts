@@ -316,6 +316,8 @@ function readArray(c: Cursor, depth: number): PdfValue {
  * maxNumberChars characters, followed by a byte that is not regular. A
  * non-negative integral number may open an indirect reference `num gen R`,
  * with white-space and comments skipped before the generation and before `R`.
+ * The end of the parse region counts as not regular, so a compressed object
+ * read up to the next header offset may end right there (request #60 (1)).
  */
 function readNumberOrRef(c: Cursor): PdfValue {
   const start = c.pos;
@@ -332,7 +334,7 @@ function readNumberOrRef(c: Cursor): PdfValue {
     p += 1;
     if (p - start > VERIFIER_LIMITS.maxNumberChars) throw new SyntaxFault('number-too-long', start);
   }
-  if (digits === 0 || isRegular(byteAt(c.bytes, p))) throw new SyntaxFault('unexpected-byte', start);
+  if (digits === 0 || (p < c.end && isRegular(byteAt(c.bytes, p)))) throw new SyntaxFault('unexpected-byte', start);
   c.pos = p;
   const value = Number(Buffer.from(c.bytes.buffer, c.bytes.byteOffset + start, p - start).toString('latin1'));
   if (!Number.isFinite(value)) throw new SyntaxFault('unexpected-byte', start);
@@ -343,7 +345,7 @@ function readNumberOrRef(c: Cursor): PdfValue {
   const gen = readUnsignedInt(c.bytes, genStart, c.end);
   if (gen === null) return number;
   const r = skipWhitespaceAndComments(c.bytes, gen.next, c.end);
-  if (r > gen.next && r < c.end && byteAt(c.bytes, r) === 0x52 && !isRegular(byteAt(c.bytes, r + 1))) {
+  if (r > gen.next && r < c.end && byteAt(c.bytes, r) === 0x52 && (r + 1 >= c.end || !isRegular(byteAt(c.bytes, r + 1)))) {
     c.pos = r + 1;
     return { kind: 'ref', num: value, gen: gen.value };
   }

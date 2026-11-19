@@ -11,6 +11,7 @@
 // unchecked; an attached CMS accepted; non-minimal DER accepted; the gap, range
 // 1 or the revision boundary unchecked; the fallback accepting one byte short;
 // signingTime changing a verdict; an out-of-profile algorithm read as valid.
+// For request #60 (4): signature-compressed dropped (the reviewer's M1).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,7 +21,7 @@ import { DerFault, readTlv } from '../../../src/verifier/der.ts';
 import { checkOf } from './helpers/agreement.mjs';
 import { testPki } from './helpers/cert-build.mjs';
 import { buildSignedData, sealSynthetic, sha256Hex } from './helpers/cms-build.mjs';
-import { appendSignaturePlaceholder, appendUpdate, buildBase, docFromBytes, embedCms, signedContent } from './helpers/pdf-build.mjs';
+import { appendSignaturePlaceholder, appendUpdate, appendXrefStreamSection, buildBase, docFromBytes, embedCms, signedContent } from './helpers/pdf-build.mjs';
 
 const at = new Date();
 const pki = testPki(at);
@@ -276,4 +277,33 @@ test('[VB-10] three SignerInfos, or nine certificates, give integrity indetermin
   assert.equal(checkOf(nine, 'cms-structure').detail, 'too-many-certificates');
   const eight = verify(sealSynthetic({ signer: pki.leaf, variant: { extraCertificates: 7 }, hexDigits: 65536 }).bytes);
   assert.equal(eight.integrity, 'valid');
+});
+
+// ---------------------------------------------------------------------------
+// Request #60 (4): a signature dictionary inside an object stream gives
+// integrity indeterminate (signature-compressed): its /Contents would sit in
+// compressed bytes that no ByteRange can address.
+//
+// Mutant killed here: signature-compressed dropped (the reviewer's M1), which
+// reads the dictionary's offsets in the decoded data as file offsets.
+// ---------------------------------------------------------------------------
+
+test('[VB-07] a signature dictionary inside an object stream gives integrity indeterminate, signature-compressed (request #60 (4))', () => {
+  const sig = '<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached /ByteRange [0 10 20 30] /Contents <00> >>';
+  const header = '9 0 ';
+  const data = header + sig;
+  const compressed = appendXrefStreamSection(buildBase({ xref: 'stream' }), {
+    objects: [{ num: 8, text: `<< /Type /ObjStm /N 1 /First ${header.length} /Length ${data.length} >>\nstream\n${data}\nendstream` }],
+    widths: [1, 4, 2],
+    rowsFor: (offsets, xrefAt) => [{ first: 8, rows: [[1, offsets.get(8), 0], [2, 8, 0], [1, xrefAt, 0]] }],
+    xnum: 10,
+  });
+  const outcome = verify(compressed.bytes);
+  assert.equal(checkOf(outcome, 'revision-structure').result, 'pass');
+  assert.equal(checkOf(outcome, 'signature-dictionary').detail, 'signature-compressed');
+  assert.equal(outcome.integrity, 'indeterminate');
+  assert.equal(outcome.accepted_as_original, false);
+  // The same dictionary as an uncompressed object is the one signature dictionary.
+  const plain = verify(appendUpdate(buildBase({ xref: 'stream' }), [{ num: 9, text: sig }]).bytes);
+  assert.equal(checkOf(plain, 'signature-dictionary').result, 'pass');
 });

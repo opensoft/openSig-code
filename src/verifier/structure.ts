@@ -70,6 +70,13 @@
 // position; one without a %%EOF has an unmarked end, at which no signature can
 // end; the last by position ends at the file length.
 //
+// Work (request #60 (2)): a region already read is reused, never read again: an
+// indirect read or a header skip by its start offset, a cross-reference stream
+// by its offset, a compressed object by its object stream, start and end. No
+// byte total refuses a file: each loop is bounded by its own run, which never
+// passes the input or the decoded data, and by the counts capped at or above
+// T033's ceilings (entries, sections, depth and inflated bytes).
+//
 // Every loop and size is bounded (VERIFIER_LIMITS). A failure names one detail.
 
 import { inflateSync } from 'node:zlib';
@@ -95,6 +102,7 @@ import {
   SyntaxFault,
   type ByteRangeKey,
   type IndirectObject,
+  type ObjectHeader,
   type PdfValue,
 } from './pdf-syntax.ts';
 
@@ -193,13 +201,16 @@ interface Section extends SectionInfo {
   readonly hidden: LocalEntries | null;
 }
 
+/** What one structure read has spent, and the regions it has read and reuses (request #60 (2)). */
 interface Budget {
   /** Inflated bytes still allowed across all decoded cross-reference and object streams. */
   inflated: number;
-  /** White-space and comment bytes skipped so far around object headers. */
-  skipped: number;
-  /** Bytes of effective objects parsed so far. */
-  parsed: number;
+  /** Indirect objects read at an offset: the header, and the object, or null when its body is malformed. */
+  readonly indirect: Map<number, { readonly header: ObjectHeader; readonly object: IndirectObject | null } | null>;
+  /** Cross-reference streams read at an offset (sections and /XRefStm). */
+  readonly xrefStreams: Map<number, XrefStreamRead | null>;
+  /** Compressed objects parsed, keyed by object stream offset, start and end. */
+  readonly compressed: Map<string, PdfValue>;
 }
 
 const HEADER_LENGTH = 8; // `%PDF-x.y`
@@ -219,7 +230,12 @@ export function readRevisionStructure(bytes: Uint8Array): StructureResult {
 function walk(bytes: Uint8Array): { revisions: Revision[]; signature: SignatureScan } {
   if (bytes.length > VERIFIER_LIMITS.maxInputBytes) fault('input-too-large');
   checkHeader(bytes);
-  const budget: Budget = { inflated: VERIFIER_LIMITS.maxXrefInflatedBytes, skipped: 0, parsed: 0 };
+  const budget: Budget = {
+    inflated: VERIFIER_LIMITS.maxXrefInflatedBytes,
+    indirect: new Map(),
+    xrefStreams: new Map(),
+    compressed: new Map(),
+  };
   const sections: SectionInfo[] = [];
   const effective = new Map<number, Entry>();
   // B3: /Prev in either direction, as T033 follows it; no section is visited
@@ -252,9 +268,30 @@ function walk(bytes: Uint8Array): { revisions: Revision[]; signature: SignatureS
   return { revisions, signature };
 }
 
-function spend(budget: Budget, skipped: number): void {
-  budget.skipped += skipped;
-  if (budget.skipped > VERIFIER_LIMITS.maxHeaderSkipBytes) fault('too-much-work');
+/**
+ * The indirect object at `offset`, read once and reused (request #60 (2)): null
+ * when no header is there; `object` is null when the body is malformed.
+ */
+function indirectAt(
+  bytes: Uint8Array,
+  offset: number,
+  budget: Budget,
+): { readonly header: ObjectHeader; readonly object: IndirectObject | null } | null {
+  const known = budget.indirect.get(offset);
+  if (known !== undefined) return known;
+  const header = readObjectHeader(bytes, offset);
+  let read: { readonly header: ObjectHeader; readonly object: IndirectObject | null } | null = null;
+  if (header !== null) {
+    let object: IndirectObject | null = null;
+    try {
+      object = readIndirectObject(bytes, offset);
+    } catch (error) {
+      if (!(error instanceof SyntaxFault)) throw error;
+    }
+    read = { header, object };
+  }
+  budget.indirect.set(offset, read);
+  return read;
 }
 
 function checkHeader(bytes: Uint8Array): void {
@@ -300,7 +337,6 @@ function readSection(bytes: Uint8Array, offset: number, origin: 'startxref' | 'p
   // The T014 line accepts white-space and comments before `xref` (a superset of T033).
   const start = skipWhitespaceAndComments(bytes, offset, bytes.length);
   if (atKeyword(bytes, start, 'xref')) {
-    spend(budget, start - offset);
     return readTableSection(bytes, offset, start, budget);
   }
   const stream = readXrefStream(bytes, offset, budget);
@@ -408,27 +444,35 @@ function optionalOffset(dict: PdfValue, key: string, detail: StructureDetail): n
 // Cross-reference streams
 // ---------------------------------------------------------------------------
 
-/** The cross-reference stream reached at `offset`, or null when no /Type /XRef object is there. */
-function readXrefStream(
-  bytes: Uint8Array,
-  offset: number,
-  budget: Budget,
-): { start: number; prev: number | null; local: LocalEntries } | null {
-  let object: IndirectObject | null;
-  try {
-    object = readIndirectObject(bytes, offset);
-  } catch (error) {
-    if (error instanceof SyntaxFault) return null;
-    throw error;
-  }
-  if (object === null) return null;
-  spend(budget, object.header.skipped);
+interface XrefStreamRead {
+  readonly start: number;
+  readonly prev: number | null;
+  readonly local: LocalEntries;
+}
+
+/**
+ * The cross-reference stream reached at `offset`, or null when no /Type /XRef
+ * object is there. Each offset is read and decoded once, and reused when more
+ * sections name it (request #60 (2)).
+ */
+function readXrefStream(bytes: Uint8Array, offset: number, budget: Budget): XrefStreamRead | null {
+  const known = budget.xrefStreams.get(offset);
+  if (known !== undefined) return known;
+  const read = decodeXrefStreamAt(bytes, offset, budget);
+  budget.xrefStreams.set(offset, read);
+  return read;
+}
+
+function decodeXrefStreamAt(bytes: Uint8Array, offset: number, budget: Budget): XrefStreamRead | null {
+  const read = indirectAt(bytes, offset, budget);
+  if (read === null || read.object === null) return null;
+  const object = read.object;
   if (nameValue(dictEntry(object.value, 'Type')) !== 'XRef') return null;
   if (object.streamStart === null) fault('xref-stream-malformed');
   // /Length is always direct in a cross-reference stream (ISO 32000, 7.5.8.2).
   const length = intValue(dictEntry(object.value, 'Length'));
   if (length === null) fault('xref-stream-malformed');
-  const raw = streamBody(bytes, object.streamStart, length, budget, XREF_STREAM_FAULTS);
+  const raw = streamBody(bytes, object.streamStart, length, XREF_STREAM_FAULTS);
   const decoded = decodeStream(object.value, raw, budget, XREF_STREAM_FAULTS);
   const local = xrefStreamEntries(object.value, decoded);
   return { start: object.header.start, prev: optionalOffset(object.value, 'Prev', 'xref-stream-malformed'), local };
@@ -460,13 +504,12 @@ const OBJECT_STREAM_FAULTS: DecodeFaults = {
 };
 
 /** `length` bytes from `start`, then white-space and comments, then `endstream`. */
-function streamBody(bytes: Uint8Array, start: number, length: number, budget: Budget, faults: DecodeFaults): Uint8Array {
+function streamBody(bytes: Uint8Array, start: number, length: number, faults: DecodeFaults): Uint8Array {
   if (length < 0) fault(faults.malformed);
   if (length > VERIFIER_LIMITS.maxXrefStreamBytes) fault(faults.tooLarge);
   const end = start + length;
   if (end > bytes.length) fault(faults.malformed);
   const kw = skipWhitespaceAndComments(bytes, end, bytes.length);
-  spend(budget, kw - end);
   if (!atKeyword(bytes, kw, 'endstream')) fault(faults.malformed);
   return bytes.subarray(start, end);
 }
@@ -570,7 +613,8 @@ function xrefStreamEntries(dict: PdfValue, data: Uint8Array): LocalEntries {
   if (size === null || size < 0) fault('xref-stream-malformed');
   const index = dictEntry(dict, 'Index');
   const pairs: Array<[number, number]> = [];
-  if (index === undefined) {
+  // /Index absent or null means [0 /Size]: T033's default applies to a null too (request #60 (1)).
+  if (index === undefined || index.kind === 'null') {
     pairs.push([0, size]);
   } else {
     if (index.kind !== 'array' || index.items.length % 2 !== 0) fault('xref-stream-malformed');
@@ -692,26 +736,13 @@ function checkEffectiveObjects(bytes: Uint8Array, effective: ReadonlyMap<number,
   return scan.result();
 }
 
-function charge(budget: Budget, parsed: number): void {
-  budget.parsed += parsed;
-  if (budget.parsed > VERIFIER_LIMITS.maxObjectParseBytes) fault('too-much-work');
-}
-
 /** B1 (b): the offset is bounded only by the file; the header there carries the entry's number and generation, and the object parses. */
 function readInUseObject(bytes: Uint8Array, entry: Entry, budget: Budget): { gen: number; value: PdfValue } {
-  const header = readObjectHeader(bytes, entry.field2);
-  if (header === null) fault('xref-entry-mismatch');
-  spend(budget, header.skipped);
-  if (header.num !== entry.num || header.gen !== entry.field3) fault('xref-entry-mismatch');
-  let parsed: { value: PdfValue; next: number };
-  try {
-    parsed = parseValue(bytes, header.next, bytes.length);
-  } catch (error) {
-    if (error instanceof SyntaxFault) fault('object-malformed');
-    throw error;
-  }
-  charge(budget, parsed.next - header.next);
-  return { gen: header.gen, value: parsed.value };
+  const read = indirectAt(bytes, entry.field2, budget);
+  if (read === null) fault('xref-entry-mismatch');
+  if (read.header.num !== entry.num || read.header.gen !== entry.field3) fault('xref-entry-mismatch');
+  if (read.object === null) fault('object-malformed');
+  return { gen: read.header.gen, value: read.object.value };
 }
 
 /**
@@ -742,14 +773,25 @@ function readCompressedObject(
   if (number !== entry.num) fault('xref-entry-mismatch');
   const at = read.first + offset;
   if (at >= read.data.length) fault('xref-type2-not-object-stream');
+  // The object ends at the next header offset, or at the end of the decoded
+  // data when that offset is not greater than its own (T033's readCompressed;
+  // request #60 (1)).
+  let end = read.data.length;
+  if (entry.field3 + 1 < read.count) {
+    const [, nextOffset] = headerPair(read, entry.field3 + 1);
+    if (nextOffset > offset) end = Math.min(read.data.length, read.first + nextOffset);
+  }
+  const key = `${stream.field2}:${at}:${end}`;
+  const known = budget.compressed.get(key);
+  if (known !== undefined) return known;
   let parsed: { value: PdfValue; next: number };
   try {
-    parsed = parseValue(read.data, at, read.data.length);
+    parsed = parseValue(read.data, at, end);
   } catch (error) {
     if (error instanceof SyntaxFault) fault('object-malformed');
     throw error;
   }
-  charge(budget, parsed.next - at);
+  budget.compressed.set(key, parsed.value);
   return parsed.value;
 }
 
@@ -759,21 +801,16 @@ function readObjectStream(
   effective: ReadonlyMap<number, Entry>,
   budget: Budget,
 ): ObjectStream {
-  let object: IndirectObject | null = null;
-  try {
-    object = readIndirectObject(bytes, offset);
-  } catch (error) {
-    if (!(error instanceof SyntaxFault)) throw error;
-  }
+  const read = indirectAt(bytes, offset, budget);
+  const object = read === null ? null : read.object;
   if (object === null || object.streamStart === null) fault('xref-type2-not-object-stream');
-  spend(budget, object.header.skipped);
   if (nameValue(dictEntry(object.value, 'Type')) !== 'ObjStm') fault('xref-type2-not-object-stream');
   const count = intValue(dictEntry(object.value, 'N'));
   if (count === null || count < 0) fault('xref-type2-not-object-stream');
   const first = intValue(dictEntry(object.value, 'First'));
   if (first === null || first < 0) fault('xref-type2-not-object-stream');
   const length = streamLength(bytes, dictEntry(object.value, 'Length'), effective, budget);
-  const raw = streamBody(bytes, object.streamStart, length, budget, OBJECT_STREAM_FAULTS);
+  const raw = streamBody(bytes, object.streamStart, length, OBJECT_STREAM_FAULTS);
   const data = decodeStream(object.value, raw, budget, OBJECT_STREAM_FAULTS);
   if (first > data.length) fault('xref-type2-not-object-stream');
   return { num: object.num, count, first, data, pairs: [], pos: 0 };
@@ -797,14 +834,11 @@ function streamLength(
   }
   const target = effective.get(value.num);
   if (target === undefined || target.type !== 1) fault('xref-type2-not-object-stream');
-  let object: IndirectObject | null = null;
-  try {
-    object = readIndirectObject(bytes, target.field2);
-  } catch (error) {
-    if (!(error instanceof SyntaxFault)) throw error;
-  }
-  if (object === null || object.num !== value.num || object.gen !== value.gen) fault('xref-type2-not-object-stream');
-  spend(budget, object.header.skipped);
+  // Read with the ENTRY's own generation; the reference's generation is never
+  // compared, as in T033's streamLength (request #60 (1)).
+  const read = indirectAt(bytes, target.field2, budget);
+  const object = read === null ? null : read.object;
+  if (object === null || object.num !== value.num || object.gen !== target.field3) fault('xref-type2-not-object-stream');
   const length = intValue(object.value);
   if (length === null) fault('xref-type2-not-object-stream');
   return length;
@@ -842,6 +876,15 @@ interface FoundSignature {
   readonly compressed: boolean;
 }
 
+/** What one parsed value holds for the signature scan, found once and reused for every object sharing it (request #60 (2)). */
+interface ValueSummary {
+  /** At most two signature dictionaries (`more` marks others), each with whether it is the value itself. */
+  readonly signatures: ReadonlyArray<{ readonly dict: PdfValue & { readonly kind: 'dict' }; readonly top: boolean }>;
+  readonly more: boolean;
+  readonly permissions: boolean;
+  readonly fieldValues: readonly PdfValue[];
+}
+
 /**
  * Signatures by DICTIONARY, as T033's classifyValue finds them (request #58
  * (1)): every dictionary in every effective object is examined, nested ones
@@ -849,35 +892,32 @@ interface FoundSignature {
  * dictionary is a signature when /Type is /Sig or /DocTimeStamp, or when it has
  * both /ByteRange and /Contents. More than one, any /DocMDP or /UR3 key, or a
  * /FT /Sig field whose non-null /V is not the one signature dictionary, is
- * `multiple-signatures`.
+ * `multiple-signatures`. A value shared by several objects (a reused
+ * compressed object) is walked once, and its signatures count once per object,
+ * as T033 counts each object it parses.
  */
 class SignatureCollector {
   private readonly found: FoundSignature[] = [];
   private more = false;
   private permissions = false;
   private readonly fieldValues: PdfValue[] = [];
+  private readonly summaries = new Map<PdfValue, ValueSummary>();
 
   object(num: number, gen: number, value: PdfValue, compressed: boolean): void {
-    this.visit(value, num, gen, compressed, true);
-  }
-
-  private visit(value: PdfValue, num: number, gen: number, compressed: boolean, top: boolean): void {
-    if (value.kind === 'array') {
-      for (const item of value.items) this.visit(item, num, gen, compressed, false);
-      return;
+    let summary = this.summaries.get(value);
+    const firstUse = summary === undefined;
+    if (summary === undefined) {
+      summary = summarize(value);
+      this.summaries.set(value, summary);
     }
-    if (value.kind !== 'dict') return;
-    const type = nameValue(value.entries.get('Type'));
-    if (type === 'Sig' || type === 'DocTimeStamp' || (value.entries.has('ByteRange') && value.entries.has('Contents'))) {
-      if (this.found.length < 2) this.found.push({ dict: value, num: top ? num : null, gen, compressed });
+    for (const signature of summary.signatures) {
+      if (this.found.length < 2) this.found.push({ dict: signature.dict, num: signature.top ? num : null, gen, compressed });
       else this.more = true;
     }
-    if (value.entries.has('DocMDP') || value.entries.has('UR3')) this.permissions = true;
-    if (nameValue(value.entries.get('FT')) === 'Sig') {
-      const v = value.entries.get('V');
-      if (v !== undefined && v.kind !== 'null') this.fieldValues.push(v);
-    }
-    for (const item of value.entries.values()) this.visit(item, num, gen, compressed, false);
+    if (summary.more) this.more = true;
+    if (summary.permissions) this.permissions = true;
+    // A shared value's field values are the same values, so they are compared once.
+    if (firstUse) for (const v of summary.fieldValues) this.fieldValues.push(v);
   }
 
   result(): SignatureScan {
@@ -889,7 +929,36 @@ class SignatureCollector {
       if (!same) return { state: 'unsupported', detail: 'multiple-signatures' };
     }
     if (one === undefined) return { state: 'none' };
+    // Request #60 (4): its /Contents would sit in compressed bytes no ByteRange can address.
     if (one.compressed) return { state: 'unsupported', detail: 'signature-compressed' };
     return { state: 'one', byteRange: one.dict.byteRangeKey };
   }
+}
+
+/** One walk of a parsed value: its signature dictionaries, permission keys and signature-field values. */
+function summarize(value: PdfValue): ValueSummary {
+  const signatures: Array<{ readonly dict: PdfValue & { readonly kind: 'dict' }; readonly top: boolean }> = [];
+  const fieldValues: PdfValue[] = [];
+  let more = false;
+  let permissions = false;
+  const visit = (v: PdfValue, top: boolean): void => {
+    if (v.kind === 'array') {
+      for (const item of v.items) visit(item, false);
+      return;
+    }
+    if (v.kind !== 'dict') return;
+    const type = nameValue(v.entries.get('Type'));
+    if (type === 'Sig' || type === 'DocTimeStamp' || (v.entries.has('ByteRange') && v.entries.has('Contents'))) {
+      if (signatures.length < 2) signatures.push({ dict: v, top });
+      else more = true;
+    }
+    if (v.entries.has('DocMDP') || v.entries.has('UR3')) permissions = true;
+    if (nameValue(v.entries.get('FT')) === 'Sig') {
+      const field = v.entries.get('V');
+      if (field !== undefined && field.kind !== 'null') fieldValues.push(field);
+    }
+    for (const item of v.entries.values()) visit(item, false);
+  };
+  visit(value, true);
+  return { signatures, more, permissions, fieldValues };
 }

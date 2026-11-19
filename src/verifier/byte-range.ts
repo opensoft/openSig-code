@@ -93,7 +93,7 @@ export function locateSignature(bytes: Uint8Array, structure: StructureResult): 
   return { state: 'pass', field };
 }
 
-/** The OC-08 fallback: exactly one /ByteRange name token in the file. */
+/** The OC-08 fallback: exactly one /ByteRange name token in the file (a narrow exception to VB-07, request #60 (3)). */
 export function locateByteRange(bytes: Uint8Array): LocateResult {
   const positions: number[] = [];
   let from = 0;

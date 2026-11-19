@@ -285,6 +285,8 @@ test('[VB-06] the composed cases cannot skip: no skip, todo, catch or capability
   const composed = codeOf('./structure-composed.test.mjs');
   const sealed = codeOf('./strand-sealed.test.mjs');
   const helper = codeOf('./helpers/product-compose.mjs');
+  // Request #60 (1): the sealed candidates C1 to C3 are held to the same rule.
+  const candidates = codeOf('./strand-candidates.test.mjs');
   const forbidden = [
     /\bskip\b/,
     /\btodo\b/,
@@ -299,6 +301,7 @@ test('[VB-06] the composed cases cannot skip: no skip, todo, catch or capability
   const files = [
     ['structure-composed.test.mjs', composed],
     ['strand-sealed.test.mjs', sealed],
+    ['strand-candidates.test.mjs', candidates],
     ['helpers/product-compose.mjs', helper],
   ];
   for (const [name, code] of files) {
@@ -308,6 +311,9 @@ test('[VB-06] the composed cases cannot skip: no skip, todo, catch or capability
   assert.equal(sealed.match(/^test\(/gm)?.length, 5, 'the five sealed strand-path cases (request #58)');
   assert.ok((sealed.match(/await sealAndVerify\(/g)?.length ?? 0) >= 5, 'every strand-path case seals and verifies');
   assert.match(sealed, /^import \{ sealWithProduct, syntheticEvidenceDigest \} from '\.\/helpers\/product-seal\.mjs';$/m, 'a static import');
+  assert.equal(candidates.match(/^test\(/gm)?.length, 3, 'the three sealed candidate cases (request #60 (1))');
+  assert.ok((candidates.match(/await sealAndVerify\(/g)?.length ?? 0) >= 3, 'every candidate case seals and verifies');
+  assert.match(candidates, /^import \{ sealWithProduct, syntheticEvidenceDigest \} from '\.\/helpers\/product-seal\.mjs';$/m, 'a static import');
   assert.ok((composed.match(/await composeAndRead\(t, /g)?.length ?? 0) >= 4, 'every case composes and reads');
   assert.match(composed, /^import \{ composeWithProduct \} from '\.\/helpers\/product-compose\.mjs';$/m, 'a static import');
   assert.match(helper, /^import \{ composeSealRevision \} from /m, 'a static import');
@@ -429,4 +435,68 @@ test('[VB-06] entries are counted as distinct effective entries and per section,
 test('[VB-06] a dictionary or array holds more than 2,097,152 items, as T033 caps none (request #58)', () => {
   const text = buildBase().bytes.toString('latin1');
   ok(editedBytes(text, BASE_TRAILER, `trailer\n<< /Size 5 /Root 1 0 R /OpensigList [${'0 '.repeat(2_097_153)}] >>`));
+});
+
+// ---------------------------------------------------------------------------
+// Request #60 (2): no byte total refuses a file, and a region already read is
+// reused. Candidates 4 and 5 are checked here, at the structure level: composed
+// through T033's parser, each would depend on T033's CPU cap under the host's
+// load, which request #60 lets these cases avoid. C1 to C3 are sealed end to end
+// in strand-candidates.test.mjs, and signature-compressed is in
+// cms-profile.test.mjs.
+//
+// Mutants killed here: reuse disabled (C4's one /XRefStm, decoded once per
+// section, passes the inflated-bytes cap); a byte total on header skips
+// restored (C4's distinct starts inside one run).
+// ---------------------------------------------------------------------------
+
+const RUN = 9 * 1024 * 1024;
+
+test('[VB-06] C4: header skips have no byte total, and one /XRefStm named by 31 sections is read once (request #60 (2))', () => {
+  // The base and 30 updates name the base's /XRefStm, with 9 MiB of white-space
+  // before its header. Read once, it inflates 18,000,054 bytes; a decode per
+  // section would pass maxXrefInflatedBytes, and a skip per section B6's total.
+  const rows = 1_000_000;
+  const base = buildBase({ xref: 'hybrid', hiddenStreamPadding: RUN, hiddenFreeRows: rows });
+  let doc = base;
+  for (let i = 0; i < 30; i += 1) {
+    doc = appendUpdate(doc, [{ num: doc.size, text: `<< /Producer (c4 ${i}) >>` }], { trailerExtra: ` /XRefStm ${base.xrefStm}` });
+  }
+  assert.ok(doc.bytes.length < 10 * 1024 * 1024, 'under the 10 MiB upload cap');
+  assert.ok(31 * rows * 18 > VERIFIER_LIMITS.maxXrefInflatedBytes, 'a decode per section passes the inflated-bytes cap');
+  assert.ok(31 * RUN > 4 * VERIFIER_LIMITS.maxInputBytes, 'a skip per section passes request #56 B6\'s total');
+  assert.equal(ok(doc.bytes).length, 31);
+  // Distinct starts inside that run: the base and 25 updates each name their
+  // own offset in the white-space, 26 regions that together pass B6's total.
+  const spreadBase = buildBase({ xref: 'hybrid', hiddenStreamPadding: RUN });
+  let spread = spreadBase;
+  for (let k = 1; k <= 25; k += 1) {
+    spread = appendUpdate(spread, [{ num: spread.size, text: `<< /Producer (c4 spread ${k}) >>` }], { trailerExtra: ` /XRefStm ${spreadBase.xrefStm + k}` });
+  }
+  assert.ok(spread.bytes.length < 10 * 1024 * 1024, 'under the 10 MiB upload cap');
+  assert.ok(26 * (RUN - 25) > 4 * VERIFIER_LIMITS.maxInputBytes, 'the distinct skips pass request #56 B6\'s total');
+  const revisions = ok(spread.bytes);
+  assert.equal(revisions.length, 26);
+  assert.deepEqual(revisions.slice(1).map((r) => r.hiddenStreamOffset), Array.from({ length: 25 }, (_, i) => spreadBase.xrefStm + i + 1));
+});
+
+test('[VB-06] C5: compressed objects have no parse total, and 1,500 header pairs naming one offset parse it once (request #60 (2))', () => {
+  const n = 1500;
+  const value = `<<${' '.repeat(1024 * 1024)}>>`;
+  const header = `${Array.from({ length: n }, (_, i) => `${10 + i} 0`).join(' ')} `;
+  const data = header + value;
+  const stream = `<< /Type /ObjStm /N ${n} /First ${header.length} /Length ${data.length} >>\nstream\n${data}\nendstream`;
+  const doc = appendXrefStreamSection(buildBase({ xref: 'stream' }), {
+    objects: [{ num: 9, text: stream }],
+    widths: [1, 4, 2],
+    rowsFor: (offsets, xrefAt) => [
+      { first: 9, rows: [[1, offsets.get(9), 0], ...Array.from({ length: n }, (_, i) => [2, 9, i])] },
+      { first: 10 + n, rows: [[1, xrefAt, 0]] },
+    ],
+    xnum: 10 + n,
+  });
+  assert.ok(doc.bytes.length < 10 * 1024 * 1024, 'under the 10 MiB upload cap');
+  const oldTotal = 2 * (VERIFIER_LIMITS.maxInputBytes + VERIFIER_LIMITS.maxXrefInflatedBytes);
+  assert.ok(n * value.length > oldTotal, 'a parse per pair passes the first fix\'s maxObjectParseBytes');
+  assert.equal(ok(doc.bytes).length, 2);
 });

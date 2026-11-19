@@ -22,7 +22,8 @@
 //   cross-reference and object stream. T033's per-stream maxRatio has no
 //   counterpart: the verifier sets no ratio limit, so it is not stricter.
 // Limits with no T033 counterpart (string, container and stream sizes) are held
-// by the input bound; the header-skip and object-parse totals are below.
+// by the input bound. No byte total refuses a file (request #60 (2)): regions
+// already read are reused, and each loop is bounded by its own run.
 // Table and header numbers have up to 15 digits (T033's readUnsigned); other
 // number tokens have up to 32 characters (T033's readValue).
 
@@ -66,26 +67,15 @@ export const VERIFIER_LIMITS = Object.freeze({
   /** Most characters in any other number token: 32, as T033's readValue (sign, digits, point). */
   maxNumberChars: 32,
   /**
-   * Most white-space and comment bytes skipped, in total, before and inside the
-   * object headers read at offsets (section starts and entry checks). T033 skips
-   * any amount and bounds its work by CPU time instead, so this bound has no
-   * T033 counterpart. Request #56 B6 sets it at least at MAX_SEALED_PDF_BYTES,
-   * derived from the same constant as the input bound: in a base T033 accepts,
-   * each skipped run ends at its own object's header, so the runs are disjoint
-   * and their total cannot exceed the file. A run is read once or twice in an
-   * ordinary file (a section, hidden-stream or object-stream read, then its
-   * entry check), and four times the input bound leaves room for a stream read
+   * Request #60 (2) replaces request #56 B6's skip bound: no total of skipped
+   * white-space and comment bytes refuses a file. T033 bounds that work only by
+   * its CPU cap, which a fixed byte total cannot track. Each skip is bounded by
+   * its own run, which never passes the input. The value stays, unbounded, so
+   * B6's floor (at least MAX_SEALED_PDF_BYTES) still holds, and a region already
+   * read is reused rather than skipped again, whether it is read in one role or
    * in more than one role. A test asserts the floor.
    */
-  maxHeaderSkipBytes: 4 * MAX_SEALED_PDF_BYTES,
-  /**
-   * Most bytes of effective objects parsed, in total, for the entry checks and
-   * the signature scan. T033 parses every effective object too and has no such
-   * total. In a base it accepts, the objects are disjoint: the uncompressed ones
-   * lie in the file and the compressed ones in decoded object streams, so the
-   * input bound plus the inflate budget covers them, and twice that leaves room.
-   */
-  maxObjectParseBytes: 2 * (MAX_SEALED_PDF_BYTES + T033_PARSER_CEILINGS.maxInflatedBytes),
+  maxHeaderSkipBytes: Number.POSITIVE_INFINITY,
   /** Most hex digits in the signature's /Contents. */
   maxContentsHexDigits: 2 * 64 * 1024,
   /** Largest CMS SignedData. */

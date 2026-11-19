@@ -20,6 +20,9 @@
 // or a verifier limit below one (request #58 (3)); and a header-skip bound below the input bound
 // (request #56 B6: the assertion kills any such bound, the file whose one
 // skipped run nearly fills the input bound kills one more than 1 KiB below it).
+// Request #60 (2) supersedes that bound: no byte total refuses a file, so the
+// limit is unbounded and B6's floor still holds; C4 and C5 in
+// structure.test.mjs check that no total refuses repeated or overlapping reads.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

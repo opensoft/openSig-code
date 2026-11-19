@@ -101,13 +101,21 @@ function objectStream(options) {
   const o3 = o2 + OBJ2.length + 1;
   const nums = [1, 2, 3];
   if (options.objStmHeaderOverride) nums[options.objStmHeaderOverride.index] = options.objStmHeaderOverride.num;
-  const header = `${nums[0]} 0 ${nums[1]} ${o2} ${nums[2]} ${o3}${options.objStmTight ? '' : ' '}`;
-  const data = `${header}${first} ${OBJ2} ${OBJ3}`;
+  let header = `${nums[0]} 0 ${nums[1]} ${o2} ${nums[2]} ${o3}${options.objStmTight ? '' : ' '}`;
+  let data = `${header}${first} ${OBJ2} ${OBJ3}`;
+  if (options.objStmAdjacent) {
+    // Objects 7 (`12`) and 8 (`true`) with no byte between them: object 7 ends
+    // at object 8's header offset (T033's readCompressed; request #60 (1)).
+    const o7 = o3 + OBJ3.length + 1;
+    header = `${nums[0]} 0 ${nums[1]} ${o2} ${nums[2]} ${o3} 7 ${o7} 8 ${o7 + 2} `;
+    data = `${header}${first} ${OBJ2} ${OBJ3} 12true`;
+  }
   const body = options.objStmFlate ? deflateSync(Buffer.from(data, 'latin1')).toString('latin1') : data;
   let filter = options.objStmFlate ? ' /Filter /FlateDecode' : '';
   if (options.objStmFilterName) filter = ` /Filter /${options.objStmFilterName}`;
-  const length = options.objStmIndirectLength ? '7 0 R' : String(body.length);
-  const text = `<< /Type /ObjStm /N ${options.objStmCount ?? 3} /First ${header.length} /Length ${length}${filter} >>\nstream\n${body}\nendstream`;
+  const length = options.objStmIndirectLength ? `7 ${options.objStmLengthRefGen ?? 0} R` : String(body.length);
+  const count = options.objStmCount ?? (options.objStmAdjacent ? 5 : 3);
+  const text = `<< /Type /ObjStm /N ${count} /First ${header.length} /Length ${length}${filter} >>\nstream\n${body}\nendstream`;
   return { text, bodyLength: body.length };
 }
 
@@ -136,6 +144,14 @@ function contentObject() {
  *   one colour, one row per entry);
  * - xrefDictExtra: text added to the cross-reference stream dictionary (stream);
  * - hiddenShadowsInUse: the hybrid's hidden stream also lists object 4;
+ * - objStmLengthRefGen: the generation written in objStmIndirectLength's
+ *   `7 g R` (object 7's entry keeps generation 0);
+ * - objStmAdjacent: two more compressed objects, 7 (`12`) and 8 (`true`), with
+ *   no byte between them (stream bases);
+ * - hiddenStreamPadding: white-space before the hybrid's hidden stream header,
+ *   which /XRefStm names (the doc's xrefStm gives that offset);
+ * - hiddenFreeRows: that many free rows for objects 10 onward in the hybrid's
+ *   hidden stream, FlateDecoded with /W [6 6 6] (18 inflated bytes a row);
  * - objStmIndirectLength: the object stream's /Length as `7 0 R`, object 7
  *   holding it (stream bases only; /Size becomes 8);
  * - xrefStmDelta, startxrefDelta: added to the written offsets;
@@ -206,10 +222,14 @@ export function buildBase(options = {}) {
   w.write(`5 0 obj\n${stmObject.text}\nendobj\n`);
   let off7 = null;
   if (options.objStmIndirectLength) {
-    if (xref === 'hybrid') throw new Error('objStmIndirectLength is for stream bases');
+    if (xref === 'hybrid' || options.objStmAdjacent) throw new Error('objStmIndirectLength is for stream bases without objStmAdjacent');
     off7 = w.offset;
     w.write(`7 0 obj\n${stmObject.bodyLength}\nendobj\n`);
   }
+  // hiddenStreamPadding: white-space before the hybrid's hidden stream header,
+  // and /XRefStm names the start of that white-space.
+  const paddingAt = w.offset;
+  if (xref === 'hybrid' && options.hiddenStreamPadding) w.write(Buffer.alloc(options.hiddenStreamPadding, 0x20));
   const off6 = w.offset;
   const widths = [1, 4, 2];
   if (xref === 'hybrid') {
@@ -219,8 +239,17 @@ export function buildBase(options = {}) {
     // table, as compressed in object 4 (not an object stream); the table's
     // in-use entry must win (B1 (c)).
     if (options.hiddenShadowsInUse) hiddenRows.push([2, 4, 0]);
-    const rows = xrefRows(hiddenRows, widths);
-    w.write(`6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 2] /Index [1 ${hiddenRows.length}] /Length ${rows.length} >>\nstream\n`);
+    let rows = xrefRows(hiddenRows, widths);
+    let hiddenDict = `/Size 7 /W [1 4 2] /Index [1 ${hiddenRows.length}]`;
+    if (options.hiddenFreeRows) {
+      // hiddenFreeRows: that many free rows (all zero, /W [6 6 6]) for objects
+      // 10 onward, FlateDecoded, so each decode of the hidden stream inflates
+      // 18 bytes per row.
+      const wide = [6, 6, 6];
+      rows = deflateSync(Buffer.concat([xrefRows(hiddenRows, wide), Buffer.alloc(options.hiddenFreeRows * 18)]));
+      hiddenDict = `/Size ${10 + options.hiddenFreeRows} /W [6 6 6] /Index [1 ${hiddenRows.length} 10 ${options.hiddenFreeRows}] /Filter /FlateDecode`;
+    }
+    w.write(`6 0 obj\n<< /Type /XRef ${hiddenDict} /Length ${rows.length} >>\nstream\n`);
     w.write(rows);
     w.write('\nendstream\nendobj\n');
     const xrefAt = w.offset;
@@ -230,10 +259,11 @@ export function buildBase(options = {}) {
     w.write(tableEntry(off4 + delta(4), 0, 'n'));
     w.write(tableEntry(off5 + delta(5), 0, 'n'));
     w.write(tableEntry(off6 + delta(6), 0, 'n'));
-    w.write(`trailer\n<< /Size 7 /Root 1 0 R /XRefStm ${off6 + (options.xrefStmDelta ?? 0)} >>\n`);
+    const xrefStm = options.hiddenStreamPadding ? paddingAt : off6 + (options.xrefStmDelta ?? 0);
+    w.write(`trailer\n<< /Size 7 /Root 1 0 R /XRefStm ${xrefStm} >>\n`);
     w.write(`startxref\n${xrefAt + (options.startxrefDelta ?? 0)}\n%%EOF\n`);
     if (options.trailingBytes) w.write(options.trailingBytes);
-    return { bytes: w.bytes(), kind: 'table', startxref: xrefAt, size: 7, root: '1 0 R' };
+    return { bytes: w.bytes(), kind: 'table', startxref: xrefAt, size: 7, root: '1 0 R', xrefStm };
   }
   const stm = options.type2StreamOverride ?? 5;
   const entries = [
@@ -246,6 +276,7 @@ export function buildBase(options = {}) {
     [1, off6 + delta(6), 0],
   ];
   if (off7 !== null) entries.push([1, off7, 0]);
+  if (options.objStmAdjacent) entries.push([2, stm, 3], [2, stm, 4]);
   const size = entries.length;
   const streamWidths = options.xrefWidths ?? widths;
   const rowWidth = streamWidths[0] + streamWidths[1] + streamWidths[2];
@@ -290,7 +321,7 @@ export function appendUpdate(doc, objects, options = {}) {
     const xrefAt = w.offset;
     w.write('xref\n');
     for (const { num } of sorted) w.write(`${num} 1\n${tableEntry(offsets.get(num), 0, 'n')}`);
-    w.write(`trailer\n<< /Size ${size} /Root ${doc.root} /Prev ${prev} >>\nstartxref\n${xrefAt + (options.startxrefDelta ?? 0)}\n%%EOF\n`);
+    w.write(`trailer\n<< /Size ${size} /Root ${doc.root} /Prev ${prev}${options.trailerExtra ?? ''} >>\nstartxref\n${xrefAt + (options.startxrefDelta ?? 0)}\n%%EOF\n`);
     return { bytes: w.bytes(), kind: 'table', startxref: xrefAt, size, root: doc.root };
   }
   const xnum = size;
