@@ -22,15 +22,68 @@
 // The capability-id reads at the end serve the ceremony's audit events
 // (recipient.capabilities_revoked and recipient.locked_out, CH-06): which
 // invitations and sessions a revocation revoked, by id only.
+//
+// The envelope event count (A-010 row EVENT-CAP, CH-10) reads only the
+// audit_events_envelope index. It writes nothing and changes no existing row,
+// and the cap needs no migration or backfill. The revocation splitter (row
+// REVOKE-META, CH-11) keeps a revocation within the audit writer's metadata
+// limit however many capabilities older rows hold.
 
 import type { CapabilityOwner, Database, Row, TenantStore } from '../db/index.ts';
 import { StorageUsageError } from '../db/index.ts';
+import { canonicalize, type JsonValue } from '../../domain/canonical/index.ts';
 import type { ConsentText } from '../../domain/consent/index.ts';
+import { MAX_METADATA_BYTES } from '../audit/index.ts';
 
 /** Twenty wrong codes over an invitation's lifetime revoke it (data-model.md § Entities, Invitation). */
 export const INVITATION_LOCKOUT_WRONG_CODES = 20;
 /** Five attempts per challenge, then it is locked (data-model.md § Entities, Challenge). */
 export const CHALLENGE_MAX_ATTEMPTS = 5;
+
+/**
+ * The per-envelope cap on the actions a person can repeat (A-010 row EVENT-CAP,
+ * request #46). An invitation resend, a challenge request and a recipient-session
+ * creation are refused once the envelope holds this many audit events. The count
+ * is the audit_events rows themselves, so the cap is durable: it survives a
+ * restart and holds across connections, unlike the per-process rate limits.
+ * T016's receipt budget (PK-01) imports it.
+ */
+export const ENVELOPE_REPEATABLE_EVENT_CAP = 2048;
+
+/**
+ * The most audit events one allowed repeatable action appends to rows this code
+ * writes (request #50). A session creation with the right code appends
+ * recipient.challenge_verified, then one recipient.capabilities_revoked for the
+ * recipient's other sessions it revokes, then recipient.session_created. The
+ * wrong code that reaches the lockout appends recipient.locked_out. A resend
+ * appends recipient.capabilities_revoked and recipient.invited. A challenge
+ * request appends none. Since a recipient holds at most one unrevoked
+ * invitation and one unrevoked session, each revocation names at most two ids
+ * and is a single event.
+ */
+export const REPEATABLE_ACTION_MAX_EVENTS = 3;
+
+/** The most recipients an envelope has: envelopes.recipients_count is CHECKed to 1..2 (migration 0002). */
+export const ENVELOPE_MAX_RECIPIENTS = 2;
+
+/**
+ * The most session ends that can still be appended once the cap is reached. A
+ * session end is never refused, but a session creation revokes the recipient's
+ * other sessions (request #50), so each recipient holds at most one unrevoked
+ * session.
+ */
+export const ENVELOPE_SESSION_ENDS_PAST_CAP = ENVELOPE_MAX_RECIPIENTS;
+
+/**
+ * The most audit events the repeatable actions and their session ends can bring
+ * an envelope to (2047 + 3 + 2 = 2052). An action runs only while the count is
+ * below the cap and appends at most REPEATABLE_ACTION_MAX_EVENTS; after it, only
+ * the ENVELOPE_SESSION_ENDS_PAST_CAP session ends can follow. T016's PK-01
+ * imports this figure and adds the event sources that are never refused and are
+ * bounded per envelope. The claim covers rows this code writes; rows written
+ * before it are kept, but they are not claimed to fit.
+ */
+export const ENVELOPE_REPEATABLE_EVENT_CEILING = ENVELOPE_REPEATABLE_EVENT_CAP - 1 + REPEATABLE_ACTION_MAX_EVENTS + ENVELOPE_SESSION_ENDS_PAST_CAP;
 
 export interface InvitationRecord {
   readonly id: string;
@@ -307,6 +360,11 @@ export function revokeSession(store: TenantStore, sessionId: string, now: string
   return store.update('recipient_sessions', { id: sessionId, revoked_at: null }, { revoked_at: now }) === 1;
 }
 
+/** Ids of the recipient's unrevoked sessions on the envelope, oldest first (what a new session revokes). */
+export function unrevokedSessionIdsOf(store: TenantStore, envelopeId: string, recipientId: string): string[] {
+  return ids(store, 'recipient_sessions', { envelope_id: envelopeId, recipient_id: recipientId, revoked_at: null });
+}
+
 /** Revoke every unrevoked session of the recipient; returns how many. */
 export function revokeSessionsOf(store: TenantStore, envelopeId: string, recipientId: string, now: string): number {
   return store.update('recipient_sessions', { envelope_id: envelopeId, recipient_id: recipientId, revoked_at: null }, { revoked_at: now });
@@ -355,6 +413,90 @@ export function outstandingCapabilitiesOf(store: TenantStore, envelopeId: string
 export function capabilitiesRevokedAt(store: TenantStore, envelopeId: string, at: string): CapabilityIds {
   const where = { envelope_id: envelopeId, revoked_at: at };
   return { invitationIds: ids(store, 'invitations', where), sessionIds: ids(store, 'recipient_sessions', where) };
+}
+
+// ------------------------------------------------- envelope event cap (EVENT-CAP)
+
+/**
+ * How many audit events the envelope holds. The tenant store issues
+ * SELECT count(*) FROM audit_events WHERE tenant_id = ? AND envelope_id = ?,
+ * which the audit_events_envelope index (tenant_id, envelope_id, seq; migration
+ * 0006) answers alone. A repeatable action calls this inside its own write
+ * transaction. BEGIN IMMEDIATE holds the write lock from before the count until
+ * the commit, so no other writer can append between the two.
+ */
+export function envelopeEventCount(store: TenantStore, envelopeId: string): number {
+  return store.count('audit_events', { envelope_id: envelopeId });
+}
+
+/** True once the envelope's audit events have reached the cap: its repeatable actions are refused. */
+export function envelopeEventCapReached(store: TenantStore, envelopeId: string): boolean {
+  return envelopeEventCount(store, envelopeId) >= ENVELOPE_REPEATABLE_EVENT_CAP;
+}
+
+// ------------------------------------------- revocation metadata (REVOKE-META)
+
+/** Metadata for a recipient.capabilities_revoked event: the caller's scope members, plus the two id lists. */
+export type RevocationMetadata = { readonly [key: string]: JsonValue };
+
+function revocationMetadata(scope: RevocationMetadata, invitationIds: readonly string[], sessionIds: readonly string[]): RevocationMetadata {
+  return { ...scope, invitation_ids: [...invitationIds], session_ids: [...sessionIds] };
+}
+
+function canonicalBytes(metadata: RevocationMetadata): number {
+  return Buffer.byteLength(canonicalize(metadata), 'utf8');
+}
+
+/**
+ * The metadata of the recipient.capabilities_revoked events that record
+ * `revoked` (row REVOKE-META, request #50; T010's decline uses it too, row
+ * REVOKE-DECLINE). When the scope and both full id lists fit within `maxBytes`
+ * of canonical JSON (the audit writer's MAX_METADATA_BYTES), the result is ONE
+ * metadata object with exactly those lists, so the event is the same as before.
+ * Only when they would not fit are the ids split over several objects.
+ *
+ * The split is greedy and keeps order. The ids are taken in one sequence, the
+ * invitation ids then the session ids, each in its given order. Each id is
+ * appended to the current part when the part still fits with it; otherwise the
+ * current part is closed and a new part starts with that id. Every id is placed
+ * in exactly one part, and each part is emitted exactly once, so the parts are
+ * disjoint, together name every id once, and in order concatenate to the input.
+ * Each part fits, and a part is closed only when the next id would not fit, so
+ * no part could have taken that id.
+ *
+ * Every part carries the same scope members. An empty `revoked` gives no
+ * metadata, since nothing was revoked. An id that cannot fit even alone with the
+ * scope throws, as the audit writer would; an id is at most 64 characters, so a
+ * valid scope never reaches that.
+ */
+export function splitRevocationMetadata(scope: RevocationMetadata, revoked: CapabilityIds, maxBytes: number = MAX_METADATA_BYTES): RevocationMetadata[] {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new StorageUsageError('the revocation metadata limit must be a positive integer');
+  if (revoked.invitationIds.length === 0 && revoked.sessionIds.length === 0) return [];
+  const whole = revocationMetadata(scope, revoked.invitationIds, revoked.sessionIds);
+  if (canonicalBytes(whole) <= maxBytes) return [whole];
+  const parts: RevocationMetadata[] = [];
+  let invitations: string[] = [];
+  let sessions: string[] = [];
+  const sequence: readonly (readonly ['invitation' | 'session', string])[] = [
+    ...revoked.invitationIds.map((id) => ['invitation', id] as const),
+    ...revoked.sessionIds.map((id) => ['session', id] as const),
+  ];
+  for (const [kind, id] of sequence) {
+    const nextInvitations = kind === 'invitation' ? [...invitations, id] : invitations;
+    const nextSessions = kind === 'session' ? [...sessions, id] : sessions;
+    if (canonicalBytes(revocationMetadata(scope, nextInvitations, nextSessions)) <= maxBytes) {
+      invitations = nextInvitations;
+      sessions = nextSessions;
+      continue;
+    }
+    if (invitations.length === 0 && sessions.length === 0) throw new StorageUsageError('one revoked id does not fit the audit metadata limit');
+    parts.push(revocationMetadata(scope, invitations, sessions));
+    invitations = kind === 'invitation' ? [id] : [];
+    sessions = kind === 'session' ? [id] : [];
+    if (canonicalBytes(revocationMetadata(scope, invitations, sessions)) > maxBytes) throw new StorageUsageError('one revoked id does not fit the audit metadata limit');
+  }
+  if (invitations.length > 0 || sessions.length > 0) parts.push(revocationMetadata(scope, invitations, sessions));
+  return parts;
 }
 
 /** Audit event types whose metadata names revoked invitations or sessions. */

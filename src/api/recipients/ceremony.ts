@@ -49,7 +49,11 @@
 // expired or revoked invitation and an unknown token are a generic 401. A right
 // code consumes the challenge and creates the session: the cookie value (only
 // its SHA-256 stored) and an immutable CSRF secret, bound to the tenant,
-// envelope, recipient, revision and manifest.
+// envelope, recipient, revision and manifest. A recipient holds at most one
+// unrevoked session per envelope (request #50; data-model.md § Authentication
+// and secrets). Before inserting the new session, the same transaction revokes
+// the recipient's other sessions, so signing in on a second device ends the
+// first.
 //
 // Reads (readRecipientSession, readRecipientDocument, readRecipientManifest)
 // never consume, approve or change the envelope: at most a session's
@@ -69,10 +73,15 @@
 // - recipient.session_created: the session that code opened;
 // - recipient.locked_out: the twentieth wrong code revoked the invitation;
 // - recipient.capabilities_revoked: a resend revoked the recipient's
-//   invitations and sessions, the recipient ended a session, or the envelope
-//   was voided, expired or reissued (the envelope service has revoked every
-//   outstanding capability; the event names those revoked at that change's
-//   instant that no earlier event names).
+//   invitations and sessions, a new session revoked the recipient's other
+//   sessions, the recipient ended a session, or the envelope was voided,
+//   expired or reissued (the envelope service has revoked every outstanding
+//   capability; the event names those revoked at that change's instant that no
+//   earlier event names). It is one event with the full id lists whenever they
+//   fit the audit writer's metadata limit, as they always do for rows this code
+//   writes. For older rows holding more, splitRevocationMetadata splits them
+//   over several disjoint events of this type that together name each id once
+//   (row REVOKE-META, CH-11).
 // Each event carries the envelope id and the bound manifest digest as its
 // subject. Its metadata holds ids, ordinals and digests only (invitation,
 // challenge, session, recipient and revision ids, the recipient's ordinal, the
@@ -80,6 +89,26 @@
 // address or a stored hash. The actor is the operator who caused the step, the
 // recipient (by id) for their own verification, session and end, or the
 // system.
+//
+// Event cap (A-010 row EVENT-CAP, request #46; CH-10). A person can repeat
+// three actions: an invitation resend, a challenge request and a
+// recipient-session creation. Each counts the envelope's audit events through
+// the audit_events_envelope index, inside its own write transaction and before
+// it writes anything. Once the count has reached ENVELOPE_REPEATABLE_EVENT_CAP
+// (2048), the action is refused and writes nothing. resendInvitation and
+// createSession throw 429 rate_limited with detail envelope_event_limit and no
+// Retry-After. The challenge request is refused silently (request #50): its
+// generic 202 is unchanged, and its deferred work supersedes, stores and mails
+// nothing and logs the refusal once, with the correlation ID and the detail
+// only. The count is the rows themselves, so the cap is durable, unlike the
+// per-process rate limits. A session creation writes at most three events,
+// and a recipient keeps at most one unrevoked session, so at most two session
+// ends follow the cap: ENVELOPE_REPEATABLE_EVENT_CEILING (2052) bounds the rows
+// this code writes. Nothing else here is refused for the cap: the first
+// invitation and the follow-up invitation after an approval (onEnvelopeChange),
+// the revocation records of a void, an expiry or a reissue, the end of a
+// session, and every read. Approval, decline and finalization write their
+// events outside this module.
 
 import { createHash, randomBytes } from 'node:crypto';
 import { inspect } from 'node:util';
@@ -125,6 +154,7 @@ import {
   auditedRevocationsOf,
   capabilitiesRevokedAt,
   consumeChallenge,
+  envelopeEventCapReached,
   getConsentInForce,
   getInvitation,
   getSession,
@@ -140,8 +170,10 @@ import {
   revokeInvitationsOf,
   revokeSession,
   revokeSessionsOf,
+  splitRevocationMetadata,
   supersedeOpenChallenges,
   touchSession,
+  unrevokedSessionIdsOf,
   type CapabilityIds,
   type ChallengeRecord,
   type InvitationRecord,
@@ -245,7 +277,35 @@ export class InvitationMail {
 type SessionOutcome =
   | { readonly kind: 'created'; readonly value: string; readonly state: JsonValue }
   | { readonly kind: 'refused' }
-  | { readonly kind: 'locked' };
+  | { readonly kind: 'locked' }
+  | { readonly kind: 'capped' };
+
+/** The error detail of the per-envelope event cap (A-010 row EVENT-CAP). */
+export const ENVELOPE_EVENT_LIMIT_DETAIL = 'envelope_event_limit';
+
+/** What #writeChallenge returns at the event cap: nothing was written and nothing is mailed. */
+const AT_CAP: unique symbol = Symbol('envelope event cap');
+
+/**
+ * The cap refusal: 429 rate_limited, with the detail on `envelope`. It carries no
+ * Retry-After, because waiting does not lift the cap: only a void and a reissue
+ * do. Every caller throws it before writing anything.
+ */
+function envelopeEventLimit(): HttpError {
+  return new HttpError(429, 'rate_limited', { details: [{ field: 'envelope', code: ENVELOPE_EVENT_LIMIT_DETAIL }] });
+}
+
+/** True for the cap refusal that resendInvitation and createSession throw (T034 maps the resend's). */
+export function isEnvelopeEventLimit(error: unknown): error is HttpError {
+  return (
+    error instanceof HttpError &&
+    error.status === 429 &&
+    error.code === 'rate_limited' &&
+    error.details.length === 1 &&
+    error.details[0]?.field === 'envelope' &&
+    error.details[0]?.code === ENVELOPE_EVENT_LIMIT_DETAIL
+  );
+}
 
 const CLOSED_STATES: ReadonlySet<string> = new Set(['declined', 'expired', 'voided']);
 
@@ -373,14 +433,18 @@ export class RecipientCeremony implements RecipientSessionAuthority {
     return recipient.ordinal;
   }
 
-  /** recipient.capabilities_revoked, when the revocation revoked anything. */
+  /**
+   * recipient.capabilities_revoked, when the revocation revoked anything. It is
+   * ONE event with the full id lists whenever they fit the audit writer's
+   * metadata limit, which they always do for rows this code writes. Only for
+   * older rows holding many capabilities is it split over several disjoint events,
+   * each with the same actor, subject and scope, that together name each id once
+   * (row REVOKE-META, CH-11).
+   */
   #recordRevoked(store: TenantStore, actor: AuditActor, envelopeId: string, subjectDigest: string | null, scope: { readonly [key: string]: JsonValue }, revoked: CapabilityIds): void {
-    if (revoked.invitationIds.length === 0 && revoked.sessionIds.length === 0) return;
-    this.#record(store, 'recipient.capabilities_revoked', actor, envelopeId, subjectDigest, {
-      ...scope,
-      invitation_ids: [...revoked.invitationIds],
-      session_ids: [...revoked.sessionIds],
-    });
+    for (const metadata of splitRevocationMetadata(scope, revoked)) {
+      this.#record(store, 'recipient.capabilities_revoked', actor, envelopeId, subjectDigest, metadata);
+    }
   }
 
   /** The invitation still names the envelope's frozen revision and manifest. */
@@ -467,6 +531,12 @@ export class RecipientCeremony implements RecipientSessionAuthority {
    * outstanding invitation and session and gets a fresh invitation. `actor` is
    * the operator who asked for it (the audit events' actor; the system when
    * omitted).
+   *
+   * Event cap (A-010 EVENT-CAP). After the 404 and 409 checks and before its
+   * first write, the resend counts the envelope's audit events through `store`,
+   * which belongs to the caller's write transaction (T034's EnvelopeApi.resend).
+   * At the cap it throws the 429 rate_limited / envelope_event_limit HttpError.
+   * The caller's transaction then rolls back, and capture() discards the mail.
    */
   resendInvitation(store: TenantStore, envelopeId: string, recipientId: string, actor?: Actor): void {
     const now = this.#now();
@@ -483,6 +553,7 @@ export class RecipientCeremony implements RecipientSessionAuthority {
     );
     if (recipient.ordinal !== turn) throw new HttpError(409, 'order_conflict');
     if (recipient.status !== 'invited') throw new HttpError(409, 'state_conflict');
+    if (envelopeEventCapReached(store, envelopeId)) throw envelopeEventLimit();
     const by = operatorActor(actor);
     const outstanding = outstandingCapabilitiesOf(store, envelopeId, recipientId);
     revokeInvitationsOf(store, envelopeId, recipientId, iso);
@@ -580,14 +651,18 @@ export class RecipientCeremony implements RecipientSessionAuthority {
 
   /** The per-invitation work: the lookup and challenge write in one transaction, then the mail. */
   async #challengeWork(tokenHash: string, correlationId: string): Promise<void> {
-    let mail: RecipientChallengeRequest | null;
+    let mail: RecipientChallengeRequest | null | typeof AT_CAP;
     try {
       mail = this.#writeChallenge(tokenHash);
     } catch (error) {
       this.#workFailed('storage', correlationId, error);
       return;
     }
-    if (mail !== null) {
+    if (mail === AT_CAP) {
+      // Refused silently behind the generic 202 (request #50). Logged once, with the
+      // correlation ID and the detail only: never a token, code, invitation id or address.
+      this.#logger.warn('challenge_refused', { correlation_id: correlationId, detail: ENVELOPE_EVENT_LIMIT_DETAIL });
+    } else if (mail !== null) {
       try {
         await this.#notifier.send(mail);
       } catch (error) {
@@ -612,11 +687,16 @@ export class RecipientCeremony implements RecipientSessionAuthority {
     return Object.freeze({ ...this.#work });
   }
 
-  /** For a live invitation: supersede its open challenge and store a new one; returns the mail, or null. */
-  #writeChallenge(tokenHash: string): RecipientChallengeRequest | null {
+  /**
+   * For a live invitation: supersede its open challenge and store a new one, and
+   * return the mail. Returns null when the token names no live invitation, and
+   * AT_CAP when the envelope's audit events have reached the cap. In both of
+   * those cases nothing is written.
+   */
+  #writeChallenge(tokenHash: string): RecipientChallengeRequest | null | typeof AT_CAP {
     const now = this.#now();
     const iso = now.toISOString();
-    return this.#db.transaction((): RecipientChallengeRequest | null => {
+    return this.#db.transaction((): RecipientChallengeRequest | null | typeof AT_CAP => {
       const owner = resolveInvitation(this.#db, tokenHash);
       if (owner === undefined) return null;
       const store = this.#db.forTenant(owner.tenantId);
@@ -626,6 +706,10 @@ export class RecipientCeremony implements RecipientSessionAuthority {
       if (envelope === undefined || !this.#bound(envelope, invitation) || CLOSED_STATES.has(envelope.state) || Date.parse(envelope.expiresAt) <= now.getTime()) return null;
       const recipient = listRecipients(store, envelope.id).find((entry) => entry.id === invitation.recipientId);
       if (recipient === undefined) return null;
+      // Event cap (A-010 EVENT-CAP, request #50), inside this transaction and before
+      // any write. At the cap nothing is superseded, stored or mailed. The generic
+      // 202 has already been sent, and #challengeWork logs the refusal once.
+      if (envelopeEventCapReached(store, envelope.id)) return AT_CAP;
       supersedeOpenChallenges(store, invitation.id, iso);
       const challengeId = this.#id();
       const code = newChallengeCode();
@@ -637,7 +721,14 @@ export class RecipientCeremony implements RecipientSessionAuthority {
 
   // ------------------------------------------------------------------ session
 
-  /** createRecipientSession: 201 state plus the cookie value, or 401 / 429 locked / 429 rate_limited / 400. */
+  /**
+   * createRecipientSession: 201 state plus the cookie value, or 401 / 429 locked /
+   * 429 rate_limited / 400. The event cap (A-010 EVENT-CAP) is checked inside the
+   * transaction, after the checks that write nothing and before the code is
+   * compared. At the cap, neither a right code (consumption, revocation, session,
+   * up to three events) nor a wrong one (counters, lockout event) writes: 429
+   * rate_limited, envelope_event_limit.
+   */
   createSession(body: unknown, clientAddress: string): CreatedSession {
     const { invitation: token, code } = checkSessionCreate(body);
     const tokenHash = capabilityHash(token);
@@ -659,6 +750,7 @@ export class RecipientCeremony implements RecipientSessionAuthority {
       const challenge = openChallenge(store, invitation.id);
       if (challenge === undefined || Date.parse(challenge.expiresAt) <= now.getTime()) return { kind: 'refused' };
       if (challenge.attempts >= CHALLENGE_MAX_ATTEMPTS) return { kind: 'locked' };
+      if (envelopeEventCapReached(store, envelope.id)) return { kind: 'capped' };
       if (!this.#key.verify(invitation.id, challenge.id, code, challenge.codeHmac)) {
         // Committed although the request fails: the counts only move forward.
         const wrong = recordWrongCode(store, invitation, challenge, iso);
@@ -677,6 +769,7 @@ export class RecipientCeremony implements RecipientSessionAuthority {
       return this.#openSession(store, invitation, challenge, envelope, now);
     });
     if (outcome.kind === 'locked') throw new HttpError(429, 'locked');
+    if (outcome.kind === 'capped') throw envelopeEventLimit();
     if (outcome.kind === 'refused') throw new HttpError(401, 'unauthenticated');
     return { value: outcome.value, state: outcome.state };
   }
@@ -692,6 +785,13 @@ export class RecipientCeremony implements RecipientSessionAuthority {
       recipient_ordinal: ordinal,
       attempt: challenge.attempts + 1,
     });
+    // One unrevoked session per recipient (request #50): the recipient's other
+    // unrevoked sessions on the envelope are revoked before the new one is
+    // inserted, and named in one recipient.capabilities_revoked event, with the
+    // recipient as actor. Signing in on a second device ends the first session.
+    const others = unrevokedSessionIdsOf(store, envelope.id, invitation.recipientId);
+    revokeSessionsOf(store, envelope.id, invitation.recipientId, iso);
+    this.#recordRevoked(store, by, envelope.id, invitation.manifestDigest, { recipient_id: invitation.recipientId, recipient_ordinal: ordinal }, { invitationIds: [], sessionIds: others });
     const value = newSessionValue();
     const csrfSecret = newCsrfSecret();
     const sessionId = this.#id();

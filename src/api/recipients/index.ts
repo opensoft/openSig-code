@@ -15,8 +15,10 @@
 export {
   CHALLENGE_TTL_MS,
   DEFAULT_CEREMONY_LIMITS,
+  ENVELOPE_EVENT_LIMIT_DETAIL,
   INVITATION_TTL_MS,
   InvitationMail,
+  isEnvelopeEventLimit,
   RecipientCeremony,
   type CeremonyLimits,
   type ChallengeWorkStats,
@@ -42,3 +44,14 @@ export { CEREMONY_HANDLERS, ceremonyAuthority, ceremonyOf, RECIPIENT_CEREMONY } 
 export { createWindowLimiter, type LimitDecision, type WindowLimit, type WindowLimiter } from './rate-limit.ts';
 export { checkChallengeRequest, checkSessionCreate, INVITATION_PATTERN, SESSION_CODE_PATTERN } from './validation.ts';
 export { maskEmail, SESSION_ENVELOPE_STATES, sessionStateView, turnOf, type Turn } from './views.ts';
+// The per-envelope event cap (A-010 EVENT-CAP) and the revocation splitter (REVOKE-META),
+// defined beside the ceremony's other counters.
+export {
+  ENVELOPE_MAX_RECIPIENTS,
+  ENVELOPE_REPEATABLE_EVENT_CAP,
+  ENVELOPE_REPEATABLE_EVENT_CEILING,
+  ENVELOPE_SESSION_ENDS_PAST_CAP,
+  REPEATABLE_ACTION_MAX_EVENTS,
+  splitRevocationMetadata,
+  type RevocationMetadata,
+} from '../../storage/repositories/recipients.ts';
