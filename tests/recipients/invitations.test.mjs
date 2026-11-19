@@ -75,7 +75,7 @@ test('[RC-01] sending issues a 256-bit invitation, stores only its hash, binds i
       const pdf = syntheticPdf('rollback');
       const put = rolled.blobs.put(rolled.tenant, pdf);
       const created = rolled.service.create(rolled.req(), createInput(1)).body;
-      const uploaded = rolled.service.uploadDocument(rolled.req(), created.id, 1, { digest: put.digest, bytes: pdf.length, pages: [{ number: 1, width: 612, height: 792, rotate: 0 }], parseReport: { pages: 1 } }).body;
+      const uploaded = rolled.service.uploadDocument(rolled.req(), created.id, 1, { digest: put.digest, bytes: pdf.length, pages: [{ number: 1, width: 612, height: 792, rotate: 0 }], parseReport: { pages: [{ number: 1, width: 612, height: 792, rotate: 0, media_box: [0, 0, 612, 792], crop_box: [0, 0, 612, 792] }] } }).body;
       const prepared = rolled.service.prepare(rolled.req(), created.id, { expected_version: uploaded.version, fields: fieldsFor(1) }).body;
       // The 2-byte idempotency body limit fails the send inside its transaction, after the invitation was issued.
       await assert.rejects(
@@ -102,7 +102,7 @@ test('[RC-01] sending issues a 256-bit invitation, stores only its hash, binds i
       const pdf = syntheticPdf('opaque');
       const put = second.blobs.put(second.tenant, pdf);
       const created = second.service.create(second.req(), createInput(1)).body;
-      const uploaded = second.service.uploadDocument(second.req(), created.id, 1, { digest: put.digest, bytes: pdf.length, pages: [{ number: 1, width: 612, height: 792, rotate: 0 }], parseReport: { pages: 1 } }).body;
+      const uploaded = second.service.uploadDocument(second.req(), created.id, 1, { digest: put.digest, bytes: pdf.length, pages: [{ number: 1, width: 612, height: 792, rotate: 0 }], parseReport: { pages: [{ number: 1, width: 612, height: 792, rotate: 0, media_box: [0, 0, 612, 792], crop_box: [0, 0, 612, 792] }] } }).body;
       const prepared = second.service.prepare(second.req(), created.id, { expected_version: uploaded.version, fields: fieldsFor(1) }).body;
       const captured = second.ceremony.capture(() => second.service.send(second.req(), prepared.id, { expected_version: prepared.version }));
       assert.equal(captured.mails.length, 1, 'one invitation awaits delivery after the commit');

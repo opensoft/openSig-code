@@ -68,6 +68,7 @@ import {
   fieldsFor,
   logsFreeOf,
   openSession,
+  pageReport,
   readAs,
   requestChallenge,
   requestCode,
@@ -257,7 +258,7 @@ async function sentEnvelopeIn(world, tenant, service) {
     digest: put.digest,
     bytes: pdf.length,
     pages,
-    parseReport: { pages: 2, network_sandbox: 'netns+fs-enforced (local)' },
+    parseReport: { pages: pageReport(pages), network_sandbox: 'netns+fs-enforced (local)' },
   }).body;
   const prepared = service.prepare(req, created.id, { expected_version: uploaded.version, fields: fieldsFor(1) }).body;
   const sent = (await world.ceremony.run(() => service.send(req, prepared.id, { expected_version: prepared.version }))).body;

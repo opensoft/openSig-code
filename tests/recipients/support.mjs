@@ -314,6 +314,19 @@ export function wrongCode(code, shift = 1) {
 }
 
 /**
+ * The page list T034's upload stores in the parse report (request #53): each displayed
+ * page with its MediaBox and an equal CropBox, the box sized so that the displayed
+ * width and height follow under the page's rotation (a quarter-turned 612 x 792 page
+ * has the box [0, 0, 792, 612]).
+ */
+export function pageReport(pages) {
+  return pages.map((page) => {
+    const box = page.rotate % 180 === 0 ? [0, 0, page.width, page.height] : [0, 0, page.height, page.width];
+    return { ...page, media_box: box, crop_box: [...box] };
+  });
+}
+
+/**
  * A human-created envelope taken to sent through the T007 service, its
  * document stored in the blob store, the send run inside the ceremony so the
  * invitation is mailed after the commit. Returns { envelope, token, pdf }.
@@ -327,7 +340,7 @@ export async function sentEnvelope(world, { recipients = 1, expiresAt } = {}) {
     digest: put.digest,
     bytes: pdf.length,
     pages,
-    parseReport: { pages: 2, network_sandbox: 'netns+fs-enforced (local)' },
+    parseReport: { pages: pageReport(pages), network_sandbox: 'netns+fs-enforced (local)' },
   }).body;
   const prepared = world.service.prepare(world.req(), created.id, { expected_version: uploaded.version, fields: fieldsFor(recipients) }).body;
   const sent = (await world.ceremony.run(() => world.service.send(world.req(), prepared.id, { expected_version: prepared.version }))).body;
