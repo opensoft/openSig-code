@@ -152,6 +152,8 @@ function contentObject() {
  *   which /XRefStm names (the doc's xrefStm gives that offset);
  * - hiddenFreeRows: that many free rows for objects 10 onward in the hybrid's
  *   hidden stream, FlateDecoded with /W [6 6 6] (18 inflated bytes a row);
+ * - hiddenDictExtra: text added to the hybrid's hidden stream dictionary
+ *   (CAND7: a /Prev that T033 never reads there);
  * - objStmIndirectLength: the object stream's /Length as `7 0 R`, object 7
  *   holding it (stream bases only; /Size becomes 8);
  * - xrefStmDelta, startxrefDelta: added to the written offsets;
@@ -249,7 +251,7 @@ export function buildBase(options = {}) {
       rows = deflateSync(Buffer.concat([xrefRows(hiddenRows, wide), Buffer.alloc(options.hiddenFreeRows * 18)]));
       hiddenDict = `/Size ${10 + options.hiddenFreeRows} /W [6 6 6] /Index [1 ${hiddenRows.length} 10 ${options.hiddenFreeRows}] /Filter /FlateDecode`;
     }
-    w.write(`6 0 obj\n<< /Type /XRef ${hiddenDict} /Length ${rows.length} >>\nstream\n`);
+    w.write(`6 0 obj\n<< /Type /XRef ${hiddenDict}${options.hiddenDictExtra ?? ''} /Length ${rows.length} >>\nstream\n`);
     w.write(rows);
     w.write('\nendstream\nendobj\n');
     const xrefAt = w.offset;

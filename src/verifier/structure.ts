@@ -52,7 +52,9 @@
 // - the final startxref, every /Prev and every /XRefStm reach a section of the
 //   right kind. /Prev is followed as T033 follows it (B3): a non-negative offset
 //   within the file, in either direction, no section revisited, and at most
-//   maxRevisions sections;
+//   maxRevisions sections. /Prev is read only from a section's own trailer (a
+//   table's, or a chain stream's dictionary), never from a hybrid's hidden
+//   /XRefStm stream, whose entries alone are used (request #64 (1));
 // - only EFFECTIVE entries are checked (B2): the first entry for each object
 //   number, newest section first (T033's addEntry). Inside a hybrid section the
 //   precedence is the section's in-use table entry, then its /XRefStm entry,
@@ -414,7 +416,11 @@ function readSection(bytes: Uint8Array, offset: number, origin: 'startxref' | 'p
   }
   const stream = readXrefStream(bytes, offset, budget);
   if (stream === null) fault(notXref);
-  return { offset, start: stream.start, kind: 'stream', prev: stream.prev, hiddenStreamOffset: null, local: stream.local, hidden: null };
+  // Request #64 (1): /Prev is checked here, in the chain-section role only, as
+  // T033's readChain checks a section's own trailer, and at each use, so the
+  // per-offset cache never carries one role's check into the other.
+  const prev = optionalOffset(stream.dict, 'Prev', 'xref-stream-malformed');
+  return { offset, start: stream.start, kind: 'stream', prev, hiddenStreamOffset: null, local: stream.local, hidden: null };
 }
 
 /** T033's addLocal: the first entry for an object number in a section wins; a section's own count is bounded. */
@@ -486,6 +492,8 @@ function readTableSection(bytes: Uint8Array, offset: number, start: number, budg
     if (hiddenStreamOffset >= end) fault('xrefstm-not-xref-stream');
     const stream = readXrefStream(bytes, hiddenStreamOffset, budget);
     if (stream === null) fault('xrefstm-not-xref-stream');
+    // Only its entries are used: T033's readChain never reads a hidden stream's
+    // /Prev, so neither does this reader (request #64 (1), CAND7).
     hidden = stream.local;
   }
   return { offset, start, kind: 'table', prev, hiddenStreamOffset, local, hidden };
@@ -519,7 +527,8 @@ function optionalOffset(dict: PdfValue, key: string, detail: StructureDetail): n
 
 interface XrefStreamRead {
   readonly start: number;
-  readonly prev: number | null;
+  /** The stream dictionary: its /Prev is read only in the chain-section role (request #64 (1)). */
+  readonly dict: PdfValue;
   readonly local: LocalEntries;
 }
 
@@ -550,7 +559,7 @@ function decodeXrefStreamAt(bytes: Uint8Array, offset: number, budget: Budget): 
   const raw = streamBody(bytes, object.streamStart, length, XREF_STREAM_FAULTS);
   const decoded = decodeStream(object.value, raw, budget, XREF_STREAM_FAULTS);
   const local = xrefStreamEntries(object.value, decoded);
-  return { start: object.header.start, prev: optionalOffset(object.value, 'Prev', 'xref-stream-malformed'), local };
+  return { start: object.header.start, dict: object.value, local };
 }
 
 /** The details one stream decode reports: a cross-reference stream's own, or those of an object stream a type-2 entry names. */

@@ -289,6 +289,8 @@ test('[VB-06] the composed cases cannot skip: no skip, todo, catch or capability
   const candidates = codeOf('./strand-candidates.test.mjs');
   // Request #62 (1): the sealed section-offset cases are held to the same rule.
   const offsets = codeOf('./strand-offsets.test.mjs');
+  // Request #64 (1): the sealed CAND7 cases are held to the same rule.
+  const hiddenPrev = codeOf('./strand-hidden-prev.test.mjs');
   const forbidden = [
     /\bskip\b/,
     /\btodo\b/,
@@ -305,6 +307,7 @@ test('[VB-06] the composed cases cannot skip: no skip, todo, catch or capability
     ['strand-sealed.test.mjs', sealed],
     ['strand-candidates.test.mjs', candidates],
     ['strand-offsets.test.mjs', offsets],
+    ['strand-hidden-prev.test.mjs', hiddenPrev],
     ['helpers/product-compose.mjs', helper],
   ];
   for (const [name, code] of files) {
@@ -320,6 +323,9 @@ test('[VB-06] the composed cases cannot skip: no skip, todo, catch or capability
   assert.equal(offsets.match(/^test\(/gm)?.length, 3, 'the three sealed section-offset cases (request #62 (1))');
   assert.ok((offsets.match(/await sealAndVerify\(/g)?.length ?? 0) >= 3, 'every section-offset case seals and verifies');
   assert.match(offsets, /^import \{ sealWithProduct, syntheticEvidenceDigest \} from '\.\/helpers\/product-seal\.mjs';$/m, 'a static import');
+  assert.equal(hiddenPrev.match(/^test\(/gm)?.length, 2, 'the two sealed CAND7 cases (request #64 (1))');
+  assert.ok((hiddenPrev.match(/await sealAndVerify\(/g)?.length ?? 0) >= 2, 'every CAND7 case seals and verifies');
+  assert.match(hiddenPrev, /^import \{ sealWithProduct, syntheticEvidenceDigest \} from '\.\/helpers\/product-seal\.mjs';$/m, 'a static import');
   assert.ok((composed.match(/await composeAndRead\(t, /g)?.length ?? 0) >= 4, 'every case composes and reads');
   assert.match(composed, /^import \{ composeWithProduct \} from '\.\/helpers\/product-compose\.mjs';$/m, 'a static import');
   assert.match(helper, /^import \{ composeSealRevision \} from /m, 'a static import');
@@ -505,4 +511,33 @@ test('[VB-06] C5: compressed objects have no parse total, and 1,500 header pairs
   const oldTotal = 2 * (VERIFIER_LIMITS.maxInputBytes + VERIFIER_LIMITS.maxXrefInflatedBytes);
   assert.ok(n * value.length > oldTotal, 'a parse per pair passes the first fix\'s maxObjectParseBytes');
   assert.equal(ok(doc.bytes).length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// Request #64 (1): /Prev follows the role. T033's readChain checks /Prev only
+// on a section's own trailer (a table's, or a chain stream's dictionary) and
+// never reads a hybrid's hidden /XRefStm stream's /Prev. The check follows the
+// role at each use, whichever role the per-offset cache meets first. CAND7 is
+// sealed end to end in strand-hidden-prev.test.mjs.
+//
+// Mutants killed here: the /Prev check restored on hidden streams; the /Prev
+// check dropped for chain streams; the cache reusing the first role's /Prev
+// decision for the second role.
+// ---------------------------------------------------------------------------
+
+test('[VB-06] CAND7: a hidden /XRefStm stream carrying /Prev null or /Prev -1 is read for its entries only (request #64 (1))', () => {
+  assert.equal(ok(buildBase({ xref: 'hybrid', hiddenDictExtra: ' /Prev null' }).bytes).length, 1);
+  assert.equal(ok(buildBase({ xref: 'hybrid', hiddenDictExtra: ' /Prev -1' }).bytes).length, 1);
+});
+
+test('[VB-06] CAND7: a chain stream\'s /Prev null or -1 is refused, also when the cache first met the stream as a hidden /XRefStm stream (request #64 (1))', () => {
+  failsWith(buildBase({ xref: 'stream', xrefDictExtra: ' /Prev null' }).bytes, 'xref-stream-malformed');
+  failsWith(buildBase({ xref: 'stream', xrefDictExtra: ' /Prev -1' }).bytes, 'xref-stream-malformed');
+  // The table trailer names its hidden stream as /XRefStm and as /Prev, so the
+  // stream is read first as hidden (entries only), then as a chain section,
+  // whose /Prev null must be refused.
+  const hybrid = buildBase({ xref: 'hybrid', hiddenDictExtra: ' /Prev null' });
+  const named = `/XRefStm ${hybrid.xrefStm} >>`;
+  const twice = `/XRefStm ${hybrid.xrefStm} /Prev ${hybrid.xrefStm} >>`;
+  failsWith(editedBytes(hybrid.bytes.toString('latin1'), named, twice), 'xref-stream-malformed');
 });
