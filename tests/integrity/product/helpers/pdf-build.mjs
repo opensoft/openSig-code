@@ -419,3 +419,50 @@ export function embedCms(layout, der) {
   bytes.write(hex, layout.contentsStart + 1, 'latin1');
   return bytes;
 }
+
+/**
+ * A one-page base whose one cross-reference section is a stream at the very
+ * start of the file, named by `startxref` at offset `at` (request #62 (1)):
+ * - at 7: the header's minor version digit is the stream's object number, as
+ *   T033's readIndirect reads `7` (or `0`), `0`, `obj` across the header's end
+ *   of line: `%PDF-1.7` gives object 7 (its own entry in use at offset 7), and
+ *   `%PDF-2.0` gives object 0 (entry 0 stays free);
+ * - at 0: T033's skipWhitespace passes over the header line as a comment, and
+ *   the stream object (number 5) starts on the next line.
+ */
+export function buildEarlyStreamBase({ version = '1.7', at = 7 } = {}) {
+  const head = `%PDF-${version}\n`;
+  let xnum;
+  let prefix;
+  if (at === 7) {
+    xnum = Number(version[2]);
+    if (xnum >= 1 && xnum <= 4) throw new Error('buildEarlyStreamBase: object ' + xnum + ' is a page object');
+    prefix = `${head}0 obj\n`;
+  } else if (at === 0) {
+    xnum = 5;
+    prefix = `${head}5 0 obj\n`;
+  } else {
+    throw new Error('buildEarlyStreamBase: `at` is 7 or 0');
+  }
+  const size = Math.max(5, xnum + 1);
+  const widths = [1, 4, 2];
+  const w = new Writer();
+  w.write(prefix);
+  w.write(`<< /Type /XRef /Size ${size} /W [1 4 2] /Root 1 0 R /Length ${size * 7} >>\nstream\n`);
+  const rowsAt = w.offset;
+  w.write(Buffer.alloc(size * 7));
+  w.write('\nendstream\nendobj\n');
+  const offsets = [];
+  for (const [num, text] of [[1, OBJ1], [2, OBJ2], [3, OBJ3], [4, contentObject()]]) {
+    offsets[num] = w.offset;
+    w.write(`${num} 0 obj\n${text}\nendobj\n`);
+  }
+  w.write(`startxref\n${at}\n%%EOF\n`);
+  const entries = Array.from({ length: size }, (_, num) => [0, 0, num === 0 ? 65535 : 0]);
+  for (let num = 1; num <= 4; num += 1) entries[num] = [1, offsets[num], 0];
+  // The stream's own entry, in use where it stands; object 0 (a 2.0 header) stays free.
+  if (xnum > 4) entries[xnum] = [1, at === 7 ? 7 : head.length, 0];
+  const bytes = w.bytes();
+  xrefRows(entries, widths).copy(bytes, rowsAt);
+  return { bytes, kind: 'stream', startxref: at, size, root: '1 0 R' };
+}

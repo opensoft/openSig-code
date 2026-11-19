@@ -287,6 +287,8 @@ test('[VB-06] the composed cases cannot skip: no skip, todo, catch or capability
   const helper = codeOf('./helpers/product-compose.mjs');
   // Request #60 (1): the sealed candidates C1 to C3 are held to the same rule.
   const candidates = codeOf('./strand-candidates.test.mjs');
+  // Request #62 (1): the sealed section-offset cases are held to the same rule.
+  const offsets = codeOf('./strand-offsets.test.mjs');
   const forbidden = [
     /\bskip\b/,
     /\btodo\b/,
@@ -302,6 +304,7 @@ test('[VB-06] the composed cases cannot skip: no skip, todo, catch or capability
     ['structure-composed.test.mjs', composed],
     ['strand-sealed.test.mjs', sealed],
     ['strand-candidates.test.mjs', candidates],
+    ['strand-offsets.test.mjs', offsets],
     ['helpers/product-compose.mjs', helper],
   ];
   for (const [name, code] of files) {
@@ -314,6 +317,9 @@ test('[VB-06] the composed cases cannot skip: no skip, todo, catch or capability
   assert.equal(candidates.match(/^test\(/gm)?.length, 3, 'the three sealed candidate cases (request #60 (1))');
   assert.ok((candidates.match(/await sealAndVerify\(/g)?.length ?? 0) >= 3, 'every candidate case seals and verifies');
   assert.match(candidates, /^import \{ sealWithProduct, syntheticEvidenceDigest \} from '\.\/helpers\/product-seal\.mjs';$/m, 'a static import');
+  assert.equal(offsets.match(/^test\(/gm)?.length, 3, 'the three sealed section-offset cases (request #62 (1))');
+  assert.ok((offsets.match(/await sealAndVerify\(/g)?.length ?? 0) >= 3, 'every section-offset case seals and verifies');
+  assert.match(offsets, /^import \{ sealWithProduct, syntheticEvidenceDigest \} from '\.\/helpers\/product-seal\.mjs';$/m, 'a static import');
   assert.ok((composed.match(/await composeAndRead\(t, /g)?.length ?? 0) >= 4, 'every case composes and reads');
   assert.match(composed, /^import \{ composeWithProduct \} from '\.\/helpers\/product-compose\.mjs';$/m, 'a static import');
   assert.match(helper, /^import \{ composeSealRevision \} from /m, 'a static import');

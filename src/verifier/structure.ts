@@ -68,7 +68,11 @@
 // ends are found in file order: each revision ends after the first %%EOF past
 // its section and at most one end-of-line, before the next section by
 // position; one without a %%EOF has an unmarked end, at which no signature can
-// end; the last by position ends at the file length.
+// end; the last by position ends at the file length. A stream section may start
+// at any offset T033's section read admits (request #62 (1)): at 7, where
+// readIndirect reads the header's minor version digit as the object number,
+// and at 0, where its skipWhitespace passes over the header line as a comment.
+// No revision check assumes that a section starts after the header.
 //
 // Work (request #60 (2)): a region already read is reused, never read again: an
 // indirect read or a header skip by its start offset, a cross-reference stream
@@ -211,15 +215,57 @@ interface Budget {
   readonly xrefStreams: Map<number, XrefStreamRead | null>;
   /** Compressed objects parsed, keyed by object stream offset, start and end. */
   readonly compressed: Map<string, PdfValue>;
+  /** Test-only read counts (readRevisionStructureCounted), or null; the reader never reads them. */
+  readonly counts: StructureReadCounts | null;
 }
 
-const HEADER_LENGTH = 8; // `%PDF-x.y`
+/**
+ * TEST ONLY (request #62 (3); row T014-TESTS): how many reads one structure
+ * read asked for, and how many it made afresh rather than reusing.
+ */
+export interface StructureReadCounts {
+  /** Indirect objects asked for at an offset, and read afresh (indirectAt). */
+  indirectRequests: number;
+  indirectReads: number;
+  /** Cross-reference streams asked for at an offset, and decoded afresh. */
+  xrefStreamRequests: number;
+  xrefStreamDecodes: number;
+  /** Object streams read and decoded (once per stream object). */
+  objectStreamDecodes: number;
+  /** Compressed objects asked for, and parsed afresh (by object stream, start and end). */
+  compressedRequests: number;
+  compressedParses: number;
+}
+
 const MAX_GENERATION = 65535;
 
 /** Read the revision structure of `bytes`. Never throws on malformed input. */
 export function readRevisionStructure(bytes: Uint8Array): StructureResult {
+  return readStructure(bytes, null);
+}
+
+/**
+ * TEST ONLY (request #62 (3); row T014-TESTS): readRevisionStructure, with the
+ * reads it made counted in a fresh object created here for this one call.
+ * index.ts does not export it, so no product caller reaches it, and the reader
+ * only adds to the counts, never reads them; product calls carry none.
+ */
+export function readRevisionStructureCounted(bytes: Uint8Array): { result: StructureResult; counts: StructureReadCounts } {
+  const counts: StructureReadCounts = {
+    indirectRequests: 0,
+    indirectReads: 0,
+    xrefStreamRequests: 0,
+    xrefStreamDecodes: 0,
+    objectStreamDecodes: 0,
+    compressedRequests: 0,
+    compressedParses: 0,
+  };
+  return { result: readStructure(bytes, counts), counts };
+}
+
+function readStructure(bytes: Uint8Array, counts: StructureReadCounts | null): StructureResult {
   try {
-    const { revisions, signature } = walk(bytes);
+    const { revisions, signature } = walk(bytes, counts);
     return { ok: true, revisions, signature };
   } catch (error) {
     if (error instanceof StructureFault) return { ok: false, detail: error.detail };
@@ -227,7 +273,7 @@ export function readRevisionStructure(bytes: Uint8Array): StructureResult {
   }
 }
 
-function walk(bytes: Uint8Array): { revisions: Revision[]; signature: SignatureScan } {
+function walk(bytes: Uint8Array, counts: StructureReadCounts | null): { revisions: Revision[]; signature: SignatureScan } {
   if (bytes.length > VERIFIER_LIMITS.maxInputBytes) fault('input-too-large');
   checkHeader(bytes);
   const budget: Budget = {
@@ -235,6 +281,7 @@ function walk(bytes: Uint8Array): { revisions: Revision[]; signature: SignatureS
     indirect: new Map(),
     xrefStreams: new Map(),
     compressed: new Map(),
+    counts,
   };
   const sections: SectionInfo[] = [];
   const effective = new Map<number, Entry>();
@@ -277,8 +324,10 @@ function indirectAt(
   offset: number,
   budget: Budget,
 ): { readonly header: ObjectHeader; readonly object: IndirectObject | null } | null {
+  if (budget.counts !== null) budget.counts.indirectRequests += 1;
   const known = budget.indirect.get(offset);
   if (known !== undefined) return known;
+  if (budget.counts !== null) budget.counts.indirectReads += 1;
   const header = readObjectHeader(bytes, offset);
   let read: { readonly header: ObjectHeader; readonly object: IndirectObject | null } | null = null;
   if (header !== null) {
@@ -456,8 +505,10 @@ interface XrefStreamRead {
  * sections name it (request #60 (2)).
  */
 function readXrefStream(bytes: Uint8Array, offset: number, budget: Budget): XrefStreamRead | null {
+  if (budget.counts !== null) budget.counts.xrefStreamRequests += 1;
   const known = budget.xrefStreams.get(offset);
   if (known !== undefined) return known;
+  if (budget.counts !== null) budget.counts.xrefStreamDecodes += 1;
   const read = decodeXrefStreamAt(bytes, offset, budget);
   budget.xrefStreams.set(offset, read);
   return read;
@@ -673,7 +724,8 @@ function locateRevisions(bytes: Uint8Array, newestFirst: readonly SectionInfo[])
     if (section === undefined) return fault('revision-order');
     const next = sections[k + 1];
     const regionEnd = next === undefined ? bytes.length : next.start;
-    if (section.start < HEADER_LENGTH || section.start >= regionEnd) fault('revision-order');
+    // Any start T033's section read admits, 0 and 7 included (request #62 (1)).
+    if (section.start >= regionEnd) fault('revision-order');
     let end = bytes.length;
     let eofEnd: number | null = bytes.length;
     if (next !== undefined) {
@@ -782,8 +834,10 @@ function readCompressedObject(
     if (nextOffset > offset) end = Math.min(read.data.length, read.first + nextOffset);
   }
   const key = `${stream.field2}:${at}:${end}`;
+  if (budget.counts !== null) budget.counts.compressedRequests += 1;
   const known = budget.compressed.get(key);
   if (known !== undefined) return known;
+  if (budget.counts !== null) budget.counts.compressedParses += 1;
   let parsed: { value: PdfValue; next: number };
   try {
     parsed = parseValue(read.data, at, end);
@@ -801,6 +855,7 @@ function readObjectStream(
   effective: ReadonlyMap<number, Entry>,
   budget: Budget,
 ): ObjectStream {
+  if (budget.counts !== null) budget.counts.objectStreamDecodes += 1;
   const read = indirectAt(bytes, offset, budget);
   const object = read === null ? null : read.object;
   if (object === null || object.streamStart === null) fault('xref-type2-not-object-stream');
