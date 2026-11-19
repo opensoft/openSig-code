@@ -76,11 +76,46 @@
 // the If-Match version, so a refused upload never reaches the parse service.
 // It then takes one of the tenant's upload slots (uploads.ts) and streams the request body
 // into parsePdf(), with no options: no caller-supplied value ever reaches the parse service.
-// The bytes the service reads are kept as they pass, checked against the service's digest
-// and length, stored in the tenant's content-addressed blob store and recorded through the
-// domain (version + 1). On a client abort or a body timeout, parsePdf() rejects instead of
-// returning an outcome: nothing was parsed or stored, the error is the body's own (400, or
-// the server's 408), never a 500, and the slot is released on every path.
+// The bytes the service reads are kept as they pass and checked against the service's digest
+// and length. The document is then judged sealable (EA-07, below), stored in the tenant's
+// content-addressed blob store and recorded through the domain (version + 1). On a client
+// abort or a body timeout, parsePdf() rejects instead of returning an outcome: nothing was
+// parsed or stored, the error is the body's own (400, or the server's 408), never a 500, and
+// the slot is released on every path.
+//
+// Upload sealability (A-010 requests #44, #45 and #46, rows SIZE-BOUND, T036-NUMRANGE and
+// T036-RESIDUAL; test EA-07). T036's predicate runs on the LIVE parse report through this
+// module's one adapter (sealable.ts). It runs after the bytes have matched the report, and
+// before the blob is stored and before any state changes. The stored document input keeps no
+// objects, so it cannot answer. A document the composer could not seal is 422
+// unsupported_pdf, whose single detail is the predicate's first refusal, in the order of
+// SEAL_REFUSAL_DETAILS: composition_too_large, number_range, dangling_form_reference,
+// annots_shape, acroform_shape, xref_size, page_box or name_character. One upload_unsealable
+// request-log record (request #57 (3)) holds the correlation id, the envelope id, the detail,
+// at most 16 of that refusal's object references as [number, generation] pairs, and their
+// total count. It holds no document byte, name, string, file name or capability value, and the
+// response is unchanged. The refusal leaves no blob, no revision, no version change, no audit
+// or outbox event and no idempotency record. Like every other refused upload, it records no
+// response, so its Idempotency-Key stays new (request #16 resolves only
+// a key that has a record): a retry under the same key is parsed and judged again, and a
+// sealable document under that key is accepted.
+//
+// First refusal wins (EA-07). An upload is answered by the first check it fails, in this
+// fixed order:
+// 1. the router: route, Origin, 401, the role matrix's 403 and the declared length's 413;
+// 2. the handler: path form 404, Idempotency-Key 400, If-Match 428/400 and media type 415;
+// 3. the arrival-time check: a key with a live record skips the target checks; otherwise 404,
+//    overdue 409, state 409, then version 409;
+// 4. the tenant's upload slot: 429;
+// 5. a recorded key: replay, or 409 idempotency_conflict, from the body's digest alone and
+//    without any parse;
+// 6. the parse service: its streaming 413, its 429s, its 422s in the parser's own precedence
+//    (src/pdf/parser.ts: malformed and encrypted documents, existing signatures, active
+//    content, cropbox_differs, the page count and the parser limits), and its 500s;
+// 7. the received bytes against the report: 500;
+// 8. sealability: 422 with the predicate's first refusal.
+// So EA-07 judges only a document the parse service accepted, and no earlier answer is ever
+// replaced by an EA-07 detail.
 //
 // Send confirmation (SC002-24). A send needs a valid SendConfirmation when the envelope is
 // service-created or the sender is a service (A-010); the domain decides it per send.
@@ -123,6 +158,7 @@ import {
 import type { OperatorPrincipal } from '../auth/operator.ts';
 import { RecipientCeremony } from '../recipients/ceremony.ts';
 import { actorOf, bytesResult, httpErrorOf, requireHuman } from './request.ts';
+import { sealabilityRefusal } from './sealable.ts';
 import { acquireUploadSlot } from './uploads.ts';
 
 /** The server locals key of the app's EnvelopeApi. */
@@ -422,8 +458,9 @@ export class EnvelopeApi {
   }
 
   /**
-   * uploadDocument (If-Match): stream the PDF to the isolated parse service, store the
-   * accepted bytes and record the document while in draft (200 Envelope, version + 1).
+   * uploadDocument (If-Match): stream the PDF to the isolated parse service, refuse a document
+   * the composer could not seal (422 unsupported_pdf, EA-07), store the accepted bytes and
+   * record the document while in draft (200 Envelope, version + 1).
    */
   async upload(request: UploadRequest): Promise<HandlerResult> {
     const { principal, envelopeId, key, expectedVersion } = request;
@@ -453,6 +490,16 @@ export class EnvelopeApi {
       if (bytes.length !== outcome.report.bytes || sha256(bytes) !== outcome.report.digest) {
         request.logger.warn('upload_parse_mismatch', { bytes: bytes.length });
         throw new HttpError(500, 'internal');
+      }
+      // EA-07 (requests #44 to #46): T036's predicate reads the LIVE report, before the blob is
+      // stored and before any state changes. The stored input below keeps no objects, so it
+      // cannot answer. A refusal writes nothing but its one bounded request-log record
+      // (request #57 (3); the request logger carries the correlation id), and the finally
+      // block releases the slot.
+      const unsealable = sealabilityRefusal(outcome.report);
+      if (unsealable !== null) {
+        request.logger.info('upload_unsealable', { envelope_id: envelopeId, ...unsealable.log });
+        throw unsealable.error;
       }
       const document = documentInput(outcome.report);
       // The content-addressed blob is written first: a refused record leaves at most an

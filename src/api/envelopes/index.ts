@@ -13,4 +13,5 @@
 export { ENVELOPE_API, EnvelopeApi, RESEND_ROUTE, type EnvelopeApiOptions, type UploadRequest } from './api.ts';
 export { ENVELOPE_HANDLERS, envelopeApiOf } from './handlers.ts';
 export { ID_PATTERN, IF_MATCH_PATTERN } from './request.ts';
+export { MAX_LOGGED_REFS, SEAL_REFUSAL_DETAILS, SEALED_PDF_LIMIT, sealabilityOf, sealabilityRefusal, type Sealability, type SealabilityRefusal } from './sealable.ts';
 export { UPLOADS_PER_TENANT, acquireUploadSlot, uploadCapacity, uploadsInFlight, type UploadSlot } from './uploads.ts';
