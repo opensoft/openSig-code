@@ -38,8 +38,11 @@
 // when /Filter is absent, null or [], with /DecodeParms then ignored; otherwise
 // exactly one FlateDecode with no predictor or a PNG predictor (/BitsPerComponent
 // 8, /Colors 1 to 4, any /Columns of at least 1). Inflated bytes count against
-// one total budget, at least T033's ceiling. Hybrids: a table trailer's
-// /XRefStm names a hidden stream whose entries belong to the same section.
+// one total budget, at least T033's ceiling, which refuses a stream only when
+// its output is larger than the bytes still allowed (T033's inflate; request
+// #63), so a budget used up exactly still passes an empty output. Hybrids: a
+// table trailer's /XRefStm names a hidden stream whose entries belong to the
+// same section.
 //
 // What it checks (request #56 B1: base-structure checks mirror T033; the
 // security checks in byte-range.ts and verify.ts stay strict and read only the
@@ -261,6 +264,27 @@ export function readRevisionStructureCounted(bytes: Uint8Array): { result: Struc
     compressedParses: 0,
   };
   return { result: readStructure(bytes, counts), counts };
+}
+
+/**
+ * TEST ONLY (request #63): one structural stream decoded through a shared
+ * inflate budget, exactly as the reader decodes it, with the cross-reference
+ * stream details or the object-stream details. `budget.inflated` is the bytes
+ * still allowed and is spent as the reader spends it. index.ts does not export
+ * it, so no product caller reaches it, and the reader never calls it.
+ */
+export function decodeWithInflateBudget(
+  kind: 'xref-stream' | 'object-stream',
+  dict: PdfValue,
+  raw: Uint8Array,
+  budget: { inflated: number },
+): { readonly ok: true; readonly data: Uint8Array } | { readonly ok: false; readonly detail: StructureDetail } {
+  try {
+    return { ok: true, data: decodeStream(dict, raw, budget, kind === 'xref-stream' ? XREF_STREAM_FAULTS : OBJECT_STREAM_FAULTS) };
+  } catch (error) {
+    if (error instanceof StructureFault) return { ok: false, detail: error.detail };
+    throw error;
+  }
 }
 
 function readStructure(bytes: Uint8Array, counts: StructureReadCounts | null): StructureResult {
@@ -571,9 +595,12 @@ function streamBody(bytes: Uint8Array, start: number, length: number, faults: De
  * FlateDecode (a name or a one-element array) with /Predictor 1 or a PNG
  * predictor 10 to 15 (/BitsPerComponent 8, /Colors 1 to 4, /Columns at least
  * 1; each row is Colors x Columns bytes plus its tag byte). Inflated bytes
- * count against one total budget over every decoded stream.
+ * count against one total budget over every decoded stream, cross-reference
+ * and object streams alike: a stream is refused only when its output is
+ * larger than the bytes still allowed, the comparison T033's inflate makes
+ * (request #63). No ratio limit is applied.
  */
-function decodeStream(dict: PdfValue, raw: Uint8Array, budget: Budget, faults: DecodeFaults): Uint8Array {
+function decodeStream(dict: PdfValue, raw: Uint8Array, budget: { inflated: number }, faults: DecodeFaults): Uint8Array {
   const filter = dictEntry(dict, 'Filter');
   if (filter === undefined || filter.kind === 'null' || (filter.kind === 'array' && filter.items.length === 0)) return raw;
   let filterName: string | null = null;
@@ -588,13 +615,14 @@ function decodeStream(dict: PdfValue, raw: Uint8Array, budget: Budget, faults: D
   if (parms !== undefined && parms.kind !== 'dict' && parms.kind !== 'null') fault(faults.malformed);
   let decoded: Uint8Array;
   try {
-    if (budget.inflated < 1) fault(faults.tooLarge);
-    decoded = inflateSync(raw, { maxOutputLength: budget.inflated });
+    // One byte past what is left, so an output just too large is seen, and an
+    // empty output passes even when nothing is left (request #63).
+    decoded = inflateSync(raw, { maxOutputLength: budget.inflated + 1 });
   } catch (error) {
-    if (error instanceof StructureFault) throw error;
     if (error instanceof RangeError) fault(faults.tooLarge);
     return fault(faults.malformed);
   }
+  if (decoded.length > budget.inflated) fault(faults.tooLarge);
   budget.inflated -= decoded.length;
   if (parms === undefined || parms.kind !== 'dict') return decoded;
   const predictor = intValue(dictEntry(parms, 'Predictor')) ?? 1;

@@ -17,7 +17,11 @@
 // and a code that no longer exists fails until its entry goes. Each cited T033
 // function must be defined in src/pdf/.
 //
-// Mutants killed here: one map entry deleted; one unmapped code added.
+// The list keeps no exception (request #63): every entry is covered on the
+// same base, and the third case fails if an entry names one.
+//
+// Mutants killed here: one map entry deleted; one unmapped code added; and,
+// for request #63, the inflate-budget exception restored.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -34,11 +38,11 @@ const FAULT_MAP = Object.freeze({
   'prev-revisited': { t033: ['readChain'], why: 'an offset seen again; a new offset reaching a section already read leads on to that section\'s /Prev, already seen (a section without /Prev ends the chain)' },
   'too-many-revisions': { t033: ['readChain'], why: 'xref-sections past maxXrefSections (ceiling 256); T014 allows 257, one more for T036\'s revision' },
   'too-many-xref-entries': { t033: ['addLocal', 'addEntry'], why: 'object-count past maxObjects (ceiling 1,000,000) in one section or in all; T014 allows 1,048,576 of each' },
-  'too-much-work': { t033: ['loadObjectStream', 'decodeStructuralStream', 'inflate', 'readIndirect'], why: 'an object stream inflating past the budget (T014 spends T033\'s ceiling on no stream T033 does not decode, nor more often), or a /Length past the end of the file' },
+  'too-much-work': { t033: ['loadObjectStream', 'decodeStructuralStream', 'inflate', 'readIndirect'], why: 'an object stream whose output is larger than the bytes the budget still allows, the comparison inflate makes (T014 spends T033\'s ceiling on no stream T033 does not decode, nor more often), or a /Length past the end of the file' },
   'xref-table-malformed': { t033: ['readXrefTable'], why: 'a subsection header or entry that is not unsigned numbers and `n` or `f`, or a generation above 65535' },
   'trailer-malformed': { t033: ['readXrefTable', 'readChain'], why: 'the trailer is not a dictionary, or its /Prev or /XRefStm is not a non-negative integer' },
   'xref-stream-malformed': { t033: ['readXrefStream', 'readIndirect', 'decodeStructuralStream'], why: 'bad /W, /Size, /Index, data length, stream framing or direct /Length, or invalid FlateDecode data' },
-  'xref-stream-too-large': { t033: ['readIndirect', 'inflate'], why: 'a /Length past the end of the file, or inflation past the budget; one exception: an empty output once the budget is exactly spent, which inflate passes' },
+  'xref-stream-too-large': { t033: ['readIndirect', 'inflate'], why: 'a /Length past the end of the file, or an output larger than the bytes the budget still allows, the comparison inflate makes' },
   'xref-stream-filter-unsupported': { t033: ['decodeStructuralStream', 'filterNames'], why: 'a filter other than one /FlateDecode' },
   'xref-stream-predictor-unsupported': { t033: ['decodeStructuralStream', 'unpredictPng'], why: 'a predictor other than 1 or PNG 10 to 15, or PNG parameters other than 8 bits, 1 to 4 colours and at least 1 column' },
   'png-filter-unknown': { t033: ['unpredictPng'], why: 'a PNG row filter byte above 4' },
@@ -89,5 +93,12 @@ test('[VB-06] each fault map entry names T033 functions defined in src/pdf/, or 
       const defined = new RegExp(`^\\s*(?:export\\s+)?(?:function\\s+)?${name}\\s*\\(`, 'm');
       assert.match(t033, defined, `${code}: ${name} is defined in src/pdf/`);
     }
+  }
+});
+
+test('[VB-06] the fault map keeps no exception: every entry is covered on the same base (request #63)', () => {
+  for (const [code, entry] of Object.entries(FAULT_MAP)) {
+    assert.deepEqual(Object.keys(entry).filter((key) => !['t033', 'why', 'cannot'].includes(key)), [], `${code}: only t033 and why, or cannot`);
+    assert.doesNotMatch(entry.why ?? entry.cannot, /\bexcept/i, `${code} names an exception`);
   }
 });
