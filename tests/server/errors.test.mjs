@@ -6,6 +6,12 @@
 // weakening: every registry route either has its handler from the composed maps (T008, T034,
 // T010) or stays null and answers the uniform 501 Error with a correlation ID, and no handler
 // exists outside the registry.
+// Amended for the US2 composition (A-010 row ARTIFACT-ROUTES, request #46) the same way: the
+// composed maps now include T016's artifact map and T038's retry map. The 501 check moves from
+// readVerification to a route still without a handler (readWebhookRegistration, T019), every
+// route still without one keeps the 501, no T016 or T038 route is left without its handler, and
+// each newly live route fails closed (a uniform 500, never a 2xx) in an app that holds no
+// ArtifactApi or FinalizationRetryApi.
 
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
@@ -73,10 +79,13 @@ const CONTRACT_PATHS = {
   declineAsRecipient: 'POST /v1/recipient-session/decline',
 };
 
-/** The handler the composition installs for `operationId`: T010's over T008's, then T034's; else null. */
-const { APPROVAL_HANDLERS = {}, CONTRACT_ROUTES = [], ENVELOPE_HANDLERS = {}, RECIPIENT_HANDLERS = {}, ROUTES } = registry;
-const composedHandler = (operationId) => APPROVAL_HANDLERS[operationId] ?? ENVELOPE_HANDLERS[operationId] ?? RECIPIENT_HANDLERS[operationId] ?? null;
-const MAPS = { T008: RECIPIENT_HANDLERS, T034: ENVELOPE_HANDLERS, T010: APPROVAL_HANDLERS };
+/** The handler the composition installs for `operationId`: T038's, T016's, T010's over T008's, then T034's; else null. */
+const { APPROVAL_HANDLERS = {}, ARTIFACT_HANDLERS = {}, CONTRACT_ROUTES = [], ENVELOPE_HANDLERS = {}, FINALIZATION_HANDLERS = {}, RECIPIENT_HANDLERS = {}, ROUTES } = registry;
+const composedHandler = (operationId) =>
+  FINALIZATION_HANDLERS[operationId] ?? ARTIFACT_HANDLERS[operationId] ?? APPROVAL_HANDLERS[operationId] ?? ENVELOPE_HANDLERS[operationId] ?? RECIPIENT_HANDLERS[operationId] ?? null;
+const MAPS = { T008: RECIPIENT_HANDLERS, T034: ENVELOPE_HANDLERS, T010: APPROVAL_HANDLERS, T016: ARTIFACT_HANDLERS, T038: FINALIZATION_HANDLERS };
+/** ARTIFACT-ROUTES: the operations each US2 map must carry (a map that lost one fails here, not only below). */
+const US2_OPERATIONS = { T016: ['downloadFinalPdf', 'downloadPackage', 'readVerification'], T038: ['retryFinalization'] };
 
 test('[SEC-04] the route registry has exactly one route per contract operation', () => {
   assert.deepEqual(ROUTES.map((route) => route.operationId).sort(), Object.keys(ROLE_MATRIX).sort());
@@ -103,6 +112,15 @@ test('[SEC-04] the route registry has exactly one route per contract operation',
   // T010's approval and decline replace T008's guard-only entries.
   for (const operationId of ['approveAsHuman', 'declineAsRecipient']) {
     assert.notEqual(ROUTES.find((route) => route.operationId === operationId).handler, RECIPIENT_HANDLERS[operationId], `${operationId}: not T008's guard-only entry`);
+  }
+  // ARTIFACT-ROUTES: T016's and T038's maps carry exactly their operations, and ROUTES serves each through its owner's handler.
+  for (const [owner, operations] of Object.entries(US2_OPERATIONS)) {
+    assert.deepEqual(Object.keys(MAPS[owner]).sort(), operations, `${owner}'s map names ${JSON.stringify(Object.keys(MAPS[owner]).sort())}`);
+    for (const operationId of operations) {
+      const route = ROUTES.find((entry) => entry.operationId === operationId);
+      assert.equal(route.owner, owner, `${operationId}: owner ${route.owner}`);
+      assert.ok(route.handler !== null && route.handler === MAPS[owner][operationId], `${operationId}: ROUTES carries ${owner}'s handler (ARTIFACT-ROUTES)`);
+    }
   }
 });
 
@@ -138,13 +156,15 @@ test('[SEC-04] errors are uniform contract Error bodies with a fresh server-side
     await check('sender on retryFinalization', { method: 'POST', path: `/v1/envelopes/${ENVELOPE_ID}/finalization/retry`, headers: { ...sender, 'content-type': 'application/json' }, body: '{}' }, 403, 'forbidden');
     await check('operator bearer on approve (SC002-18)', { method: 'POST', path: '/v1/recipient-session/approval', headers: { ...sender, 'content-type': 'application/json', origin: 'http://127.0.0.1:1' }, body: '{}' }, 401, 'unauthenticated');
     await check('service bearer on approve (SC002-17)', { method: 'POST', path: '/v1/recipient-session/approval', headers: { authorization: `Bearer ${bearer('service')}`, 'content-type': 'application/json', origin: 'http://127.0.0.1:1' }, body: '{}' }, 401, 'unauthenticated');
-    // WIRE-US1: readRecipientPreview now has T034's handler, so this check moves to a route that
-    // is still unimplemented (readVerification, T016).
-    await check('authorized request to an unimplemented operation', { path: `/v1/envelopes/${ENVELOPE_ID}/verification`, headers: sender }, 501, 'internal');
-    // Every route still without a handler answers the uniform 501 after authentication.
+    // WIRE-US1: readRecipientPreview now has T034's handler, so this check moved to readVerification
+    // (T016); ARTIFACT-ROUTES: readVerification now has T016's handler, so it moves to a route that
+    // is still unimplemented (readWebhookRegistration, T019, tenant_admin only).
     const admin = { authorization: `Bearer ${bearer('admin')}` };
+    await check('authorized request to an unimplemented operation', { path: `/v1/webhook-registrations/${ENVELOPE_ID}`, headers: admin }, 501, 'internal');
+    // Every route still without a handler answers the uniform 501 after authentication.
     const unimplemented = ROUTES.filter((route) => route.handler === null);
-    assert.deepEqual(unimplemented.map((route) => route.owner).filter((owner) => ['T008', 'T010', 'T034'].includes(owner)), [], 'no US1 route is left without a handler');
+    assert.deepEqual(unimplemented.map((route) => route.owner).filter((owner) => ['T008', 'T010', 'T034', 'T016', 'T038'].includes(owner)), [], 'no US1 route, and no T016 or T038 route, is left without a handler');
+    assert.ok(unimplemented.length >= 1, `premise: ${unimplemented.length} route(s) still without a handler keep this check meaningful`);
     for (const route of unimplemented) {
       const path = route.path.replace(/\{[a-z_]+\}/g, ENVELOPE_ID);
       const roles = ROLE_MATRIX[route.operationId].roles;
@@ -155,6 +175,18 @@ test('[SEC-04] errors are uniform contract Error bodies with a fresh server-side
     }
     // A composed handler whose app holds no composition fails closed: a uniform 500, never a 2xx.
     await check('readRecipientPreview with no EnvelopeApi in the app', { path: `/v1/envelopes/${ENVELOPE_ID}/preview`, headers: sender }, 500, 'internal');
+    // ARTIFACT-ROUTES: the newly live routes fail closed the same way (this app holds neither an
+    // ArtifactApi nor a FinalizationRetryApi), each after the router's checks passed.
+    for (const operationId of ['readVerification', 'downloadFinalPdf', 'downloadPackage']) {
+      const path = ROUTES.find((route) => route.operationId === operationId).path.replace('{envelope_id}', ENVELOPE_ID);
+      await check(`${operationId} with no ArtifactApi in the app`, { path, headers: sender }, 500, 'internal');
+    }
+    await check(
+      'retryFinalization with no FinalizationRetryApi in the app',
+      { method: 'POST', path: `/v1/envelopes/${ENVELOPE_ID}/finalization/retry`, headers: { ...admin, 'content-type': 'application/json', 'idempotency-key': 'ik-sec04-retry-0000000001' }, body: '{"expected_version":1}' },
+      500,
+      'internal',
+    );
 
     // A handler exception is a generic 500: nothing of the exception reaches the client.
     const crashed = await check('handler exception', { path: `/v1/envelopes/${ENVELOPE_ID}`, headers: sender }, 500, 'internal');

@@ -13,8 +13,13 @@
 // (checked first), and a started server composes the database, a data directory and a spool
 // (composedEnv). An allowed role now reaches readEnvelope's real handler (404 for an envelope
 // absent from the tenant, shown to be the handler's by its request log line) where it used to
-// reach the 501 of a missing handler (A-010 request #30 (3)); the tenant_admin retry keeps 501,
-// because retryFinalization (T038) has no handler yet.
+// reach the 501 of a missing handler (A-010 request #30 (3)). Amended the same way for the US2
+// composition (A-010 row ARTIFACT-ROUTES, request #46): retryFinalization now has T038's handler,
+// so the tenant_admin retry, once its role is allowed, reaches that handler and gets the
+// contract's 404 for an envelope absent from the tenant (it was 501), shown to be the handler's
+// by its request log line. The retry therefore carries an Idempotency-Key and a VersionOnly body,
+// so the handler answers on the envelope, not on the request's form. The refusals (403 for a role
+// outside allowed_roles, 401 for a malformed value) are unchanged.
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -28,12 +33,13 @@ import { ALPHA, alphaTenantRow, authFile, authInput, bearer, cleanup, composedEn
 
 after(cleanup);
 
+let retries = 0;
 const retry = (port, who) =>
   send(port, {
     method: 'POST',
     path: `/v1/envelopes/${ENVELOPE_ID}/finalization/retry`,
-    headers: { authorization: `Bearer ${bearer(who)}`, 'content-type': 'application/json' },
-    body: '{}',
+    headers: { authorization: `Bearer ${bearer(who)}`, 'content-type': 'application/json', 'idempotency-key': `ik-sec07-retry-${String((retries += 1)).padStart(12, '0')}` },
+    body: '{"expected_version":1}',
   });
 
 function setAllowedRoles(path, value) {
@@ -61,7 +67,10 @@ test('[SEC-07] the tenant role policy comes from the tenants table, read on ever
 
     // The table is read per request: allowing tenant_admin applies without a restart ...
     setAllowedRoles(database, JSON.stringify(['sender', 'tenant_admin', 'service']));
-    assert.equal((await retry(running.port, 'admin')).status, 501, 'tenant_admin now passes authorization');
+    // ARTIFACT-ROUTES (was 501): the allowed tenant_admin reaches T038's real handler.
+    const allowed = await retry(running.port, 'admin');
+    assert.deepEqual([allowed.status, allowed.json?.code], [404, 'not_found'], `tenant_admin now passes authorization and reaches the handler (got ${allowed.status} ${allowed.json?.code ?? ''})`);
+    assert.equal(lastRequest(), 'retryFinalization:404', 'the 404 is the handler\'s (its request line names the operation), so the role passed authorization');
     // ... and a malformed value fails closed.
     setAllowedRoles(database, JSON.stringify(['superuser']));
     const closed = await retry(running.port, 'admin');

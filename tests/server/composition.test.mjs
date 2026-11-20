@@ -8,8 +8,13 @@
 // - The composed server serves every route of the T008, T034 and T010 maps through its real
 //   handler: each answer is one only that handler gives (never the 501 of a missing handler,
 //   never the 500 of a missing composition), is a status the contract declares for the
-//   operation, and its request log line names the operation. Routes still without a handler
-//   keep the uniform 501.
+//   operation, and its request log line names the operation. Extended for the US2 composition
+//   (A-010 row ARTIFACT-ROUTES, request #46): T016's three artifact routes and T038's retry
+//   route are among them (409 not_completed and 409 finalization_not_retryable on an envelope
+//   that never reached completion or finalization, answers the router never gives), and those
+//   refusals write no audit event. Routes still without a handler (T019's) keep the uniform 501.
+//   The seal settings, the runner and the retry and audit path are SEC-12's finalization cases
+//   (finalization.test.mjs).
 // - Both listeners (TCP, and the Hermes relay's Unix socket) serve one registry with one
 //   composition: the same ceremony, EnvelopeApi and ApprovalApi objects, and T034's one
 //   process-wide per-tenant upload cap, which uploads through either listener fill together.
@@ -36,8 +41,10 @@ import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { after, test } from 'node:test';
 
+import { ArtifactApi } from '../../src/api/artifacts/index.ts';
 import { ROLE_MATRIX } from '../../src/api/auth/index.ts';
 import { EnvelopeApi } from '../../src/api/envelopes/api.ts';
+import { FinalizationRetryApi } from '../../src/api/envelopes/retry.ts';
 import { UPLOADS_PER_TENANT, uploadCapacity, uploadsInFlight } from '../../src/api/envelopes/uploads.ts';
 import { ApprovalApi } from '../../src/api/recipients/approval.ts';
 import { RecipientCeremony } from '../../src/api/recipients/ceremony.ts';
@@ -223,13 +230,35 @@ test('[SEC-12] the composed server serves every wired route through its real han
     const ended = await through('endRecipientSession', { path: '/v1/recipient-session', headers: mutation });
     assert.equal(ended.status, 204);
 
+    // ARTIFACT-ROUTES (the retry was 501): T016 and T038, operator routes, on the voided envelope.
+    const auditBefore = rows(env.OPENSIG_DATABASE, 'SELECT COUNT(*) AS n FROM audit_events')[0].n;
+    for (const [operationId, path] of [
+      ['readVerification', `/v1/envelopes/${id}/verification`],
+      ['downloadFinalPdf', `/v1/envelopes/${id}/final-pdf`],
+      ['downloadPackage', `/v1/envelopes/${id}/package`],
+    ]) {
+      const read = await through(operationId, { path, headers: sender() });
+      assert.deepEqual([read.status, read.json?.code], [409, 'not_completed'], `${operationId}: T016's handler answers ${read.status} ${read.json?.code} for an envelope that is not completed`);
+    }
+    const admin = { authorization: `Bearer ${bearer('admin')}` };
+    assert.ok(ROLE_MATRIX.retryFinalization.roles.includes('tenant_admin'), 'premise: the admin is authorized for the retry');
+    // T038 checks expected_version before the job (409 version_conflict), and the reissue above moved
+    // the voided envelope to its next version (reissued_as), so the retry sends the version it holds now.
+    const current = rows(env.OPENSIG_DATABASE, 'SELECT version FROM envelopes WHERE id = ?', id)[0]?.version;
+    assert.equal(current, voided.json.version + 1, `premise: the reissue moved the voided envelope from version ${voided.json.version} to ${current}`);
+    const retry = await through('retryFinalization', { path: `/v1/envelopes/${id}/finalization/retry`, headers: { ...admin, 'idempotency-key': newKey() }, body: { expected_version: current } });
+    // No job is refused with no detail; the server's Error body omits an empty details (T031 errors.ts).
+    assert.deepEqual([retry.status, retry.json?.code, retry.json?.details], [409, 'finalization_not_retryable', undefined], `T038's handler answers ${retry.status} ${retry.json?.code} with details ${JSON.stringify(retry.json?.details)} for an envelope with no finalization job`);
+    const auditAfter = rows(env.OPENSIG_DATABASE, 'SELECT COUNT(*) AS n FROM audit_events')[0].n;
+    assert.equal(auditAfter, auditBefore, `refused reads and a refused retry write no audit event (${auditBefore} before, ${auditAfter} after)`);
+
     // Every wired route was exercised, and nothing else counted as wired.
     assert.deepEqual([...exercised.keys()].sort(), ROUTES.filter((route) => route.handler !== null).map((route) => route.operationId).sort(), 'every route with a composed handler was served through it');
 
-    // Routes still without a handler keep the uniform 501 on the composed server.
-    const retry = await call(running.port, { method: 'POST', path: `/v1/envelopes/${id}/finalization/retry`, headers: { authorization: `Bearer ${bearer('admin')}` }, body: {} });
-    assert.deepEqual([retry.status, retry.json.code], [501, 'internal']);
-    assert.ok(ROLE_MATRIX.retryFinalization.roles.includes('tenant_admin'), 'premise: the admin is authorized, so the 501 is the missing handler');
+    // Routes still without a handler (T019's) keep the uniform 501 on the composed server.
+    const webhook = await call(running.port, { path: `/v1/webhook-registrations/${ENVELOPE_ID}`, headers: admin });
+    assert.deepEqual([webhook.status, webhook.json?.code], [501, 'internal'], `readWebhookRegistration: ${webhook.status} ${webhook.json?.code}`);
+    assert.ok(ROLE_MATRIX.readWebhookRegistration.roles.includes('tenant_admin'), 'premise: the admin is authorized, so the 501 is the missing handler');
   } finally {
     side.close();
     await running.close();
@@ -303,12 +332,15 @@ test('[SEC-12] both listeners share one composition and T034\'s one process-wide
     const { composition } = running;
     assert.deepEqual(running.listeners.map((listener) => listener.name), ['tcp', 'relay']);
     assert.ok(composition.ceremony instanceof RecipientCeremony && composition.envelopes instanceof EnvelopeApi && composition.approvals instanceof ApprovalApi);
+    assert.ok(composition.artifacts instanceof ArtifactApi && composition.finalizationRetry instanceof FinalizationRetryApi, 'ARTIFACT-ROUTES: the composition holds T016\'s ArtifactApi and T038\'s FinalizationRetryApi');
     for (const listener of running.listeners) {
       assert.equal(listener.routes, ROUTES, `${listener.name}: serves the registry itself`);
       assert.ok(Object.isFrozen(listener.routes), `${listener.name}: the registry it exposes is read-only`);
       assert.equal(listener.services.ceremony, composition.ceremony, `${listener.name}: the composition's ceremony`);
       assert.equal(listener.services.envelopes, composition.envelopes, `${listener.name}: the composition's EnvelopeApi`);
       assert.equal(listener.services.approvals, composition.approvals, `${listener.name}: the composition's ApprovalApi`);
+      assert.equal(listener.services.artifacts, composition.artifacts, `${listener.name}: the composition's ArtifactApi`);
+      assert.equal(listener.services.finalizationRetry, composition.finalizationRetry, `${listener.name}: the composition's FinalizationRetryApi`);
     }
     // The composition states the cap, and the listening line logs it.
     assert.deepEqual({ ...composition.uploadCap }, { scope: 'process', perTenant: UPLOADS_PER_TENANT });

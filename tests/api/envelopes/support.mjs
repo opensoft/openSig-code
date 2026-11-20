@@ -31,8 +31,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
+import { ARTIFACT_API, ArtifactApi } from '../../../src/api/artifacts/index.ts';
 import { createOperatorAuthenticator, loadOperatorAuthConfig } from '../../../src/api/auth/index.ts';
 import { ENVELOPE_API, EnvelopeApi, uploadsInFlight } from '../../../src/api/envelopes/index.ts';
+import { FINALIZATION_RETRY, FinalizationRetryApi } from '../../../src/api/envelopes/retry.ts';
 import { RECIPIENT_CEREMONY, RecipientCeremony, loadChallengeKey } from '../../../src/api/recipients/index.ts';
 import { ROUTES, withEnvelopeHandlers, withRecipientHandlers } from '../../../src/api/routes.ts';
 import { createNotifier, createSpoolTransport } from '../../../src/notifications/index.ts';
@@ -42,6 +44,7 @@ import { createApp, createAppServer } from '../../../src/server/app.ts';
 import { loadServerConfig } from '../../../src/server/config.ts';
 import { createLogger } from '../../../src/server/redact.ts';
 import { openTenantPolicy } from '../../../src/server/tenants.ts';
+import { AuditWriter } from '../../../src/storage/audit/index.ts';
 import { openBlobStore } from '../../../src/storage/blobs/index.ts';
 import { loadVendoredContract } from '../../contract/envelopes/lib/contract.mjs';
 import { validate } from '../../contract/envelopes/lib/schema.mjs';
@@ -486,6 +489,9 @@ export async function createWorld({ bodyTiming } = {}) {
   const app = createApp({ routes, config, logger, authenticator, allowedOrigins: new Set([ORIGIN]) });
   app.locals.set(RECIPIENT_CEREMONY, ceremony);
   app.locals.set(ENVELOPE_API, api);
+  // A-010 row ARTIFACT-ROUTES (request #46): the artifact API, so SC002-26 meets T016's and T038's installed handlers.
+  app.locals.set(ARTIFACT_API, new ArtifactApi({ db, blobs, clock: time.clock }));
+  app.locals.set(FINALIZATION_RETRY, new FinalizationRetryApi({ db, audit: new AuditWriter(db, { clock: time.clock }), clock: time.clock }));
   const server = createAppServer(app);
   await new Promise((resolveListen) => server.listen({ host: '127.0.0.1', port: 0 }, resolveListen));
   const { port } = server.address();

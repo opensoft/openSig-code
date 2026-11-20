@@ -13,10 +13,17 @@
 //   the app was built from (dispatch uses a compiled copy made at creation).
 // - Row SIGTERM-RACE (A-010 request #54), SEC-12 extended: the entrypoint installs its SIGINT
 //   and SIGTERM handlers before startup begins. A SIGTERM sent on the entrypoint's first output
-//   line is held while start is held, and the server closes once it is running and exits 0. Start
-//   is held through the existing static seam: startup imports src/server/static.ts before either
-//   listener exists, so a stand-in written into the copy can hold it at its top level until the
-//   test releases it, after the signal was sent and before any `listening` line.
+//   line lands before start can finish; it is held, and the server closes once it is running and
+//   exits 0. Start is held through the existing static seam: startup imports src/server/static.ts
+//   before either listener exists, so a stand-in written into the copy can hold it at its top
+//   level until the test releases it, after the signal was sent and before any `listening` line.
+// - Row T031RACE-TESTS (A-010 request #55), at this slot's touch of tests/server/ (row
+//   ARTIFACT-ROUTES): (1) after the exit check the case asserts that the hold marker was seen, so
+//   a head that bypassed the stand-in seam fails it (M-J2); (2) a SIGINT case beside the SIGTERM
+//   case; (3) a start failure with a signal sent during it exits 1 with the failure message, and
+//   the entrypoint's signal handlers are removed (M-OFF): the failing stand-in keeps the process
+//   up after the failure and reports its SIGINT and SIGTERM listener counts on request; (4) the
+//   wording says the signal lands before start can finish (the handler runs before the hold).
 // Waits are barriers on observable state; the only timers are hang guards.
 
 import assert from 'node:assert/strict';
@@ -70,6 +77,32 @@ process.stdin.destroy();
 export function createStaticHandler() {
   return async () => null;
 }
+`;
+
+const STAND_IN_HOLD_FAIL = `// SPDX-License-Identifier: Apache-2.0
+// Stand-in for T035's src/server/static.ts, written at test run time into a temporary copy of
+// src/ (SEC-12, row T031RACE-TESTS). Its top level holds start until the first stdin chunk, then
+// fails start with a configuration-style error. A stdin listener keeps the process up after the
+// failure: a chunk holding "count" is answered with the process's SIGINT and SIGTERM listener
+// counts, and any other chunk ends stdin, so the process can exit.
+class StandInConfigError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'StandInConfigError';
+  }
+}
+await new Promise((resolveRelease) => {
+  process.stdin.once('data', () => resolveRelease());
+  process.stdout.write('{"event":"test_start_held"}\\n');
+});
+process.stdin.on('data', (chunk) => {
+  if (String(chunk).includes('count')) {
+    process.stdout.write(JSON.stringify({ event: 'test_signal_listeners', sigint: process.listenerCount('SIGINT'), sigterm: process.listenerCount('SIGTERM') }) + '\\n');
+  } else {
+    process.stdin.destroy();
+  }
+});
+throw new StandInConfigError('stand-in start failure');
 `;
 
 /** A temporary copy of src/ with a stand-in static.ts (default: the recording one) beside the copied main.ts. */
@@ -154,8 +187,12 @@ test('[SEC-12] the real entrypoint never sets distDir: node src/server/main.ts b
   }
 });
 
-test('[SEC-12] a SIGTERM that arrives during startup is held: node src/server/main.ts, signalled on its first output line while start is held, closes once it is running and exits 0 (row SIGTERM-RACE)', async () => {
-  const root = copiedSource(STAND_IN_HOLD);
+/**
+ * The entrypoint of a copy of src/ with `standIn` as its static.ts, spawned with the composed
+ * environment, with barriers on its output (row SIGTERM-RACE, row T031RACE-TESTS).
+ */
+function spawnCopied(standIn) {
+  const root = copiedSource(standIn);
   const child = spawn(process.execPath, [join(root, 'src', 'server', 'main.ts')], { cwd: root, env: { PATH: process.env.PATH ?? '', ...composedEnv() }, stdio: ['pipe', 'pipe', 'pipe'] });
   const output = { stdout: '', stderr: '' };
   child.stdout.setEncoding('utf8').on('data', (chunk) => (output.stdout += chunk));
@@ -163,40 +200,82 @@ test('[SEC-12] a SIGTERM that arrives during startup is held: node src/server/ma
   child.stdin.on('error', () => {});
   // 'close', not 'exit': it comes once the child has ended and its stdout and stderr are drained.
   const exited = new Promise((resolveExit) => child.on('close', (code, signal) => resolveExit({ code, signal })));
-  /** Barrier: the first complete stdout line that `matches`, or null once the child has ended without one. */
-  const lineSeen = (matches) =>
+  /** Barrier: the first complete line of `stream` that `matches`, or null once the child has ended without one. */
+  const seen = (stream, matches) =>
     new Promise((resolveLine) => {
       const check = () => {
-        const line = output.stdout.split('\n').slice(0, -1).find(matches);
+        const line = output[stream].split('\n').slice(0, -1).find(matches);
         if (line === undefined) return;
-        child.stdout.off('data', check);
+        child[stream].off('data', check);
         resolveLine(line);
       };
-      child.stdout.on('data', check);
+      child[stream].on('data', check);
       exited.then(() => {
         check();
         resolveLine(null);
       });
       check();
     });
+  return { child, output, exited, lineSeen: (matches) => seen('stdout', matches), errorSeen: (matches) => seen('stderr', matches) };
+}
+
+/** Row SIGTERM-RACE (SIGTERM) and row T031RACE-TESTS (SIGINT): a signal that lands before start can finish is held. */
+async function heldSignalCase(signalName) {
+  const { child, output, exited, lineSeen } = spawnCopied(STAND_IN_HOLD);
   try {
     // The first line the entrypoint writes: startup has begun, and it cannot finish before the
-    // stand-in releases it, so the signal arrives before the server is running.
+    // stand-in releases it, so the signal lands before start can finish.
     const first = await guarded(lineSeen(() => true), 'the entrypoint\'s first output line', LISTENING_BOUND_MS);
     assert.notEqual(first, null, `premise: the entrypoint wrote a line before it ended (stderr: ${output.stderr})`);
-    child.kill('SIGTERM');
+    child.kill(signalName);
     const held = await guarded(lineSeen((line) => line.includes('"event":"test_start_held"')), 'start held at the static seam', LISTENING_BOUND_MS);
     if (held !== null) {
-      assert.equal(output.stdout.includes('"event":"listening"'), false, 'premise: the SIGTERM was sent while start was held, before any listening line');
+      assert.equal(output.stdout.includes('"event":"listening"'), false, `premise: the ${signalName} landed before start could finish, before any listening line`);
       child.stdin.end('release');
     }
-    const { code, signal } = await guarded(exited, 'the entrypoint exit after a SIGTERM held during startup');
-    assert.deepEqual([code, signal], [0, null], `the entrypoint holds a SIGTERM sent during startup, then closes and exits 0 (stderr: ${output.stderr})`);
+    const { code, signal } = await guarded(exited, `the entrypoint exit after a ${signalName} that landed during startup`);
+    assert.deepEqual([code, signal], [0, null], `the entrypoint holds a ${signalName} sent during startup, then closes and exits 0 (stderr: ${output.stderr})`);
+    // T031RACE-TESTS (1): the hold went through the stand-in seam (a head that bypassed it never writes the marker).
+    assert.notEqual(held, null, `the start hold marker was seen, so the ${signalName} landed while the stand-in held start`);
     const events = output.stdout
       .split('\n')
       .filter((line) => line.startsWith('{'))
       .map((line) => JSON.parse(line).event);
     assert.ok(events.includes('listening') && events.indexOf('closed') > events.indexOf('listening'), `the server started, then completed its close (events: ${events.join(', ')})`);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+}
+
+test('[SEC-12] a SIGTERM that arrives during startup is held: node src/server/main.ts, signalled on its first output line so the signal lands before start can finish, closes once it is running and exits 0 (row SIGTERM-RACE)', async () => {
+  await heldSignalCase('SIGTERM');
+});
+
+test('[SEC-12] a SIGINT that arrives during startup is held the same way: the entrypoint closes once it is running and exits 0 (row T031RACE-TESTS)', async () => {
+  await heldSignalCase('SIGINT');
+});
+
+test('[SEC-12] a signal sent during a start failure does not turn it into a clean exit: the entrypoint exits 1 with the failure message, and its SIGINT and SIGTERM handlers are removed (row T031RACE-TESTS)', async () => {
+  const { child, output, exited, lineSeen, errorSeen } = spawnCopied(STAND_IN_HOLD_FAIL);
+  try {
+    const first = await guarded(lineSeen(() => true), 'the entrypoint\'s first output line', LISTENING_BOUND_MS);
+    assert.notEqual(first, null, `premise: the entrypoint wrote a line before it ended (stderr: ${output.stderr})`);
+    child.kill('SIGTERM');
+    const held = await guarded(lineSeen((line) => line.includes('"event":"test_start_held"')), 'start held at the static seam', LISTENING_BOUND_MS);
+    assert.notEqual(held, null, `premise: the start hold marker was seen (stderr: ${output.stderr})`);
+    child.stdin.write('release');
+    // The start failure: main() writes its message, removes its handlers and sets exit code 1; the stand-in keeps the process up.
+    const failure = await guarded(errorSeen((line) => line.startsWith('opensig: ')), 'the start failure message', LISTENING_BOUND_MS);
+    assert.equal(failure, 'opensig: stand-in start failure', `the start failure message (got ${JSON.stringify(failure)})`);
+    child.stdin.write('count');
+    const counted = await guarded(lineSeen((line) => line.includes('"event":"test_signal_listeners"')), 'the listener counts', LISTENING_BOUND_MS);
+    assert.notEqual(counted, null, 'premise: the stand-in reported the listener counts');
+    const { sigint, sigterm } = JSON.parse(counted);
+    assert.deepEqual({ sigint, sigterm }, { sigint: 0, sigterm: 0 }, `after a start failure no SIGINT or SIGTERM handler remains (SIGINT ${sigint}, SIGTERM ${sigterm})`);
+    child.stdin.end('end');
+    const { code, signal } = await guarded(exited, 'the entrypoint exit after a start failure');
+    assert.deepEqual([code, signal], [1, null], `a start failure exits 1 even with a signal held (got ${code ?? signal})`);
+    assert.equal(output.stdout.includes('"event":"listening"'), false, 'nothing listened');
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
   }

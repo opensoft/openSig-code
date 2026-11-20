@@ -9,6 +9,12 @@
 // blob store (<OPENSIG_DATA_DIR>/blobs), the T032 notifier and the 0600 challenge-HMAC key
 // file: composedEnv() builds that environment, each file in its own mkdtemp directory, with
 // mail to a mkdtemp spool only.
+// Since the US2 composition (row ARTIFACT-ROUTES) the seal and trust-anchor settings are
+// optional, so composedEnv() leaves them out and its server composes no finalization runner.
+// sealFiles() and anchorsFile() add them: a synthetic RSA-3072 seal key generated in memory at
+// first use, written only as a 0600 PKCS#8 file in its own mkdtemp directory, and self-signed
+// synthetic certificates built in memory by T014's test-local builder
+// (tests/integrity/product/helpers/cert-build.mjs, node built-ins only; imported read-only).
 
 import { createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -23,6 +29,7 @@ import { ROUTES } from '../../src/api/routes.ts';
 import { createApp, createAppServer } from '../../src/server/app.ts';
 import { loadServerConfig } from '../../src/server/config.ts';
 import { createLogger } from '../../src/server/redact.ts';
+import { buildCertificate, rsaKeyPair } from '../integrity/product/helpers/cert-build.mjs';
 
 export const REPO = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const identities = JSON.parse(readFileSync(join(REPO, 'fixtures', 'synthetic', 'identities', 'identities.json'), 'utf8'));
@@ -157,6 +164,44 @@ export function composedEnv(overrides = {}) {
   };
   for (const [name, value] of Object.entries(env)) if (value === undefined) delete env[name];
   return env;
+}
+
+const DAY = 24 * 60 * 60 * 1000;
+let sealKeys = null;
+
+/** This test process's synthetic seal key pair (RSA-3072, exponent 65537), generated at first use and held in memory. */
+export function sealKeyPair() {
+  sealKeys ??= rsaKeyPair(3072);
+  return sealKeys;
+}
+
+/** A synthetic self-signed certificate for `keyPair`, valid from a day ago for 30 days: { der, pem }. */
+export function certificateFor(keyPair, { commonName = 'T031 Development Seal (seal.example.test)', serial = 0x3101 } = {}) {
+  const now = Date.now();
+  const built = buildCertificate({ commonName, keyPair, serial, notBefore: new Date(now - DAY), notAfter: new Date(now + 30 * DAY) });
+  return { der: built.der, pem: built.x509.toString() };
+}
+
+/**
+ * The seal settings (row ARTIFACT-ROUTES): OPENSIG_SEAL_KEY_FILE, the PKCS#8 private key of
+ * `keyPair` (or `keyBytes`) at `keyMode` (default 0600), and OPENSIG_SEAL_CERT_FILE, its
+ * self-signed certificate as PEM (or `certificate`), each in its own mkdtemp directory.
+ */
+export function sealFiles({ keyPair = sealKeyPair(), keyMode = 0o600, keyBytes, certificate } = {}) {
+  const keyPath = join(tempDir('seal-key'), 'seal.key');
+  writeFileSync(keyPath, keyBytes ?? keyPair.privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
+  chmodSync(keyPath, keyMode);
+  const certPath = join(tempDir('seal-cert'), 'seal-cert.pem');
+  writeFileSync(certPath, certificate ?? certificateFor(keyPair).pem, { mode: 0o600 });
+  return { OPENSIG_SEAL_KEY_FILE: keyPath, OPENSIG_SEAL_CERT_FILE: certPath };
+}
+
+/** OPENSIG_TRUST_ANCHORS_FILE holding `text` (default: one synthetic anchor certificate), in its own mkdtemp directory. */
+export function anchorsFile(text) {
+  const path = join(tempDir('anchors'), 'anchors.pem');
+  const anchor = () => certificateFor(rsaKeyPair(3072), { commonName: 'T031 Development Anchor (anchor.example.test)', serial: 0x3102 }).pem;
+  writeFileSync(path, text ?? anchor(), { mode: 0o600 });
+  return path;
 }
 
 /** A bearer token for the synthetic alpha operator `who` (sender, admin or service). */

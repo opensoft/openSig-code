@@ -40,12 +40,35 @@
 //                  default interval when both listeners are bound (row SWEEP-SCHED). A run is
 //                  synchronous, so a backlog after downtime holds the event loop for that run
 //                  (accepted for the pilot; T024 documents it)
-//   routes         ROUTES (src/api/routes.ts): the contract registry with the T008, T034 and
-//                  T010 handler maps installed
+//   routes         ROUTES (src/api/routes.ts): the contract registry with the T008, T034,
+//                  T010, T016 and T038 handler maps installed
+//
+// US2 composition (A-010 row ARTIFACT-ROUTES, request #46), in the same composition:
+//   settings       src/server/finalization.ts's startup checks, after the challenge key and
+//                  before anything is composed (that file says exactly what is checked): first
+//                  T015's fault-hook flag, refused in any argument of this process's command
+//                  line, since the hook arms from it and this server hosts the runner (request
+//                  #86 (4)); then OPENSIG_SEAL_KEY_FILE, OPENSIG_SEAL_CERT_FILE and
+//                  OPENSIG_TRUST_ANCHORS_FILE
+//   audit          one T029 AuditWriter(db, clock) for the three services below
+//   artifacts      T016 ArtifactApi(db, blobs, clock, audit), under ARTIFACT_API
+//   retry          T038 FinalizationRetryApi(db, audit, clock), under FINALIZATION_RETRY
+//   runner         T038 FinalizationRunner(db, audit, blobs, clock, owner, seal, anchors,
+//                  onError), only when the seal pair is set; started once at its default
+//                  interval when both listeners are bound. It gets exactly the values startup
+//                  validated, read once (the certificate's DER and the anchors' PEM items),
+//                  never re-read from their paths; only the key file is opened again, by T038,
+//                  for each attempt (request #81). Its onError is a bounded warning,
+//                  `finalization_run_failed`, with the error's name only, as the sweeper's
+//                  (row RUN-ERRORS). The composition keeps those options (finalizationOptions).
+//                  Without the seal pair there is no runner: the server logs
+//                  `finalization_not_configured` and approved envelopes wait in `finalizing`,
+//                  while the artifact and retry routes are still served.
 // The TCP listener's app and the relay listener's app serve the same registry and get the
 // same instances in their locals (install()): one ceremony, one EnvelopeApi, one ApprovalApi,
-// never one per listener. T034's per-tenant upload cap (src/api/envelopes/uploads.ts) is
-// module-level state, process-wide, so every listener draws on the one cap: at most
+// one ArtifactApi, one FinalizationRetryApi, never one per listener. T034's per-tenant upload
+// cap (src/api/envelopes/uploads.ts) is module-level state, process-wide, so every listener
+// draws on the one cap: at most
 // UPLOADS_PER_TENANT uploads of a tenant in flight across both listeners together (request
 // #16). The composition states it (uploadCap) and the `listening` line logs it.
 //
@@ -61,7 +84,13 @@
 // when the plan is not sandboxed, and the server still starts.
 //
 // Shutdown (SIGINT, SIGTERM; SEC-16, rows SHUTDOWN-INFLIGHT and T008FU-D9), in this order:
-// 1. both listeners close and the socket file is removed;
+// 1. both listeners close and the socket file is removed; then the finalization runner's
+//    stop() is awaited (row ARTIFACT-ROUTES, requests #80 (3) and #81 (11)): T038 starts no
+//    further run or attempt, aborts an attempt in flight through its lease keeper (the verify
+//    worker is terminated, the seal child killed) and resolves once it has unwound, with no
+//    durable write after the abort; the aborted attempt's job is reclaimed at its lease expiry,
+//    as after a crash. So no runner write or timer outlives this step, which comes before the
+//    drain, the sweeper's stop and the database's close;
 // 2. every request handler already dispatched settles (each is bounded by its own deadlines),
 //    and no queued request is dispatched;
 // 3. the ceremony's pending post-response work (requestChallenge after its generic 202) is
@@ -83,15 +112,18 @@
 // test can see from the product itself that no listener accepts anything after step 1. Reading
 // them changes nothing: no listener is added, no timing changes, and the close order is as above.
 
+import { randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, type Stats } from 'node:fs';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { ARTIFACT_API, ArtifactApi } from '../api/artifacts/index.ts';
 import { loadOperatorAuthConfig } from '../api/auth/config.ts';
 import { createOperatorAuthenticator, type OperatorAuthenticator } from '../api/auth/operator.ts';
 import { ENVELOPE_API, EnvelopeApi } from '../api/envelopes/api.ts';
+import { FINALIZATION_RETRY, FinalizationRetryApi } from '../api/envelopes/retry.ts';
 import { UPLOADS_PER_TENANT } from '../api/envelopes/uploads.ts';
 import { APPROVAL_API, ApprovalApi } from '../api/recipients/approval.ts';
 import { RecipientCeremony } from '../api/recipients/ceremony.ts';
@@ -99,14 +131,17 @@ import { ChallengeKeyError, loadChallengeKey, type ChallengeKey } from '../api/r
 import { RECIPIENT_CEREMONY } from '../api/recipients/handlers.ts';
 import { ROUTES, type RouteDefinition } from '../api/routes.ts';
 import { ExpirySweeper, type ExpirySweepReport } from '../jobs/expiry.ts';
+import { FinalizationRunner, type FinalizationRunnerOptions } from '../jobs/finalize.ts';
 import { createNotifierFromConfig, loadNotificationConfig, NotificationError, type Notifier } from '../notifications/index.ts';
 import { parseOrphans, parseServicePlan, parseStopsPastCap, type ServicePlan } from '../pdf/service.ts';
+import { AuditWriter } from '../storage/audit/index.ts';
 import { openBlobStore, type BlobStore } from '../storage/blobs/index.ts';
 import { DEFAULT_BUSY_TIMEOUT_MS, openDatabase, type Database } from '../storage/db/index.ts';
 import { loadMigrations } from '../storage/schema/migrations.ts';
 import { openTenantPolicy, type TenantPolicySource } from './tenants.ts';
 import { createApp, createAppServer, type App } from './app.ts';
 import { BODY_MIN_BYTES_PER_SECOND, loadServerConfig, loopbackOrigin, PDF_BODY_LIMIT, ServerConfigError, type ServerConfig } from './config.ts';
+import { loadFinalizationSettings, type FinalizationSettings } from './finalization.ts';
 import { createLogger, type LogSink, type Logger } from './redact.ts';
 import type { StaticHandler } from './types.ts';
 
@@ -131,6 +166,26 @@ export interface Composition {
    * src/api/envelopes/uploads.ts, so one cap per process, shared by every listener.
    */
   readonly uploadCap: { readonly scope: 'process'; readonly perTenant: number };
+  /** Row ARTIFACT-ROUTES: the one T029 audit writer of the artifact API, the retry API and the runner. */
+  readonly audit: AuditWriter;
+  /** T016's ArtifactApi (readVerification, downloadFinalPdf, downloadPackage). */
+  readonly artifacts: ArtifactApi;
+  /** T038's FinalizationRetryApi (retryFinalization). */
+  readonly finalizationRetry: FinalizationRetryApi;
+  /**
+   * T038's finalization runner, or null when the seal settings are not set: started once, at its
+   * default interval, when both listeners are bound; at shutdown its stop() is awaited right
+   * after the listeners close.
+   */
+  readonly finalization: FinalizationRunner | null;
+  /**
+   * The exact options the runner was built from (null without a runner), frozen: the values
+   * startup validated (seal.keyFile, seal.certificateDer, anchors), the composition's db, audit,
+   * blobs and clock, and the onError that logs `finalization_run_failed` (request #81 (7), (10)).
+   */
+  readonly finalizationOptions: FinalizationRunnerOptions | null;
+  /** How many trust anchors OPENSIG_TRUST_ANCHORS_FILE supplied (0 without it). */
+  readonly trustAnchors: number;
 }
 
 /** What one listener serves, and its state: read-only, for monitoring, SEC-12 and SEC-16. */
@@ -138,7 +193,13 @@ export interface ListenerView {
   readonly name: 'tcp' | 'relay';
   readonly routes: readonly RouteDefinition[];
   /** The app-scoped services in this listener's app (the composition's own instances). */
-  readonly services: { readonly ceremony: unknown; readonly envelopes: unknown; readonly approvals: unknown };
+  readonly services: {
+    readonly ceremony: unknown;
+    readonly envelopes: unknown;
+    readonly approvals: unknown;
+    readonly artifacts: unknown;
+    readonly finalizationRetry: unknown;
+  };
   /** Node's timeouts on this listener's server (REQ-TIMEOUT). */
   readonly timeouts: { readonly headers: number; readonly request: number };
   /** Whether this listener's server is listening now (Node's `server.listening`, read live; row SEC16-PROBE). */
@@ -181,8 +242,9 @@ export interface RunningServer {
   readonly composition: Composition;
   readonly listeners: readonly ListenerView[];
   /**
-   * Shutdown (SEC-16; rows SHUTDOWN-INFLIGHT, SWEEP-SCHED, PARSE-COUNTS): close both listeners,
-   * let every dispatched handler settle, drain the ceremony's pending work, stop the sweeper,
+   * Shutdown (SEC-16; rows SHUTDOWN-INFLIGHT, SWEEP-SCHED, PARSE-COUNTS, ARTIFACT-ROUTES): close
+   * both listeners, await the finalization runner's stop(), let every dispatched handler
+   * settle, drain the ceremony's pending work, stop the sweeper,
    * read the parse counts once more, close the database, log `closed`. Idempotent.
    */
   close(): Promise<void>;
@@ -372,8 +434,19 @@ function createServiceNotifier(env: Readonly<Record<string, string | undefined>>
   }
 }
 
-/** Build the process's one composition (WIRE-US1). Nothing listens yet. */
-function compose(config: ServerConfig, env: Readonly<Record<string, string | undefined>>, logger: Logger, challengeKey: ChallengeKey): Composition {
+/** This process's lease owner identity for T038's runner: 1..100 of [A-Za-z0-9_.:-], no host detail. */
+function leaseOwner(): string {
+  return `opensig-${process.pid}-${randomBytes(6).toString('hex')}`;
+}
+
+/** Build the process's one composition (WIRE-US1, ARTIFACT-ROUTES). Nothing listens yet. */
+function compose(
+  config: ServerConfig,
+  env: Readonly<Record<string, string | undefined>>,
+  logger: Logger,
+  challengeKey: ChallengeKey,
+  settings: FinalizationSettings,
+): Composition {
   const notifier = createServiceNotifier(env, logger);
   const db = openServiceDatabase(config.database);
   try {
@@ -393,6 +466,29 @@ function compose(config: ServerConfig, env: Readonly<Record<string, string | und
         logger.warn('expiry_sweep_failed', { error_name: error instanceof Error ? error.name : typeof error });
       },
     });
+    // ARTIFACT-ROUTES: one audit writer for T016's reads, T038's retries and T038's runner.
+    const audit = new AuditWriter(db, { clock });
+    const artifacts = new ArtifactApi({ db, blobs, clock, audit });
+    const finalizationRetry = new FinalizationRetryApi({ db, audit, clock });
+    // The runner gets exactly the values startup validated, read once (request #81 (10)); only
+    // the key file is opened again, by T038, for each attempt. Its run errors are a bounded
+    // warning with the error's name only, as the sweeper's (row RUN-ERRORS, request #81 (7)).
+    const finalizationOptions: FinalizationRunnerOptions | null =
+      settings.seal === null
+        ? null
+        : Object.freeze({
+            db,
+            audit,
+            blobs,
+            clock,
+            owner: leaseOwner(),
+            seal: settings.seal,
+            anchors: settings.anchors,
+            onError: (error: unknown) => {
+              logger.warn('finalization_run_failed', { error_name: error instanceof Error ? error.name : typeof error });
+            },
+          });
+    const finalization = finalizationOptions === null ? null : new FinalizationRunner(finalizationOptions);
     return Object.freeze({
       routes: ROUTES,
       db,
@@ -403,6 +499,12 @@ function compose(config: ServerConfig, env: Readonly<Record<string, string | und
       approvals,
       sweeper,
       uploadCap: Object.freeze({ scope: 'process' as const, perTenant: UPLOADS_PER_TENANT }),
+      audit,
+      artifacts,
+      finalizationRetry,
+      finalization,
+      finalizationOptions,
+      trustAnchors: settings.anchors.length,
     });
   } catch (error) {
     db.close();
@@ -415,6 +517,8 @@ function install(app: App, composition: Composition): void {
   app.locals.set(RECIPIENT_CEREMONY, composition.ceremony);
   app.locals.set(ENVELOPE_API, composition.envelopes);
   app.locals.set(APPROVAL_API, composition.approvals);
+  app.locals.set(ARTIFACT_API, composition.artifacts);
+  app.locals.set(FINALIZATION_RETRY, composition.finalizationRetry);
 }
 
 /**
@@ -432,7 +536,13 @@ function viewOf(name: 'tcp' | 'relay', app: App, server: Server): ListenerView {
     name,
     routes: app.routes,
     timeouts: Object.freeze({ headers: server.headersTimeout, request: server.requestTimeout }),
-    services: Object.freeze({ ceremony: app.locals.get(RECIPIENT_CEREMONY), envelopes: app.locals.get(ENVELOPE_API), approvals: app.locals.get(APPROVAL_API) }),
+    services: Object.freeze({
+      ceremony: app.locals.get(RECIPIENT_CEREMONY),
+      envelopes: app.locals.get(ENVELOPE_API),
+      approvals: app.locals.get(APPROVAL_API),
+      artifacts: app.locals.get(ARTIFACT_API),
+      finalizationRetry: app.locals.get(FINALIZATION_RETRY),
+    }),
     get listening(): boolean {
       return server.listening;
     },
@@ -454,10 +564,13 @@ export async function startServer(env: Readonly<Record<string, string | undefine
   const config = loadServerConfig(env);
   const logger = createLogger(options.logSink);
   const challengeKey = loadKey(config.challengeKeyFile);
+  // ARTIFACT-ROUTES: the fault-hook flag (request #86 (4)), then the seal and trust-anchor
+  // settings, refused before anything is composed.
+  const finalizationSettings = loadFinalizationSettings(config);
   const { authenticator, tenants } = loadAuthenticator(config, logger);
   let composition: Composition | null = null;
   try {
-    composition = compose(config, env, logger, challengeKey);
+    composition = compose(config, env, logger, challengeKey, finalizationSettings);
     // REQ-TIMEOUT (request #32): settle T033's sandbox plan now, with the same memo key as every
     // upload's parsePdf(), so no upload waits for the probe. The server starts whatever the plan
     // is; uploads keep T033's own answers (a refused plan is their 500 sandbox-unavailable).
@@ -514,6 +627,10 @@ async function listenAll(
 
   // SWEEP-SCHED: one sweeper, at its default interval (its timer does not keep the process alive).
   composition.sweeper.start();
+  // ARTIFACT-ROUTES: one finalization runner, at its default interval (T038's timer does not keep
+  // the process alive), when the seal settings are set; otherwise the server says so.
+  if (composition.finalization !== null) composition.finalization.start();
+  else logger.warn('finalization_not_configured', { effect: 'approved envelopes wait in finalizing until a server with OPENSIG_SEAL_KEY_FILE and OPENSIG_SEAL_CERT_FILE runs' });
   // PARSE-COUNTS: read the parse service's process-wide counts at least once a minute, and warn
   // when either has risen since it was last read.
   let lastCounts = counts.read();
@@ -548,6 +665,8 @@ async function listenAll(
     parse_mode: plan.mode,
     parse_launcher: plan.probe.launcher,
     network_sandbox: plan.network_sandbox,
+    finalization: composition.finalization === null ? 'not-configured' : 'running',
+    trust_anchors: composition.trustAnchors,
   };
   if (plan.mode === 'sandboxed') logger.info('listening', listening);
   else logger.warn('listening', listening);
@@ -572,9 +691,15 @@ async function listenAll(
             // already removed
           }
         }
+        // 1b. ARTIFACT-ROUTES (requests #80 (3), #81 (11)): the runner starts nothing more, aborts an
+        //     attempt in flight and has unwound before the drain, the sweeper and the database.
+        if (composition.finalization !== null) await composition.finalization.stop();
         // 2. SHUTDOWN-INFLIGHT: every dispatched handler settles (a handler can still schedule
         //    ceremony work, so this comes before the drain); nothing queued is dispatched.
-        logger.info('shutdown', { handlers_in_flight: apps.reduce((total, each) => total + each.inFlight(), 0) });
+        logger.info('shutdown', {
+          handlers_in_flight: apps.reduce((total, each) => total + each.inFlight(), 0),
+          finalization: composition.finalization === null ? 'not-configured' : 'stopped',
+        });
         await Promise.all(apps.map((each) => each.settle()));
         // 3. SEC-16 (row T008FU-D9): the work scheduled after a generic 202 finishes, so none is
         //    dropped silently.

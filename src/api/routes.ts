@@ -12,42 +12,41 @@
 //
 // The contract registry (CONTRACT_ROUTES) carries `handler: null` for every operation. ROUTES,
 // the registry the server serves (src/server/main.ts), is set from the handler maps the owning
-// tasks export (A-010 row WIRE-US1, T031's US1 composition slot):
-//   ROUTES = withApprovalHandlers(withEnvelopeHandlers(withRecipientHandlers(CONTRACT_ROUTES)))
+// tasks export (A-010 row WIRE-US1, T031's US1 composition slot; row ARTIFACT-ROUTES, the T031
+// US2 composition slot, request #46):
+//   ROUTES = withFinalizationHandlers(withArtifactHandlers(
+//              withApprovalHandlers(withEnvelopeHandlers(withRecipientHandlers(CONTRACT_ROUTES)))))
 // - T008 RECIPIENT_HANDLERS: requestChallenge, createRecipientSession, readRecipientSession,
 //   endRecipientSession, readRecipientDocument and readRecipientManifest, plus guard-only
 //   entries (the recipient session and CSRF guard, then 501) for approval and decline;
 // - T034 ENVELOPE_HANDLERS: createEnvelope, readEnvelope, uploadDocument, prepareEnvelope,
 //   readRecipientPreview, confirmSend, sendEnvelope, voidEnvelope, reissueEnvelope and
 //   resendInvitation;
-// - T010 APPROVAL_HANDLERS: approveAsHuman and declineAsRecipient, installed last, over T008's
-//   guard-only entries (A-010 request #24, ruling (7)).
-// Every other route keeps `handler: null` and answers the uniform 501 until its owner lands
-// (T038 retryFinalization, T016 artifacts, T019 webhooks); openReviewShell (GET /sign) is
-// served by src/server/static.ts (T035) when that module exists. No handler exists outside
-// this registry: each map names only registry operations, and the server dispatches only
-// through the registry it is given (T031 SEC-04, as amended by § Rulings D1).
-//
-// T016 ARTIFACT_HANDLERS (readVerification, downloadFinalPdf and downloadPackage) is exported
-// here with withArtifactHandlers(), and ROUTES does not install it (row ARTIFACT-ROUTES;
-// request #46). Its handlers need an ArtifactApi under ARTIFACT_API in the server locals.
-// The T031 US2 composition slot, after T016 and T038, composes one in src/server/main.ts,
-// installs this map and T038's retry handler, and amends SEC-04 and SEC-05. Until then the
-// three routes keep the uniform 501, so T031's errors test and T034's SC002-26 world are
-// unchanged. T016 tests through its own world: withArtifactHandlers(ROUTES), plus an
-// ArtifactApi in its locals.
+// - T010 APPROVAL_HANDLERS: approveAsHuman and declineAsRecipient, installed over T008's
+//   guard-only entries (A-010 request #24, ruling (7));
+// - T016 ARTIFACT_HANDLERS: readVerification, downloadFinalPdf and downloadPackage;
+// - T038 FINALIZATION_HANDLERS (src/api/envelopes/retry.ts): retryFinalization.
+// The T016 and T038 maps name operations no other map names, so their place in the chain
+// changes nothing else. Every other route keeps `handler: null` and answers the uniform 501
+// until its owner lands (T019 webhooks); openReviewShell (GET /sign) is served by
+// src/server/static.ts (T035) when that module exists. No handler exists outside this
+// registry: each map names only registry operations, and the server dispatches only through
+// the registry it is given (T031 SEC-04, as amended by § Rulings D1 and row ARTIFACT-ROUTES).
 //
 // The handlers find their app-scoped dependencies in the server locals: the T008
-// RecipientCeremony under RECIPIENT_CEREMONY, the T034 EnvelopeApi under ENVELOPE_API and the
-// T010 ApprovalApi under APPROVAL_API. src/server/main.ts composes them once per process and
-// installs the same instances into every listener's app; a request whose app has none is a
-// 500 (fail closed). withRecipientHandlers() and its peers stay exported so each owner tests
-// through its own map (T008, T034, T010 and T016 worlds).
+// RecipientCeremony under RECIPIENT_CEREMONY, the T034 EnvelopeApi under ENVELOPE_API, the
+// T010 ApprovalApi under APPROVAL_API, the T016 ArtifactApi under ARTIFACT_API and the T038
+// FinalizationRetryApi under FINALIZATION_RETRY. src/server/main.ts composes them once per
+// process and installs the same instances into every listener's app; a request whose app has
+// none is a 500 (fail closed). withRecipientHandlers() and its peers stay exported so each
+// owner tests through its own map (T008, T034, T010, T016 and T038 worlds); each is
+// idempotent over a registry that already carries its map.
 
 import { ARTIFACT_HANDLERS } from './artifacts/handlers.ts';
 import { withRecipientMutation } from './auth/recipient-session.ts';
 import type { OperationId } from './auth/matrix.ts';
 import { ENVELOPE_HANDLERS } from './envelopes/handlers.ts';
+import { FINALIZATION_HANDLERS, withFinalizationHandlers } from './envelopes/retry.ts';
 import { approveAsHuman } from './recipients/approval.ts';
 import { declineAsRecipient } from './recipients/decline.ts';
 import { CEREMONY_HANDLERS, ceremonyAuthority } from './recipients/handlers.ts';
@@ -158,10 +157,7 @@ export function withEnvelopeHandlers(routes: readonly RouteDefinition[] = ROUTES
 
 export { ARTIFACT_HANDLERS };
 
-/**
- * `routes` with T016's artifact handlers installed (every other route unchanged). Not yet part
- * of ROUTES: see the header comment.
- */
+/** `routes` with T016's artifact handlers installed (every other route unchanged). */
 export function withArtifactHandlers(routes: readonly RouteDefinition[] = ROUTES): readonly RouteDefinition[] {
   return Object.freeze(
     routes.map((definition) => {
@@ -171,9 +167,14 @@ export function withArtifactHandlers(routes: readonly RouteDefinition[] = ROUTES
   );
 }
 
+export { FINALIZATION_HANDLERS, withFinalizationHandlers };
+
 /**
- * The registry the server serves (WIRE-US1): the contract registry with T008's, T034's and
- * T010's handler maps installed, in that order, so T010's approval and decline replace T008's
- * guard-only entries. Frozen, like every entry.
+ * The registry the server serves (WIRE-US1, ARTIFACT-ROUTES): the contract registry with T008's,
+ * T034's and T010's handler maps installed, in that order, so T010's approval and decline
+ * replace T008's guard-only entries; then T016's artifact map and T038's retry map. Frozen,
+ * like every entry.
  */
-export const ROUTES: readonly RouteDefinition[] = withApprovalHandlers(withEnvelopeHandlers(withRecipientHandlers(CONTRACT_ROUTES)));
+export const ROUTES: readonly RouteDefinition[] = withFinalizationHandlers(
+  withArtifactHandlers(withApprovalHandlers(withEnvelopeHandlers(withRecipientHandlers(CONTRACT_ROUTES)))),
+);

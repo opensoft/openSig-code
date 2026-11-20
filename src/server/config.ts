@@ -22,6 +22,16 @@
 //                                unless it is a regular file, not a link, owned by the
 //                                server user, with no group or other permission bit (for
 //                                example 0600 or 0400), of 32 to 4096 bytes (main.ts, T008).
+//   OPENSIG_SEAL_KEY_FILE        absolute path of the seal's owner-only private-key file
+//   OPENSIG_SEAL_CERT_FILE       and absolute path of its signer certificate (T038, A-010
+//                                request #39 Part F; quickstart.md § Configuration). Set
+//                                together or not at all: without them no finalization runner
+//                                is composed and approved envelopes wait in `finalizing`;
+//                                with them startup validates both (src/server/finalization.ts)
+//                                and starts T038's runner (row ARTIFACT-ROUTES).
+//   OPENSIG_TRUST_ANCHORS_FILE   absolute path of a regular file of PEM trust-anchor
+//                                certificates (T014, request #44); optional, validated at
+//                                startup when set; without it trust is never `trusted`.
 //   OPENSIG_DATA_DIR             the service data directory; the blob store (T028) is its
 //                                `blobs` subdirectory, created 0700 if absent (row WIRE-US1).
 //   OPENSIG_ENV, OPENSIG_MAIL_TRANSPORT, OPENSIG_SPOOL_DIR
@@ -65,6 +75,12 @@ export interface ServerConfig {
   readonly database: string | null;
   /** The recipient challenge-HMAC key file (OPENSIG_CHALLENGE_KEY_FILE), or null when unset. */
   readonly challengeKeyFile: string | null;
+  /** The seal's private-key file (OPENSIG_SEAL_KEY_FILE), or null when unset (row ARTIFACT-ROUTES). */
+  readonly sealKeyFile: string | null;
+  /** The seal's signer certificate file (OPENSIG_SEAL_CERT_FILE), or null when unset. */
+  readonly sealCertFile: string | null;
+  /** The trust-anchor file (OPENSIG_TRUST_ANCHORS_FILE), or null when unset. */
+  readonly trustAnchorsFile: string | null;
   /** The blob store root, <OPENSIG_DATA_DIR>/blobs, or null without an absolute data directory. */
   readonly blobRoot: string | null;
   readonly limits: {
@@ -119,6 +135,18 @@ export function loadServerConfig(env: Readonly<Record<string, string | undefined
   if (database !== null && !isAbsolute(database)) throw new ServerConfigError('OPENSIG_DATABASE must be an absolute path');
   const challengeKeyFile = value(env, 'OPENSIG_CHALLENGE_KEY_FILE');
   if (challengeKeyFile !== null && !isAbsolute(challengeKeyFile)) throw new ServerConfigError('OPENSIG_CHALLENGE_KEY_FILE must be an absolute path');
+  // Row ARTIFACT-ROUTES: the US2 settings. Only the path form is checked here; the files are
+  // checked at startup, before anything is composed (src/server/finalization.ts).
+  const sealKeyFile = value(env, 'OPENSIG_SEAL_KEY_FILE');
+  const sealCertFile = value(env, 'OPENSIG_SEAL_CERT_FILE');
+  const trustAnchorsFile = value(env, 'OPENSIG_TRUST_ANCHORS_FILE');
+  for (const [name, path] of [
+    ['OPENSIG_SEAL_KEY_FILE', sealKeyFile],
+    ['OPENSIG_SEAL_CERT_FILE', sealCertFile],
+    ['OPENSIG_TRUST_ANCHORS_FILE', trustAnchorsFile],
+  ] as const) {
+    if (path !== null && !isAbsolute(path)) throw new ServerConfigError(`${name} must be an absolute path`);
+  }
   return Object.freeze({
     host,
     port,
@@ -131,6 +159,9 @@ export function loadServerConfig(env: Readonly<Record<string, string | undefined
     dataDir,
     database,
     challengeKeyFile,
+    sealKeyFile,
+    sealCertFile,
+    trustAnchorsFile,
     blobRoot: dataDir !== null && isAbsolute(dataDir) ? join(dataDir, BLOBS_DIRECTORY) : null,
     limits: Object.freeze({
       jsonBytes: JSON_BODY_LIMIT,
