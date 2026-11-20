@@ -330,15 +330,19 @@ test('[OR-07] a backup is a consistent private snapshot, and it refuses a damage
 
     const used = scratch.dir();
     writeFileSync(join(used, 'keep.txt'), 'existing');
-    await assert.rejects(createBackup({ databasePath: system.path, blobRoot: system.blobRoot, outDir: used, ledgerPath: system.ledgerPath, clock }), /must be empty/);
+    await assert.rejects(createBackup({ databasePath: system.path, blobRoot: system.blobRoot, outDir: used, ledgerPath: system.ledgerPath, clock }), /must be empty/, 'OR-07: a nonempty backup directory is refused');
     assert.deepEqual(readdirSync(used), ['keep.txt']);
 
     const blobFile = join(system.blobRoot, 'tenants', system.tenant, 'sha256', system.envelope.doc.digest);
     chmodSync(blobFile, 0o600);
     const original = readFileSync(blobFile);
-    writeFileSync(blobFile, Buffer.concat([original.subarray(0, 100), Buffer.from('x'), original.subarray(101)]));
+    const damaged = Buffer.from(original);
+    damaged[100] ^= 0xff;
+    assert.equal(damaged.length, original.length, 'OR-07: source-blob corruption preserves the byte length');
+    assert.notDeepEqual(damaged, original, 'OR-07: source-blob corruption changes the bytes');
+    writeFileSync(blobFile, damaged);
     const failedDir = join(scratch.dir(), 'failed-backup');
-    await assert.rejects(createBackup({ databasePath: system.path, blobRoot: system.blobRoot, outDir: failedDir, ledgerPath: system.ledgerPath, clock }), /failed verification/);
+    await assert.rejects(createBackup({ databasePath: system.path, blobRoot: system.blobRoot, outDir: failedDir, ledgerPath: system.ledgerPath, clock }), /failed verification/, 'OR-07: a changed source blob is refused by digest verification');
     assert.equal(existsSync(failedDir), false, 'a failed backup leaves no directory');
     writeFileSync(blobFile, original);
 
@@ -346,7 +350,7 @@ test('[OR-07] a backup is a consistent private snapshot, and it refuses a damage
     raw.exec('DROP TRIGGER audit_events_append_only_update');
     raw.prepare('UPDATE audit_events SET actor_ref = ? WHERE tenant_id = ? AND seq = 2').run('someone-else', system.tenant);
     raw.close();
-    await assert.rejects(backupOf(system), (error) => error instanceof BackupError && /audit chain does not verify/.test(error.message));
+    await assert.rejects(backupOf(system), (error) => error instanceof BackupError && /audit chain does not verify/.test(error.message), 'OR-07: a damaged source audit chain is refused');
   } finally {
     system.db.close();
   }
