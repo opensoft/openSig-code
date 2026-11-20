@@ -112,7 +112,8 @@ export function makeWorld() {
   };
 }
 
-function walkToFinalizing(store, envelopeId, revisionId, manifestDigest, now) {
+// walkToFinalizing, draftEnvelope and revisionRow are exported for support/sealable.mjs (FV-DIGEST's two-recipient seed).
+export function walkToFinalizing(store, envelopeId, revisionId, manifestDigest, now) {
   const steps = [
     { state: 'prepared', baseRevisionId: revisionId, manifestDigest, recipientsDigest: hex(`recipients-${envelopeId}`) },
     { state: 'sent' },
@@ -123,19 +124,19 @@ function walkToFinalizing(store, envelopeId, revisionId, manifestDigest, now) {
   });
 }
 
-function draftEnvelope(world, envelopeId, now) {
+export function draftEnvelope(world, envelopeId, now, { recipientsCount = 1 } = {}) {
   insertEnvelope(world.store, {
     id: envelopeId,
     source: { app: 'manual', record: 'record-1', version: 'v1' },
     createdBy: { kind: 'human-operator', ref: 'operator-1' },
     expiresAt: new Date(BASE_TIME + 7 * 24 * 3_600_000).toISOString(),
-    recipientsCount: 1,
+    recipientsCount,
     reissueOf: null,
     now,
   });
 }
 
-function revisionRow(world, envelopeId, revisionId, digest, bytes, now) {
+export function revisionRow(world, envelopeId, revisionId, digest, bytes, now) {
   return {
     id: revisionId,
     envelope_id: envelopeId,

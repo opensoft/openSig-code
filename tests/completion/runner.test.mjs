@@ -19,6 +19,15 @@
 // refusal (finding F-3). The verify step there is the real runVerification
 // with a worker that never answers; the database seam only replaces a read of
 // the completion checkpoint and counts runs.
+//
+// The T038 correction FV-DIGEST (A-010 request #85 (1); FEN-07 extended):
+// readSealRecords recomputes T010's fieldValuesDigest over each approval's
+// stored values and its server-day dates, after the approval-digest
+// comparison. Rows R0 (one and two recipients with a date field publish while
+// the runner clock is on another UTC day than server_time), R1-R3 (a forged
+// field_values_digest under a consistent approval_digest, at ordinal 1 of 1,
+// 1 of 2 and 2 of 2, is refused before the seal anchor) and R4-R5 (the
+// approval-digest refusal at ordinals 1 and 2) use support/sealable.mjs.
 
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -27,13 +36,15 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { SealError } from '../../src/cryptograph/worker/index.ts';
+import { fieldValuesDigest } from '../../src/domain/approval/index.ts';
 import { canonicalBytes, canonicalDigest } from '../../src/domain/canonical/index.ts';
 import { LeaseLost, reclaimLease, runVerification, StepFailure, VERIFY_WALL_CAP_MS } from '../../src/domain/finalization/index.ts';
 import { FinalizationRunner } from '../../src/jobs/finalize.ts';
 import { StorageUsageError } from '../../src/storage/db/index.ts';
 import { getCompletionCheckpoint } from '../../src/storage/repositories/artifacts.ts';
 import { ATTEMPT_GRACE_MS, attemptCollectable, DEFAULT_LEASE_MS, LEASE_EXPIRED_ERROR_CODE, listAttemptBlobs, retryDelayMs } from '../../src/storage/repositories/jobs.ts';
-import { assertUnchanged, eventsOf, lease, publish, refusedWith } from './support/steps.mjs';
+import { seedSealableWith } from './support/sealable.mjs';
+import { assertUnchanged, eventsOf, lease, outboxOf, publish, refusedWith } from './support/steps.mjs';
 import { assembleAttempt, describe, hex, makeWorld, reportBytesFor, RESERVED_VERSION, seedFinalizing, seedSealable, sha256, snapshot, syntheticBytes } from './support/world.mjs';
 
 const NEVER = Object.freeze({ setTimeout: () => 0, clearTimeout: () => undefined });
@@ -269,6 +280,97 @@ test('[FEN-07] a retry reuses the seal anchor: one seal_started event, the same 
     assert.equal(published, 2, `the artifact carries attempt ${published}`);
   } finally {
     world.close();
+  }
+});
+
+// FV-DIGEST (request #85 (1)). One world per seed: consent_texts holds one version per tenant and locale.
+const DAY_MS = 24 * 3_600_000;
+
+/** Each seeded approval's stored and recomputed digests, for assertion messages (request #70 (6)). */
+const digestsOf = (seeded) =>
+  seeded.approvals
+    .map((a) => `ordinal ${a.ordinal}: field_values_digest stored ${a.storedFieldValuesDigest}, of the values ${a.valuesDigest}; approval_digest stored ${a.storedApprovalDigest}, of the unforged record ${a.recordDigest}`)
+    .join(' | ');
+
+test('[FEN-07] FV-DIGEST R0: one and two recipients with a date field publish while the runner clock is a UTC day past server_time; each manifest approval carries T010’s field-values digest of its values and its server-day dates', async () => {
+  for (const recipients of [1, 2]) {
+    const world = makeWorld();
+    try {
+      const seeded = seedSealableWith(world, { recipients });
+      world.clock.advance(DAY_MS);
+      const runnerDay = world.clock.iso().slice(0, 10);
+      assert.notEqual(runnerDay, seeded.serverDay, `R0 premise (${recipients} recipient(s)): runner day ${runnerDay}, server day ${seeded.serverDay}`);
+      const { runner } = makeRunner(world);
+      const outcome = await runner.runAttempt(world.tenantId, seeded.envelopeId);
+      const after = snapshot(world, seeded.envelopeId);
+      const at = `R0 (${recipients} recipient(s), server day ${seeded.serverDay}, runner day ${runnerDay}): ${digestsOf(seeded)}; ${describe(after)}`;
+      assert.equal(outcome.kind, 'published', `${at}; outcome ${JSON.stringify(outcome)}`);
+      const [artifact] = after.artifacts;
+      const evidence = JSON.parse(world.blobs.readRef(world.tenantId, artifact.evidence_blob_ref).toString('utf8'));
+      const ordinals = evidence.approvals.map((approval) => approval.recipient.ordinal);
+      assert.deepEqual(ordinals, seeded.approvals.map((a) => a.ordinal), `${at}; manifest approval ordinals ${JSON.stringify(ordinals)}`);
+      evidence.approvals.forEach((approval, index) => {
+        const seed = seeded.approvals[index];
+        const recomputed = fieldValuesDigest(approval.field_values, approval.date_values);
+        assert.deepEqual(
+          [approval.field_values_digest, recomputed],
+          [seed.storedFieldValuesDigest, seed.storedFieldValuesDigest],
+          `${at}; ordinal ${seed.ordinal}: manifest field_values_digest ${approval.field_values_digest}, recomputed ${recomputed}, stored ${seed.storedFieldValuesDigest}`,
+        );
+        assert.deepEqual(
+          approval.date_values,
+          [{ key: `date-${seed.ordinal}`, value: seeded.serverDay }],
+          `${at}; ordinal ${seed.ordinal}: date_values ${JSON.stringify(approval.date_values)}`,
+        );
+      });
+    } finally {
+      world.close();
+    }
+  }
+});
+
+/**
+ * One attempt on a seed with one forged digest is refused before the seal
+ * anchor: failed after one attempt with manifest_invalid.<reason>, one
+ * envelope.finalization_failed (audit and outbox), no seal_started, no compose
+ * call, no attempt record, no later step, the envelope still finalizing.
+ */
+async function expectRefusedBeforeAnchor(label, recipients, forge, reason) {
+  const world = makeWorld();
+  try {
+    const seeded = seedSealableWith(world, { recipients, forge });
+    const ordinal = forge.fieldValuesDigestAt ?? forge.approvalDigestAt;
+    const forged = seeded.approvals.find((a) => a.ordinal === ordinal);
+    const premise = forge.fieldValuesDigestAt !== undefined ? forged.storedFieldValuesDigest !== forged.valuesDigest : forged.storedApprovalDigest !== forged.recordDigest && forged.storedFieldValuesDigest === forged.valuesDigest;
+    assert.ok(premise, `${label} premise: ${digestsOf(seeded)}`);
+    const { runner, calls } = makeRunner(world);
+    const outcome = await runner.runAttempt(world.tenantId, seeded.envelopeId);
+    const after = snapshot(world, seeded.envelopeId);
+    const at = `${label} (${recipients} recipient(s), forged ${JSON.stringify(forge)}): ${digestsOf(seeded)}; ${describe(after)}`;
+    const errorCode = `manifest_invalid.${reason}`;
+    assert.deepEqual(outcome, { kind: 'failed', errorCode }, `${at}; outcome ${JSON.stringify(outcome)}`);
+    const job = [after.job.status, after.job.attempt_count, after.job.last_error_code];
+    assert.deepEqual(job, ['failed', 1, errorCode], `${at}; job ${JSON.stringify(job)}`);
+    const announced = [eventsOf(world, seeded.envelopeId, 'envelope.finalization_failed').length, outboxOf(world, seeded.envelopeId, 'envelope.finalization_failed').length];
+    assert.deepEqual(announced, [1, 1], `${at}; finalization_failed audit and outbox ${JSON.stringify(announced)}`);
+    const beforeAnchor = [eventsOf(world, seeded.envelopeId, 'envelope.seal_started').length, calls.compose.length, after.attemptBlobs, after.envelope.state];
+    assert.deepEqual(beforeAnchor, [0, 0, 0, 'finalizing'], `${at}; seal_started, compose calls, attempt records, envelope state ${JSON.stringify(beforeAnchor)}`);
+    const later = [calls.seal.length, calls.verify.length, calls.packages.length, after.artifacts.length, after.reports];
+    assert.deepEqual(later, [0, 0, 0, 0, 0], `${at}; seal, verify, package calls, artifacts, reports ${JSON.stringify(later)}`);
+  } finally {
+    world.close();
+  }
+}
+
+test('[FEN-07] FV-DIGEST R1-R3: a forged field_values_digest under a consistent approval_digest, at ordinal 1 of 1, 1 of 2 and 2 of 2, fails the job as manifest_invalid.field-values-digest after one attempt, before the seal anchor and compose', async () => {
+  for (const [label, recipients, ordinal] of [['R1', 1, 1], ['R2', 2, 1], ['R3', 2, 2]]) {
+    await expectRefusedBeforeAnchor(label, recipients, { fieldValuesDigestAt: ordinal }, 'field-values-digest');
+  }
+});
+
+test('[FEN-07] FV-DIGEST R4-R5: an approval_digest that is not the digest of its record, at ordinal 1 and 2 of 2, keeps its refusal manifest_invalid.approval-digest, before the seal anchor and compose', async () => {
+  for (const [label, ordinal] of [['R4', 1], ['R5', 2]]) {
+    await expectRefusedBeforeAnchor(label, 2, { approvalDigestAt: ordinal }, 'approval-digest');
   }
 });
 

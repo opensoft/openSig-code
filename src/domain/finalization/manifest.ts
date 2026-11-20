@@ -16,8 +16,11 @@
 // - the frozen revision (digest, bytes, displayed pages) and the frozen field
 //   manifest's exact canonical bytes, with manifest_digest;
 // - each approval in recipient order, rebuilt as the contract ApprovalRecord
-//   from its stored row and checked against its stored approval_digest; a
-//   mismatch is a broken invariant (StepFailure manifest_invalid, not
+//   from its stored row and checked against its stored approval_digest, then
+//   its stored field_values_digest checked against T010's fieldValuesDigest
+//   of the stored values and the server-day dates (A-010 request #85 (1), row
+//   FV-DIGEST); a mismatch is a broken invariant (StepFailure
+//   manifest_invalid.approval-digest or .field-values-digest, not
 //   retryable), never repaired;
 // - each consent text the approvals reference, once, in approval order;
 // - approved_composition_digest (T036's ComposedRevision.digest), the seal's
@@ -28,7 +31,7 @@ import { canonicalDigest, parseJson, type JsonValue } from '../../domain/canonic
 import type { TenantStore } from '../../storage/db/index.ts';
 import { getApprovalOf } from '../../storage/repositories/approvals.ts';
 import { getEnvelope, getManifest, getRevision, listRecipients } from '../../storage/repositories/envelopes.ts';
-import { serverDate } from '../approval/record.ts';
+import { fieldValuesDigest, serverDate, type DateValue } from '../approval/index.ts';
 import { StepFailure } from './failure.ts';
 
 export const APPROVAL_MANIFEST_SCHEMA = 'opensig.approval-manifest/1';
@@ -67,7 +70,7 @@ export interface SealRecords {
   /** The frozen field manifest (T036's FieldManifestInput shape) and its digest. */
   readonly fieldManifest: JsonValue;
   readonly manifestDigest: string;
-  /** Contract ApprovalRecords in recipient order, each checked against its stored approval_digest. */
+  /** Contract ApprovalRecords in recipient order, each checked against its stored approval_digest and field_values_digest. */
   readonly approvals: readonly { readonly [key: string]: JsonValue }[];
   readonly consentTexts: readonly JsonValue[];
 }
@@ -108,11 +111,12 @@ export function readSealRecords(store: TenantStore, envelopeId: string): SealRec
     const fieldValues = parsed(approval.fieldValuesJson, 'field-values');
     if (!Array.isArray(fieldValues)) throw broken('field-values');
     const date = serverDate(approval.serverTime);
-    const dateValues: JsonValue[] = fieldValues
+    const dates: DateValue[] = fieldValues
       .filter((value): value is { readonly [key: string]: JsonValue } => typeof value === 'object' && value !== null && !Array.isArray(value) && value['type'] === 'date')
       .map((value) => String(value['key']))
       .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
       .map((key) => ({ key, value: date }));
+    const dateValues: JsonValue[] = dates.map(({ key, value }) => ({ key, value }));
     const record: { [key: string]: JsonValue } = {
       approval_id: approval.id,
       recipient: { id: recipient.id, ordinal: recipient.ordinal, role: recipient.role, email: recipient.email },
@@ -128,6 +132,8 @@ export function readSealRecords(store: TenantStore, envelopeId: string): SealRec
       server_time: approval.serverTime,
     };
     if (canonicalDigest(record) !== approval.approvalDigest) throw broken('approval-digest');
+    // FV-DIGEST (request #85 (1)): the stored digest must be T010's digest of the stored values and their dates.
+    if (fieldValuesDigest(fieldValues, dates) !== approval.fieldValuesDigest) throw broken('field-values-digest');
     approvals.push({ ...record, approval_digest: approval.approvalDigest });
     if (!consentIds.includes(approval.consentTextId)) consentIds.push(approval.consentTextId);
   }
