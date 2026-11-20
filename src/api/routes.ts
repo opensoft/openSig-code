@@ -28,13 +28,23 @@
 // this registry: each map names only registry operations, and the server dispatches only
 // through the registry it is given (T031 SEC-04, as amended by § Rulings D1).
 //
+// T016 ARTIFACT_HANDLERS (readVerification, downloadFinalPdf and downloadPackage) is exported
+// here with withArtifactHandlers(), and ROUTES does not install it (row ARTIFACT-ROUTES;
+// request #46). Its handlers need an ArtifactApi under ARTIFACT_API in the server locals.
+// The T031 US2 composition slot, after T016 and T038, composes one in src/server/main.ts,
+// installs this map and T038's retry handler, and amends SEC-04 and SEC-05. Until then the
+// three routes keep the uniform 501, so T031's errors test and T034's SC002-26 world are
+// unchanged. T016 tests through its own world: withArtifactHandlers(ROUTES), plus an
+// ArtifactApi in its locals.
+//
 // The handlers find their app-scoped dependencies in the server locals: the T008
 // RecipientCeremony under RECIPIENT_CEREMONY, the T034 EnvelopeApi under ENVELOPE_API and the
 // T010 ApprovalApi under APPROVAL_API. src/server/main.ts composes them once per process and
 // installs the same instances into every listener's app; a request whose app has none is a
 // 500 (fail closed). withRecipientHandlers() and its peers stay exported so each owner tests
-// through its own map (T008, T034 and T010 worlds).
+// through its own map (T008, T034, T010 and T016 worlds).
 
+import { ARTIFACT_HANDLERS } from './artifacts/handlers.ts';
 import { withRecipientMutation } from './auth/recipient-session.ts';
 import type { OperationId } from './auth/matrix.ts';
 import { ENVELOPE_HANDLERS } from './envelopes/handlers.ts';
@@ -141,6 +151,21 @@ export function withEnvelopeHandlers(routes: readonly RouteDefinition[] = ROUTES
   return Object.freeze(
     routes.map((definition) => {
       const handler = ENVELOPE_HANDLERS[definition.operationId];
+      return handler === undefined ? definition : Object.freeze({ ...definition, handler });
+    }),
+  );
+}
+
+export { ARTIFACT_HANDLERS };
+
+/**
+ * `routes` with T016's artifact handlers installed (every other route unchanged). Not yet part
+ * of ROUTES: see the header comment.
+ */
+export function withArtifactHandlers(routes: readonly RouteDefinition[] = ROUTES): readonly RouteDefinition[] {
+  return Object.freeze(
+    routes.map((definition) => {
+      const handler = ARTIFACT_HANDLERS[definition.operationId];
       return handler === undefined ? definition : Object.freeze({ ...definition, handler });
     }),
   );
