@@ -1,0 +1,392 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// The US2 sealed-PDF bound and the upload predicate (T036 follow-up; requests #44, #45
+// and #46, rows SIZE-BOUND, T036-NUMRANGE, T036-FIXES and T036-RESIDUAL).
+//
+// Import discipline: this module imports NOTHING, not even a type, so its whole
+// import closure is this one file. T037's sealing worker runs under Node's
+// permission model with a read grant on exactly this file, and T014 compares its
+// own restated bound with MAX_SEALED_PDF_BYTES. It never reaches parsePdf
+// (src/pdf/service.ts) or the composer. It restates four constants of other modules,
+// and tests/compose/ compares each with its owner's export: MAX_DOCUMENT_BYTES
+// (src/pdf/limits.ts), MAX_FIELD_VALUES (src/domain/approval/values.ts), and
+// MAX_OBJECT_NUMBER and MAX_BOX_COORDINATE (src/cryptograph/compose/report.ts).
+// centipointBox() is defined here and used by the composer itself (report.ts), so the
+// predicate and the composer measure a page box with one function.
+//
+// The predicate, for T034's upload (EA-07):
+//
+//   estimateSealedSize(report: SealableReport): SealedSizeEstimate
+//   SealedSizeEstimate = { worstCaseBytes: number; exceedsBound: boolean;
+//                          refusals: readonly SealRefusal[] }
+//   SealRefusal = { detail: SealRefusalDetail; refs: readonly ObjectRef[] }
+//
+//   - `report` is the live parse report exactly as parsePdf() returns it in
+//     `outcome.report` (a ServiceReport): T034 calls this inside the upload request
+//     on that object, before it stores the blob. The stored document input keeps no
+//     objects and cannot be used.
+//   - `worstCaseBytes`: an upper bound on the composed (sealed) PDF for ANY request
+//     the budgets allow on this document, taking every page as a possible widget
+//     page: the document's bytes, plus UPDATE_REQUEST_BOUND, plus what the composer
+//     writes for the catalog and the AcroForm, plus the MAX_FIELD_VALUES (20)
+//     costliest pages, a page's cost being everything the composer writes for it.
+//     `exceedsBound` is worstCaseBytes > MAX_SEALED_PDF_BYTES.
+//   - `refusals`: every refusal the composer could make from the report alone, for
+//     some request, in the order of SEAL_REFUSAL_DETAILS (T034 takes the first), each
+//     kind once, with the sorted references [num, gen] of the objects concerned and
+//     never a value. The composer makes each as 422 unsupported_pdf with the same
+//     detail, not retryable:
+//       composition_too_large    worstCaseBytes > MAX_SEALED_PDF_BYTES; refs: every
+//                                object the worst case counts;
+//       number_range             an exponent-form number in a value the composer
+//                                writes; refs: the object it is written from (the
+//                                rewritten dictionary, or the /Fields or /Annots
+//                                array object copied inline);
+//       dangling_form_reference  /AcroForm, /Fields or /Annots names an object the
+//                                report does not hold; refs: the object holding it;
+//       annots_shape             a page /Annots that is not an array; refs: the page;
+//       acroform_shape           an AcroForm that is not a dictionary or whose
+//                                /Fields is not an array (refs: the object holding
+//                                the entry), or an AcroForm object that is also a
+//                                page (refs: that object);
+//       xref_size                the largest request's new objects, numbered from
+//                                /Size, would pass MAX_OBJECT_NUMBER; refs: none (the
+//                                trailer is not an object);
+//       page_box                 on any page, a MediaBox or CropBox coordinate whose
+//                                magnitude is above MAX_BOX_COORDINATE, or a side under
+//                                one centipoint after centipointBox(); refs: the page;
+//       name_character           a NUL in a name or a dictionary key anywhere in a
+//                                reported object; refs: that object.
+//     Every key is data, `__proto__` included: no value is ever copied into an object.
+//     An empty list means the composer can seal this document for every request.
+//   - Pure: no I/O, no clock, no randomness. Cost: one JSON.stringify per object it
+//     sizes, and at most two iterative walks over each reported value (names, and
+//     numbers in what is written, each object walked once), so time and memory are
+//     linear in the report, which the parse service caps at 1,376,256 bytes and
+//     266,240 values.
+//
+// Why it dominates the composer (CP-01). The composer's update is its request part
+// plus its rewritten base objects and the copied first /ID.
+// - The request part is at most UPDATE_REQUEST_BOUND for every request the budgets
+//   allow and every page box the composer accepts (+-1,000,000 points); compose.ts
+//   states the derivation, and CP-01 composes the real maximum under it.
+// - The composer rewrites at most the catalog, the AcroForm and MAX_FIELD_VALUES
+//   pages (one widget per field, at most 20 fields), copying inline the /Fields
+//   array of the AcroForm and the /Annots array of each rewritten page. Each
+//   rewritten value is written in at most three times its JSON size (syntax.ts:
+//   names expand at most threefold, every other value never grows, and an exponent
+//   number is refused rather than expanded), plus at most REWRITE_OVERHEAD_BYTES of
+//   header and added entries per object. The predicate counts the catalog and the
+//   AcroForm always and the 20 costliest pages, each with its copied array, so it is
+//   at least what any request makes the composer write.
+// - The refusals follow the composer's own rules over the same values, taking every
+//   page as a widget page: the catalog's values when the composer rewrites it (no
+//   AcroForm, or an inline one), the AcroForm's values except the /Fields and
+//   /SigFlags it replaces, the /Fields items, and each page's values except /Annots
+//   plus its /Annots items; every page's boxes; every reported object's names and
+//   keys; and the most objects a request can add. So a document with no refusal
+//   composes for every request.
+
+/** A sealed PDF is at most 48 MiB (request #44). */
+export const MAX_SEALED_PDF_BYTES = 50_331_648;
+/** The update-size bound from the request alone (derivation in compose.ts). */
+export const UPDATE_REQUEST_BOUND = 1_100_000;
+/** The mathematical worst-case update size (derivation in compose.ts). */
+export const UPDATE_BOUND = 90_565_440;
+/** Restated: the field budget (src/domain/approval/values.ts MAX_FIELD_VALUES), so the most pages that receive a widget. */
+export const MAX_FIELD_VALUES = 20;
+/** Restated: the input cap (src/pdf/limits.ts MAX_DOCUMENT_BYTES), 10 MiB. */
+export const MAX_DOCUMENT_BYTES = 10_485_760;
+/** Restated: the largest indirect object number (src/cryptograph/compose/report.ts MAX_OBJECT_NUMBER). */
+export const MAX_OBJECT_NUMBER = 8_388_607;
+/** Restated: the largest page-box coordinate magnitude, in points (src/cryptograph/compose/report.ts MAX_BOX_COORDINATE). */
+export const MAX_BOX_COORDINATE = 1_000_000;
+/** Header, trailer and added entries of one rewritten object, beyond three times its value's JSON size. */
+export const REWRITE_OVERHEAD_BYTES = 400;
+/** The parse report's byte budget at MAX_DOCUMENT_BYTES (src/pdf/limits.ts reportBudget), used by UPDATE_BOUND. */
+export const REPORT_BYTE_BUDGET = 64 * 1024 + Math.floor(MAX_DOCUMENT_BYTES / 8);
+
+/** The refusals the composer can make from the parse report alone, in the order the predicate lists them (T034 takes the first). */
+export const SEAL_REFUSAL_DETAILS = Object.freeze([
+  'composition_too_large',
+  'number_range',
+  'dangling_form_reference',
+  'annots_shape',
+  'acroform_shape',
+  'xref_size',
+  'page_box',
+  'name_character',
+] as const);
+
+export type SealRefusalDetail = (typeof SEAL_REFUSAL_DETAILS)[number];
+export type ObjectRef = readonly [number, number];
+export type CentipointBox = readonly [number, number, number, number];
+
+/** The members of a parse report (src/pdf/service.ts ServiceReport) the predicate reads. */
+export interface SealableReport {
+  readonly bytes: number;
+  readonly xref: { readonly size: number; readonly kind: 'table' | 'stream' };
+  readonly pages: ReadonlyArray<{ readonly ref: ObjectRef; readonly media_box: readonly number[]; readonly crop_box: readonly number[] }>;
+  readonly trailer: { readonly root: ObjectRef; readonly id: readonly [string, string] | null };
+  readonly objects: Readonly<Record<string, { readonly gen: number; readonly value: unknown }>>;
+}
+
+export interface SealRefusal {
+  readonly detail: SealRefusalDetail;
+  /** The objects concerned, sorted by number, each once; never a value. */
+  readonly refs: readonly ObjectRef[];
+}
+
+export interface SealedSizeEstimate {
+  /** An upper bound on the sealed PDF's size for any request the budgets allow. */
+  readonly worstCaseBytes: number;
+  /** worstCaseBytes > MAX_SEALED_PDF_BYTES. */
+  readonly exceedsBound: boolean;
+  /** Every refusal the composer could make from the report alone; empty when it can seal for every request. */
+  readonly refusals: readonly SealRefusal[];
+}
+
+/** True when a composed PDF of `length` bytes is within the bound. */
+export function withinSealedBound(length: number): boolean {
+  return Number.isSafeInteger(length) && length >= 0 && length <= MAX_SEALED_PDF_BYTES;
+}
+
+/** True for a number JavaScript prints in exponent form: no bounded plain decimal exists. */
+export function isExponentNumber(value: number): boolean {
+  return String(value).includes('e');
+}
+
+/**
+ * A page box [llx, lly, urx, ury] in points as the composer places fields on it: each
+ * coordinate in whole centipoints (1/100 point), rounded to the nearest. The composer
+ * gives every page its box with this function (report.ts), and T007's prepare check
+ * passes the stored MediaBox through it to placeField() (request #46).
+ */
+export function centipointBox(box: readonly [number, number, number, number]): CentipointBox {
+  return Object.freeze([Math.round(box[0] * 100), Math.round(box[1] * 100), Math.round(box[2] * 100), Math.round(box[3] * 100)] as const);
+}
+
+/** True when the composer can place fields on a page box: every coordinate within MAX_BOX_COORDINATE and each side at least one centipoint. */
+function sealableBox(box: readonly number[]): boolean {
+  if (box.length !== 4 || !box.every((coordinate) => typeof coordinate === 'number' && Number.isFinite(coordinate) && Math.abs(coordinate) <= MAX_BOX_COORDINATE)) return false;
+  const [llx, lly, urx, ury] = centipointBox(box as unknown as readonly [number, number, number, number]);
+  return urx - llx >= 1 && ury - lly >= 1;
+}
+
+const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => typeof value === 'object' && value !== null && !Array.isArray(value);
+/** An own property only: an inherited one (from Object.prototype) is never a PDF entry. */
+const own = (record: Readonly<Record<string, unknown>>, key: string): unknown => (Object.hasOwn(record, key) ? record[key] : undefined);
+
+/** The single own key of a JSON-form wrapper ({name}, {hex}, {ref}, {dict}), or undefined. */
+function wrapped(value: unknown, key: string): unknown {
+  if (!isRecord(value)) return undefined;
+  const keys = Object.keys(value);
+  return keys.length === 1 && keys[0] === key ? value[key] : undefined;
+}
+
+/** A reference as the composer reads one (syntax.ts refValue), or null. */
+function refOf(value: unknown): ObjectRef | null {
+  const ref = wrapped(value, 'ref');
+  if (!Array.isArray(ref) || ref.length !== 2) return null;
+  const [num, gen] = ref as [unknown, unknown];
+  return typeof num === 'number' && typeof gen === 'number' && Number.isSafeInteger(num) && num >= 1 && Number.isSafeInteger(gen) && gen >= 0 && gen <= 65535
+    ? [num, gen]
+    : null;
+}
+
+/** A dictionary's entries as the composer reads them (syntax.ts dictEntries), or null. */
+function dictOf(value: unknown): Readonly<Record<string, unknown>> | null {
+  const dict = wrapped(value, 'dict');
+  return isRecord(dict) ? dict : null;
+}
+
+/**
+ * Whether a value holds an exponent-form number anywhere (iterative walk). With `skip`,
+ * `value` is a dictionary's entries and those keys are not walked: the entries the
+ * composer replaces. Every other key, `__proto__` included, is walked as data.
+ */
+function holdsExponentNumber(value: unknown, skip: readonly string[] = []): boolean {
+  const stack: unknown[] = [];
+  if (isRecord(value)) {
+    for (const key of Object.keys(value)) if (!skip.includes(key)) stack.push(value[key]);
+  } else {
+    stack.push(value);
+  }
+  while (stack.length > 0) {
+    const item = stack.pop();
+    if (typeof item === 'number') {
+      if (isExponentNumber(item)) return true;
+    } else if (Array.isArray(item)) {
+      for (const inner of item) stack.push(inner);
+    } else if (isRecord(item)) {
+      for (const key of Object.keys(item)) stack.push(item[key]);
+    }
+  }
+  return false;
+}
+
+/** Whether a reported value holds a NUL in a name or in a dictionary key (iterative walk). */
+function holdsNulName(value: unknown): boolean {
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const item = stack.pop();
+    if (Array.isArray(item)) {
+      for (const inner of item) stack.push(inner);
+    } else if (isRecord(item)) {
+      const name = wrapped(item, 'name');
+      if (typeof name === 'string') {
+        if (name.includes('\u0000')) return true;
+        continue;
+      }
+      const dict = dictOf(item);
+      for (const key of Object.keys(dict ?? item)) {
+        if (dict !== null && key.includes('\u0000')) return true;
+        stack.push((dict ?? item)[key]);
+      }
+    }
+  }
+  return false;
+}
+
+/** The worst-case composed size and every report-only refusal of a document (see the header). */
+export function estimateSealedSize(report: SealableReport): SealedSizeEstimate {
+  const objects = report.objects;
+  const found = (ref: ObjectRef | null): { readonly gen: number; readonly value: unknown } | undefined => {
+    if (ref === null) return undefined;
+    const key = String(ref[0]);
+    const object = Object.hasOwn(objects, key) ? objects[key] : undefined;
+    return object !== undefined && object.gen === ref[1] ? object : undefined;
+  };
+  const jsonSizes = new Map<number, number>();
+  const jsonSize = (ref: ObjectRef | null): number => {
+    const object = found(ref);
+    if (ref === null || object === undefined) return 0;
+    let size = jsonSizes.get(ref[0]);
+    if (size === undefined) {
+      size = Buffer.byteLength(JSON.stringify(object.value) ?? '', 'utf8');
+      jsonSizes.set(ref[0], size);
+    }
+    return size;
+  };
+
+  const findings = new Map<SealRefusalDetail, Map<number, ObjectRef>>();
+  const refuse = (detail: SealRefusalDetail, ref: ObjectRef | null): void => {
+    let refs = findings.get(detail);
+    if (refs === undefined) {
+      refs = new Map();
+      findings.set(detail, refs);
+    }
+    if (ref !== null && !refs.has(ref[0])) refs.set(ref[0], [ref[0], ref[1]]);
+  };
+  /** Values the composer writes, each with the object it is written from and the keys it replaces. */
+  const written: Array<readonly [ObjectRef, unknown, readonly string[]]> = [];
+  /** Array objects already queued (a shared array is walked once, whatever its holders). */
+  const queuedArrays = new Set<number>();
+  /**
+   * An array the composer copies inline from `holder` (mergedArray): absent or null adds
+   * nothing; a reference must name an array object; anything else must be an array.
+   * Returns the referenced array's object, if any, and the size of its copy.
+   */
+  const copied = (value: unknown, holder: ObjectRef, shape: 'annots_shape' | 'acroform_shape'): { readonly ref: ObjectRef | null; readonly bytes: number } => {
+    if (value === undefined || value === null) return { ref: null, bytes: 0 };
+    const ref = refOf(value);
+    if (ref !== null) {
+      const object = found(ref);
+      if (object === undefined) refuse('dangling_form_reference', holder);
+      else if (!Array.isArray(object.value)) refuse(shape, holder);
+      else {
+        if (!queuedArrays.has(ref[0])) {
+          queuedArrays.add(ref[0]);
+          written.push([ref, object.value, []]);
+        }
+        return { ref, bytes: 3 * jsonSize(ref) };
+      }
+      return { ref: null, bytes: 0 };
+    }
+    if (Array.isArray(value)) written.push([holder, value, []]);
+    else refuse(shape, holder);
+    return { ref: null, bytes: 0 };
+  };
+
+  // The catalog and the AcroForm (compose.ts, in the same order).
+  const root = report.trailer.root;
+  const counted = new Map<number, ObjectRef>([[root[0], root]]);
+  let fixed = 3 * jsonSize(root) + REWRITE_OVERHEAD_BYTES;
+  const catalog = dictOf(found(root)?.value) ?? {};
+  const formValue = own(catalog, 'AcroForm');
+  const hasForm = formValue !== undefined && formValue !== null;
+  let formObject: ObjectRef | null = null;
+  if (!hasForm) {
+    written.push([root, catalog, ['AcroForm']]);
+  } else {
+    const formRef = refOf(formValue);
+    let form: Readonly<Record<string, unknown>> | null = null;
+    let holder: ObjectRef = root;
+    if (formRef !== null) {
+      const object = found(formRef);
+      if (object === undefined) refuse('dangling_form_reference', root);
+      else {
+        form = dictOf(object.value);
+        if (form === null) refuse('acroform_shape', root);
+        else {
+          formObject = formRef;
+          holder = formRef;
+          counted.set(formRef[0], formRef);
+          fixed += 3 * jsonSize(formRef) + REWRITE_OVERHEAD_BYTES;
+        }
+      }
+    } else {
+      form = dictOf(formValue);
+      if (form === null) refuse('acroform_shape', root);
+      else written.push([root, catalog, ['AcroForm']]);
+    }
+    if (form !== null) {
+      written.push([holder, form, ['Fields', 'SigFlags']]);
+      const fields = copied(own(form, 'Fields'), holder, 'acroform_shape');
+      fixed += fields.bytes;
+      if (fields.ref !== null) counted.set(fields.ref[0], fields.ref);
+    }
+  }
+
+  // Every page, as a possible widget page.
+  const pageCosts = report.pages.map((page) => {
+    if (!sealableBox(page.media_box) || !sealableBox(page.crop_box)) refuse('page_box', page.ref);
+    if (formObject !== null && page.ref[0] === formObject[0]) refuse('acroform_shape', formObject);
+    const entries = dictOf(found(page.ref)?.value) ?? {};
+    written.push([page.ref, entries, ['Annots']]);
+    const annots = copied(own(entries, 'Annots'), page.ref, 'annots_shape');
+    return { ref: page.ref, annots: annots.ref, bytes: 3 * jsonSize(page.ref) + REWRITE_OVERHEAD_BYTES + annots.bytes };
+  });
+  pageCosts.sort((a, b) => b.bytes - a.bytes || a.ref[0] - b.ref[0]);
+  let pages = 0;
+  for (const cost of pageCosts.slice(0, MAX_FIELD_VALUES)) {
+    pages += cost.bytes;
+    counted.set(cost.ref[0], cost.ref);
+    if (cost.annots !== null) counted.set(cost.annots[0], cost.annots);
+  }
+  const id = report.trailer.id === null ? 0 : report.trailer.id[0].length + 2;
+  const worstCaseBytes = report.bytes + 1 + UPDATE_REQUEST_BOUND + fixed + pages + id;
+  const exceedsBound = worstCaseBytes > MAX_SEALED_PDF_BYTES;
+  if (exceedsBound) for (const ref of counted.values()) refuse('composition_too_large', ref);
+
+  for (const [ref, value, skip] of written) if (holdsExponentNumber(value, skip)) refuse('number_range', ref);
+
+  // The largest request's new objects (compose.ts): a font, an appearance and a widget per
+  // field, the seal field and the signature, a new AcroForm, and a cross-reference stream.
+  const newObjects = 1 + 2 * MAX_FIELD_VALUES + 2 + (hasForm ? 0 : 1) + (report.xref.kind === 'stream' ? 1 : 0);
+  if (report.xref.size - 1 + newObjects > MAX_OBJECT_NUMBER) refuse('xref_size', null);
+
+  for (const key of Object.keys(objects)) {
+    const object = objects[key];
+    if (object !== undefined && holdsNulName(object.value)) refuse('name_character', [Number(key), object.gen]);
+  }
+
+  const refusals: SealRefusal[] = [];
+  for (const detail of SEAL_REFUSAL_DETAILS) {
+    const refs = findings.get(detail);
+    if (refs === undefined) continue;
+    const sorted = [...refs.values()].sort((a, b) => a[0] - b[0]);
+    refusals.push(Object.freeze({ detail, refs: Object.freeze(sorted) }));
+  }
+  return Object.freeze({ worstCaseBytes, exceedsBound, refusals: Object.freeze(refusals) });
+}
