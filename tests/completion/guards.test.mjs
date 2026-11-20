@@ -162,3 +162,41 @@ test('[FEN-07] final_artifacts.approval_evidence_digest is required on insert, 6
     world.close();
   }
 });
+
+test('[FEN-09] the published artifact_id under another envelope and a takeover of the artifact’s rowid are refused by the key guard, by INSERT and INSERT OR REPLACE alike; the published row stays byte for byte', () => {
+  const world = makeWorld();
+  try {
+    const { envelopeId } = published(world);
+    // A second envelope leased at attempt 1, so 0005's fencing trigger, the digest triggers and the foreign key pass and only the key guard decides.
+    const second = seedFinalizing(world).envelopeId;
+    lease(world, second, 'runner-b');
+    const raw = new DatabaseSync(world.dbPath);
+    try {
+      raw.exec('PRAGMA busy_timeout = 5000');
+      const before = rowsOf(raw, 'final_artifacts');
+      assert.equal(before.length, 1, `premise: one published artifact (${rowids(before)})`);
+      const [stored] = before;
+      // (1) A repeat of (tenant_id, artifact_id) under the second envelope (finding F-1).
+      for (const verb of ['INSERT', 'INSERT OR REPLACE', 'REPLACE', 'INSERT OR IGNORE']) {
+        refusedByTrigger(raw, replay(raw, 'final_artifacts', 'envelope_id = ?', [envelopeId], { envelope_id: second }, verb), [], /final_artifacts key exists/);
+        sameRows(raw, 'final_artifacts', before, `${verb} of artifact ${stored.artifact_id} under ${second}`);
+      }
+      // (2) A rowid takeover: the stored rowid under a new artifact_id and the second envelope.
+      const columns = raw
+        .prepare('PRAGMA table_info(final_artifacts)')
+        .all()
+        .map((column) => column.name)
+        .join(', ');
+      for (const verb of ['INSERT', 'INSERT OR REPLACE']) {
+        replay(raw, 'final_artifacts', 'envelope_id = ?', [envelopeId], { envelope_id: second, artifact_id: sid('art') }, verb);
+        refusedByTrigger(raw, `${verb} INTO main.final_artifacts (rowid, ${columns}) SELECT ?, ${columns} FROM temp.replayed`, [stored.stored_rowid], /final_artifacts key exists/);
+        sameRows(raw, 'final_artifacts', before, `${verb} taking rowid ${stored.stored_rowid} under ${second}`);
+      }
+      raw.exec('DROP TABLE IF EXISTS temp.replayed');
+    } finally {
+      raw.close();
+    }
+  } finally {
+    world.close();
+  }
+});

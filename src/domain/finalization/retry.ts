@@ -16,16 +16,23 @@
 //    caller's expected_version (409 version_conflict). The retry changes the
 //    job, never the envelope, so the envelope version stays the reserved
 //    version that the publish compares against.
-// 4. The job moves to `retryable`, due now, only from `retryable` or
-//    `failed`; any other status, or no job, is 409
-//    finalization_not_retryable. From `failed` at the limit, max_attempts
-//    rises by exactly one (request #59 (4)); once that would pass 100 the
-//    answer is 409 finalization_not_retryable with detail { field:
-//    'envelope', code: 'attempt_ceiling' }. attempt_count is never written,
-//    and no approval is created.
-// 5. The audit event `envelope.finalization_retried`, with the operator as
-//    actor and the metadata envelope_version, attempt_count and max_attempts.
-// 6. The 202 Envelope body and its idempotency record.
+// 4. The retry is accepted only from `retryable` or `failed`; any other
+//    status, or no job, is 409 finalization_not_retryable. From `failed` at
+//    the limit, max_attempts rises by exactly one (request #59 (4)); once that
+//    would pass 100 the answer is 409 finalization_not_retryable with detail
+//    { field: 'envelope', code: 'attempt_ceiling' }. The job is written only
+//    on an actual transition (request #80 (1), row RETRY-BOUND): the limit
+//    raised, `failed` made `retryable`, or a later retry_at brought forward,
+//    each leaving the job `retryable` and due now. A job already `retryable`
+//    and due is left as it is. attempt_count is never written, and no
+//    approval is created.
+// 5. Only on that transition, the audit event `envelope.finalization_retried`,
+//    with the operator as actor and the metadata envelope_version,
+//    attempt_count and max_attempts. So each attempt is followed by at most
+//    one retried event.
+// 6. The 202 Envelope body, the envelope as it stands, and its idempotency
+//    record; a retry that changed nothing answers the same way, and its key
+//    replays that answer.
 // A refusal at any step throws inside the transaction: nothing is written.
 
 import { canonicalBytes, type JsonValue } from '../../domain/canonical/index.ts';
@@ -113,14 +120,16 @@ export function retryFinalization(db: Database, audit: AuditWriter, request: Ret
         outcome.reason === 'attempt-ceiling' ? [ATTEMPT_CEILING_DETAIL] : [],
       );
     }
-    const job = readJob(store, request.envelopeId);
-    if (job === undefined) throw new FinalizationError('internal', 'the retried job is missing');
-    audit.append(request.tenantId, {
-      type: FINALIZATION_RETRIED,
-      actor: { kind: request.actor.kind, ref: request.actor.ref },
-      envelopeId: request.envelopeId,
-      metadata: { envelope_version: aggregate.envelope.version, attempt_count: job.attemptCount, max_attempts: job.maxAttempts },
-    });
+    if (outcome.kind === 'scheduled') {
+      const job = readJob(store, request.envelopeId);
+      if (job === undefined) throw new FinalizationError('internal', 'the retried job is missing');
+      audit.append(request.tenantId, {
+        type: FINALIZATION_RETRIED,
+        actor: { kind: request.actor.kind, ref: request.actor.ref },
+        envelopeId: request.envelopeId,
+        metadata: { envelope_version: aggregate.envelope.version, attempt_count: job.attemptCount, max_attempts: job.maxAttempts },
+      });
+    }
     const refreshed = loadEnvelope(store, request.envelopeId);
     if (refreshed === undefined) throw new FinalizationError('internal', 'the retried envelope is missing');
     const body = envelopeView(refreshed, null);

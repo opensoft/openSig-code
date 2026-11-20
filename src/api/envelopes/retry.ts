@@ -13,8 +13,9 @@
 // validated: a complete body that is not JSON under a key this principal
 // already used is 409 idempotency_conflict. The domain operation
 // (src/domain/finalization/retry.ts) resolves the key, the body, the envelope,
-// the version and the job in one transaction, audits the retry and returns the
-// exact response bytes, replayed byte for byte.
+// the version and the job in one transaction, audits a retry that makes an
+// actual transition (A-010 request #80 (1)) and returns the exact response
+// bytes, replayed byte for byte.
 //
 // Installation (row ARTIFACT-ROUTES): T038 exports FINALIZATION_HANDLERS and
 // withFinalizationHandlers() and installs nothing; ROUTES keeps

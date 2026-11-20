@@ -18,7 +18,8 @@
 // Bounds (0004): attempt_count only grows (signing_jobs_monotonic), never
 // exceeds max_attempts, and max_attempts stays in 1..100. The fencing token is
 // the attempt_count at lease grant. A retry from `failed` at the limit raises
-// max_attempts by update (A-010, request #28); it never touches attempt_count.
+// max_attempts by update (A-010, request #28); it never touches attempt_count,
+// and a retry that makes no transition writes nothing (request #80 (1)).
 // last_error_code holds a code only: the contract's 60-character limit is
 // enforced here, because 0004 allows 64 (row P13).
 //
@@ -100,8 +101,17 @@ export type FailureOutcome = 'retryable' | 'failed' | 'lease-lost';
 export type ReclaimOutcome = 'retryable' | 'failed' | 'not-expired';
 
 export type RetryRefusal = 'not-reserved' | 'not-retryable' | 'attempt-ceiling' | 'conflict';
+/** The actual transition an accepted retry makes (A-010 request #80 (1)). */
+export type RetryTransition = 'raised' | 'from-failed' | 'brought-forward';
 export type RetryOutcome =
-  | { readonly kind: 'scheduled'; readonly from: 'retryable' | 'failed'; readonly maxAttempts: number; readonly retryAt: string }
+  | {
+      readonly kind: 'scheduled';
+      readonly from: 'retryable' | 'failed';
+      readonly transition: RetryTransition;
+      readonly maxAttempts: number;
+      readonly retryAt: string;
+    }
+  | { readonly kind: 'unchanged'; readonly maxAttempts: number; readonly retryAt: string | null }
   | { readonly kind: 'refused'; readonly reason: RetryRefusal };
 
 function stored(column: string): StorageUsageError {
@@ -344,10 +354,18 @@ export function reclaimExpiredLease(store: TenantStore, envelopeId: string, now:
 
 /**
  * The job half of retryFinalization: allowed only from `retryable` or
- * `failed` (data-model.md § Transitions and races, item 3). The job becomes
- * `retryable`, due now. From `failed` at the attempt limit, max_attempts is
- * raised by RETRY_RAISE within 0004's 1..100 (request #28); at 100 the retry
- * is refused. attempt_count is never written.
+ * `failed` (data-model.md § Transitions and races, item 3); at 100 attempts
+ * the retry is refused. It writes the job only on an actual transition (A-010
+ * request #80 (1), row RETRY-BOUND):
+ * - at the attempt limit, max_attempts is raised by RETRY_RAISE within
+ *   0004's 1..100 (request #28);
+ * - from `failed`, the job becomes `retryable`;
+ * - from `retryable` with retry_at later than now, retry_at is brought
+ *   forward.
+ * Each makes the job `retryable`, due now. Otherwise the job is already
+ * `retryable` and due: 'unchanged', and nothing is written. The test and the
+ * write run in the caller's one transaction, so concurrent retries serialize
+ * and at most one of them transitions. attempt_count is never written.
  */
 export function retryJob(store: TenantStore, envelopeId: string, now: Date): RetryOutcome {
   const at = iso(now);
@@ -355,11 +373,17 @@ export function retryJob(store: TenantStore, envelopeId: string, now: Date): Ret
   if (job === undefined) return { kind: 'refused', reason: 'not-reserved' };
   const from = job.status;
   if (from !== 'retryable' && from !== 'failed') return { kind: 'refused', reason: 'not-retryable' };
-  let maxAttempts = job.maxAttempts;
-  if (job.attemptCount >= job.maxAttempts) {
-    if (job.attemptCount + RETRY_RAISE > MAX_ATTEMPTS_CEILING) return { kind: 'refused', reason: 'attempt-ceiling' };
-    maxAttempts = job.attemptCount + RETRY_RAISE;
-  }
+  const atLimit = job.attemptCount >= job.maxAttempts;
+  if (atLimit && job.attemptCount + RETRY_RAISE > MAX_ATTEMPTS_CEILING) return { kind: 'refused', reason: 'attempt-ceiling' };
+  const transition: RetryTransition | null = atLimit
+    ? 'raised'
+    : from === 'failed'
+      ? 'from-failed'
+      : job.retryAt !== null && job.retryAt > at
+        ? 'brought-forward'
+        : null;
+  if (transition === null) return { kind: 'unchanged', maxAttempts: job.maxAttempts, retryAt: job.retryAt };
+  const maxAttempts = transition === 'raised' ? job.attemptCount + RETRY_RAISE : job.maxAttempts;
   const scheduled = store.compareAndSet(
     'signing_jobs',
     { envelope_id: envelopeId, status: from, attempt_count: job.attemptCount },
@@ -367,7 +391,7 @@ export function retryJob(store: TenantStore, envelopeId: string, now: Date): Ret
     { status: 'retryable', max_attempts: maxAttempts, retry_at: at, updated_at: at },
   );
   if (!scheduled) return { kind: 'refused', reason: 'conflict' };
-  return { kind: 'scheduled', from, maxAttempts, retryAt: at };
+  return { kind: 'scheduled', from, transition, maxAttempts, retryAt: at };
 }
 
 /** Envelope ids of claimable jobs: pending, then retryable and due (bounded). */

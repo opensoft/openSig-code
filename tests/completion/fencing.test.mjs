@@ -9,8 +9,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { DEFAULT_LEASE_MS, reclaimExpiredLease } from '../../src/storage/repositories/jobs.ts';
-import { assertUnchanged, lease, publish, refusedWith, takeOver } from './support/steps.mjs';
+import { DEFAULT_LEASE_MS, LEASE_EXPIRED_ERROR_CODE, leaseHeld, listExpiredLeases, reclaimExpiredLease, retryDelayMs } from '../../src/storage/repositories/jobs.ts';
+import { assertUnchanged, holderOf, lease, publish, refusedWith, takeOver } from './support/steps.mjs';
 import { assembleAttempt, makeWorld, RESERVED_VERSION, seedFinalizing, snapshot } from './support/world.mjs';
 
 test('[FEN-01] a stale fencing token publishes nothing after another attempt took over; the current token publishes', () => {
@@ -119,6 +119,44 @@ test('[FEN-05] publication requires a running job under the attempt’s unexpire
     );
     assert.throws(() => publish(world, reclaimedHolder, assembledSecond), refusedWith('fence'));
     assertUnchanged(world, second.envelopeId, beforeSecond, `the lease loser, attempt ${reclaimedHolder.fencingToken}, wrote nothing`);
+  } finally {
+    world.close();
+  }
+});
+
+test('[FEN-05] a reclaim needs lease_expires_at at or before now: 1 ms before the expiry it reclaims nothing and the lease still holds; at exactly the expiry the lease no longer holds and the reclaim succeeds (request #59 (11))', () => {
+  const world = makeWorld();
+  try {
+    const { envelopeId } = seedFinalizing(world);
+    const grant = lease(world, envelopeId, 'runner-a');
+    const tx = (fn) => world.db.transaction(fn);
+
+    world.clock.advance(DEFAULT_LEASE_MS - 1);
+    const justBefore = world.clock.iso();
+    const before = snapshot(world, envelopeId);
+    const early = tx(() => reclaimExpiredLease(world.store, envelopeId, world.clock.now()));
+    assert.equal(early, 'not-expired', `at ${justBefore}, 1 ms before the expiry ${grant.leaseExpiresAt}, the reclaim answered ${early}`);
+    assertUnchanged(world, envelopeId, before, `the reclaim at ${justBefore} wrote nothing`);
+    const heldEarly = leaseHeld(world.store, holderOf(grant), world.clock.now());
+    const listedEarly = listExpiredLeases(world.store, world.clock.now(), 10).includes(envelopeId);
+    assert.deepEqual([heldEarly, listedEarly], [true, false], `at ${justBefore}: the lease holds ${heldEarly}, listed as expired ${listedEarly}`);
+
+    world.clock.advance(1);
+    assert.equal(world.clock.iso(), grant.leaseExpiresAt, `premise: now ${world.clock.iso()} is the expiry ${grant.leaseExpiresAt}`);
+    const heldAt = leaseHeld(world.store, holderOf(grant), world.clock.now());
+    const listedAt = listExpiredLeases(world.store, world.clock.now(), 10).includes(envelopeId);
+    assert.deepEqual([heldAt, listedAt], [false, true], `at the expiry ${grant.leaseExpiresAt}: the lease holds ${heldAt}, listed as expired ${listedAt}`);
+    // #59 (11): a lease holds only while lease_expires_at is later than now, and a reclaim needs it at or
+    // before now. With attempt 1 of 5 used, the reclaimed job is retryable, its token kept.
+    const reclaimed = tx(() => reclaimExpiredLease(world.store, envelopeId, world.clock.now()));
+    assert.equal(reclaimed, 'retryable', `at exactly the expiry ${grant.leaseExpiresAt} the reclaim answered ${reclaimed}; #59 (11) and the code define retryable (attempt 1 of 5)`);
+    const job = snapshot(world, envelopeId).job;
+    const retryAt = new Date(world.clock.now().getTime() + retryDelayMs(1)).toISOString();
+    assert.deepEqual(
+      [job.status, job.fencing_token, job.lease_owner, job.last_error_code, job.retry_at],
+      ['retryable', grant.fencingToken, null, LEASE_EXPIRED_ERROR_CODE, retryAt],
+      `reclaimed job ${job.status}, attempt ${job.fencing_token}, owner ${job.lease_owner}, ${job.last_error_code}, retry_at ${job.retry_at} (expected ${retryAt})`,
+    );
   } finally {
     world.close();
   }

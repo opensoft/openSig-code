@@ -20,8 +20,13 @@
 //   every later step. A lost attempt writes nothing more: no failure record,
 //   no checkpoint, no publication. Safety never rests on this timing: every
 //   write of the attempt carries the lease predicate in its WHERE clause.
+// - Stop. abort() takes the same path with the cause 'stopped', for the
+//   runner's stop() (A-010 request #80 (3), row RUNNER-STOP): the lease row
+//   is still valid, but checkHeld() refuses every later step, so the attempt
+//   writes nothing more and its job is reclaimed at the lease expiry, as
+//   after a crash.
 
-export type LeaseLossCause = 'fenced' | 'deadline';
+export type LeaseLossCause = 'fenced' | 'deadline' | 'stopped';
 
 export class LeaseLost extends Error {
   readonly lossCause: LeaseLossCause;
@@ -102,6 +107,11 @@ export class LeaseKeeper {
     this.#stopped = true;
     if (this.#handle !== undefined) this.#timers.clearTimeout(this.#handle);
     this.#handle = undefined;
+  }
+
+  /** Abort the attempt as a lease loss does, with the cause 'stopped'; a second call, or one after a loss, changes nothing. */
+  abort(): void {
+    if (this.#lossCause === null) this.#lose('stopped');
   }
 
   /** Throws LeaseLost when the lease is lost or its local deadline has passed. */

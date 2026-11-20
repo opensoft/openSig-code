@@ -250,8 +250,10 @@ export function reportBytesFor({ artifactDigest, approvalEvidenceDigest, verifie
  * The pre-publication steps of one attempt, with landed APIs only: the seal
  * anchor (once per envelope), synthetic stored blobs, the completion
  * checkpoint (once per envelope; a later attempt reuses it) and a report.
+ * With `checkpoint: false` no checkpoint is written, and the receipt head is
+ * a well-formed head that no checkpoint records (publish step 3's refusal).
  */
-export function assembleAttempt(world, envelopeId, label = 'attempt') {
+export function assembleAttempt(world, envelopeId, label = 'attempt', { checkpoint = true } = {}) {
   const { db, audit, blobs, tenantId, store } = world;
   const pdf = blobs.put(tenantId, syntheticBytes(`pdf-${envelopeId}-${label}`));
   const evidence = blobs.put(tenantId, syntheticBytes(`evidence-${envelopeId}-${label}`));
@@ -260,6 +262,7 @@ export function assembleAttempt(world, envelopeId, label = 'attempt') {
     if (store.count('audit_events', { envelope_id: envelopeId, type: 'envelope.seal_started' }) === 0) {
       audit.append(tenantId, { type: 'envelope.seal_started', actor: { kind: 'system', ref: 'finalization-runner' }, envelopeId, metadata: { attempt: 1 } });
     }
+    if (!checkpoint) return { seq: 1, digest: hex(`no-checkpoint-${envelopeId}`) };
     const existing = getCompletionCheckpoint(store, envelopeId);
     if (existing !== undefined) return existing;
     const written = audit.checkpointCompletion(tenantId, envelopeId);

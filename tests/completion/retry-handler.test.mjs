@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The retryFinalization handler's T038 half (row ARTIFACT-ROUTES; FEN-03).
-// T038 exports the handler and installs nothing: ROUTES keeps the route at
-// 501 until the T031 US2 composition slot installs it (and amends SEC-04).
+// T038 exports the handler and the installer; it installs nothing, which its
+// scope check shows (it leaves src/api/routes.ts alone), and the T031 US2
+// composition slot's SEC-04 and SEC-05 assert the installed handler (A-010
+// request #80 (2), row FEN03-ROUTES), so this file does not read ROUTES.
 // FinalizationRetryApi maps the domain's FinalizationError to the contract's
 // status, code and details. Synthetic data only.
 
@@ -10,7 +12,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { FINALIZATION_HANDLERS, FinalizationRetryApi, retryFinalizationHandler, withFinalizationHandlers } from '../../src/api/envelopes/retry.ts';
-import { CONTRACT_ROUTES, ROUTES } from '../../src/api/routes.ts';
+import { CONTRACT_ROUTES } from '../../src/api/routes.ts';
 import { HttpError } from '../../src/server/types.ts';
 import { fail, lease } from './support/steps.mjs';
 import { makeWorld, RESERVED_VERSION, seedFinalizing } from './support/world.mjs';
@@ -19,16 +21,16 @@ function principal(world, kind = 'human-operator') {
   return { scheme: 'operator', tenant_id: world.tenantId, kind, roles: ['tenant_admin'], scopes: ['finalization:retry'], ref: 'admin-1', issuer: 'https://issuer.example.test', expires_at: Math.floor(world.clock.now().getTime() / 1000) + 600 };
 }
 
-test('[FEN-03] T038 installs no route: ROUTES keeps retryFinalization at 501, and withFinalizationHandlers installs exactly that one handler', () => {
+test('[FEN-03] FINALIZATION_HANDLERS holds exactly the retryFinalization handler, and withFinalizationHandlers installs exactly that one handler over the contract routes', () => {
   assert.deepEqual(Object.keys(FINALIZATION_HANDLERS), ['retryFinalization'], `handlers ${JSON.stringify(Object.keys(FINALIZATION_HANDLERS))}`);
-  const served = ROUTES.find((definition) => definition.operationId === 'retryFinalization');
-  assert.equal(served.handler, null, `ROUTES serves retryFinalization with ${served.handler === null ? 'no handler' : 'a handler'} (the T031 slot installs it)`);
   const installed = withFinalizationHandlers(CONTRACT_ROUTES);
   assert.equal(installed.length, CONTRACT_ROUTES.length, `${installed.length} routes from ${CONTRACT_ROUTES.length}`);
   installed.forEach((definition, index) => {
     if (definition.operationId === 'retryFinalization') assert.equal(definition.handler, retryFinalizationHandler, 'retryFinalization gets T038 handler');
     else assert.equal(definition, CONTRACT_ROUTES[index], `${definition.operationId} (route ${index}) is untouched`);
   });
+  const handled = installed.filter((definition) => definition.handler === retryFinalizationHandler).map((definition) => definition.operationId);
+  assert.deepEqual(handled, ['retryFinalization'], `routes given T038's handler: ${JSON.stringify(handled)}`);
 });
 
 test('[FEN-03] FinalizationRetryApi answers 202 with the exact bytes, replays them, and maps refusals to the contract’s status, code and details', () => {

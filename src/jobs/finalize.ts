@@ -37,6 +37,19 @@
 // Reclaim: runOnce first reclaims strictly expired leases (reclaimLease), so a
 // crashed attempt's job becomes retryable, or `failed` at the limit with its
 // one announcement (request #61 (5)).
+// Stop (A-010 request #80 (3), row RUNNER-STOP): stop() starts no further run
+// or attempt and aborts an attempt in flight through its lease keeper's abort
+// path (LeaseKeeper.abort(), cause 'stopped'), so the verify worker is
+// terminated and the seal child killed through the keeper's signal; it
+// resolves once that attempt and the scheduled run have unwound. Every
+// durable write of an attempt follows a keeper.checkHeld() with no await
+// between them, and an abort can take effect only at an await, so the aborted
+// attempt writes nothing more although its lease row is still valid; it
+// records no failure (the catch below), and its job is reclaimed at the lease
+// expiry, as after a crash. The stopped attempt counts as an attempt.
+// Run errors (A-010 request #81 (7), row RUN-ERRORS): a scheduled run that
+// rejects is passed to the optional onError, as T010's ExpirySweeper does,
+// and the loop carries on; an onError that throws is contained.
 //
 // Settings: the T031 US2 composition slot reads and validates
 // OPENSIG_SEAL_KEY_FILE, OPENSIG_SEAL_CERT_FILE and OPENSIG_TRUST_ANCHORS_FILE
@@ -101,6 +114,8 @@ export interface FinalizationRunnerOptions {
   readonly newId?: (prefix: string) => string;
   readonly newEventId?: () => string;
   readonly claimsPerTenant?: number;
+  /** Called with a scheduled run's rejection (request #81 (7)); the next interval runs again. */
+  readonly onError?: (error: unknown) => void;
 }
 
 export type AttemptOutcome =
@@ -143,18 +158,35 @@ export class FinalizationRunner {
   readonly #o: FinalizationRunnerOptions;
   readonly #leaseMs: number;
   #timer: ReturnType<typeof setTimeout> | undefined = undefined;
-  #running = false;
+  /** The scheduled run in flight (start()), settled once it has unwound. */
+  #run: Promise<void> | undefined = undefined;
+  #stopping = false;
+  /** The lease keepers and the promises of the attempts in flight, for stop(). */
+  readonly #keepers = new Set<LeaseKeeper>();
+  readonly #attempts = new Set<Promise<AttemptOutcome>>();
 
   constructor(options: FinalizationRunnerOptions) {
     if (typeof options?.clock !== 'function') throw new TypeError('the finalization runner needs an injected clock');
     if (options.buildPackage !== undefined && typeof options.buildPackage !== 'function') throw new TypeError('the package builder must be a function');
+    if (options.onError !== undefined && typeof options.onError !== 'function') throw new TypeError('onError must be a function');
     if (!(options.seal?.certificateDer instanceof Uint8Array) || typeof options.seal.keyFile !== 'string') throw new TypeError('the finalization runner needs the seal settings');
     this.#o = options;
     this.#leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
   }
 
-  /** One attempt on one envelope's job, if it is claimable now (the runner's test entry). */
-  async runAttempt(tenantId: string, envelopeId: string): Promise<AttemptOutcome> {
+  /** One attempt on one envelope's job, if it is claimable now (the runner's test entry); after stop(), none is claimed. */
+  runAttempt(tenantId: string, envelopeId: string): Promise<AttemptOutcome> {
+    if (this.#stopping) return Promise.resolve<AttemptOutcome>({ kind: 'not-claimed' });
+    const attempt = this.#runAttempt(tenantId, envelopeId);
+    this.#attempts.add(attempt);
+    const settled = (): void => {
+      this.#attempts.delete(attempt);
+    };
+    attempt.then(settled, settled);
+    return attempt;
+  }
+
+  async #runAttempt(tenantId: string, envelopeId: string): Promise<AttemptOutcome> {
     const o = this.#o;
     const store = o.db.forTenant(tenantId);
     const grant = o.db.transaction(() => grantLease(store, envelopeId, { owner: o.owner, now: o.clock(), leaseMs: this.#leaseMs }));
@@ -169,6 +201,7 @@ export class FinalizationRunner {
       clock: o.clock,
       timers: o.timers,
     });
+    this.#keepers.add(keeper);
     keeper.start();
     let stage: FailureStage = 'manifest';
     try {
@@ -182,6 +215,7 @@ export class FinalizationRunner {
       return outcome === 'lease-lost' ? { kind: 'lost' } : { kind: outcome, errorCode: verdict.errorCode };
     } finally {
       keeper.stop();
+      this.#keepers.delete(keeper);
     }
   }
 
@@ -322,6 +356,8 @@ export class FinalizationRunner {
     let reclaimed = 0;
     const attempts: { tenantId: string; envelopeId: string; outcome: AttemptOutcome['kind'] }[] = [];
     for (const tenantId of o.db.listTenantIds()) {
+      // After stop(), no further tenant is reclaimed or claimed (runAttempt also claims nothing).
+      if (this.#stopping) break;
       const store = o.db.forTenant(tenantId);
       const context: StepContext = { db: o.db, audit: o.audit, tenantId, clock: o.clock, newEventId: o.newEventId };
       for (const envelopeId of listExpiredLeases(store, o.clock(), limit)) {
@@ -335,18 +371,24 @@ export class FinalizationRunner {
     return { reclaimed, attempts };
   }
 
-  /** Run on an interval, never two runs at once. The T031 US2 composition slot starts it. */
+  /**
+   * Run on an interval, never two runs at once. The T031 US2 composition slot
+   * starts it. A run that rejects goes to onError, and the next interval runs
+   * again; after stop() no tick follows, and start() does nothing.
+   */
   start(intervalMs = DEFAULT_RUN_INTERVAL_MS): void {
-    if (this.#timer !== undefined) return;
+    if (this.#timer !== undefined || this.#stopping) return;
     const tick = (): void => {
       this.#timer = setTimeout(() => {
-        if (this.#running) return tick();
-        this.#running = true;
-        this.runOnce()
-          .catch(() => undefined)
+        if (this.#run !== undefined) return tick();
+        this.#run = this.runOnce()
+          .then(
+            () => undefined,
+            (error: unknown) => this.#reportError(error),
+          )
           .finally(() => {
-            this.#running = false;
-            if (this.#timer !== undefined) tick();
+            this.#run = undefined;
+            if (this.#timer !== undefined && !this.#stopping) tick();
           });
       }, intervalMs);
       this.#timer.unref();
@@ -354,8 +396,29 @@ export class FinalizationRunner {
     tick();
   }
 
-  stop(): void {
+  /** Pass a run's rejection to onError (request #81 (7)). An onError that throws is contained: the loop outlives its observer. */
+  #reportError(error: unknown): void {
+    try {
+      this.#o.onError?.(error);
+    } catch {
+      // Contained, so the next tick is still scheduled.
+    }
+  }
+
+  /**
+   * Stop (request #80 (3)): start no further run or attempt, abort every
+   * attempt in flight through its lease keeper (the verify worker is
+   * terminated, the seal child killed), and resolve once those attempts and
+   * the scheduled run have unwound; at once when nothing is in flight. A
+   * second call is harmless. An aborted attempt writes nothing more and is
+   * reclaimed at its lease expiry, as after a crash. The T031 US2 composition
+   * slot awaits it before the database closes (SEC-16).
+   */
+  stop(): Promise<void> {
+    this.#stopping = true;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     this.#timer = undefined;
+    for (const keeper of this.#keepers) keeper.abort();
+    return Promise.allSettled([this.#run, ...this.#attempts]).then(() => undefined);
   }
 }

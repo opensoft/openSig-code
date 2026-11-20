@@ -146,3 +146,53 @@ test('[FEN-01] the lease keeper renews, survives a busy renewal before its deadl
   assert.throws(() => fenced.checkHeld(), (error) => error instanceof LeaseLost && error.lossCause === 'fenced');
   assert.equal(fencedTimers.live(), 0, `${fencedTimers.live()} renewals scheduled after the loss`);
 });
+
+test('[FEN-01] the lease keeper’s abort(), the runner’s stop() path, loses the lease as stopped: the signal aborts with LeaseLost, checkHeld() throws, no renewal stays scheduled, and a second abort, a later tick or an abort after a loss changes nothing', () => {
+  const leaseMs = 120_000;
+  const clock = makeClock();
+  const inFuture = (ms) => new Date(clock.now().getTime() + ms).toISOString();
+  let renewals = 0;
+  const timers = fakeTimers();
+  const keeper = new LeaseKeeper({
+    renew: () => {
+      renewals += 1;
+      return inFuture(leaseMs);
+    },
+    leaseExpiresAt: inFuture(leaseMs),
+    leaseMs,
+    clock: clock.now,
+    timers,
+  });
+  keeper.start();
+  keeper.checkHeld();
+  assert.equal(timers.live(), 1, `premise: ${timers.live()} renewal scheduled`);
+  keeper.abort();
+  const reason = keeper.signal.reason;
+  assert.ok(
+    keeper.signal.aborted && reason instanceof LeaseLost && reason.lossCause === 'stopped',
+    `aborted ${keeper.signal.aborted}, reason ${reason?.name} ${reason?.lossCause}`,
+  );
+  assert.equal(keeper.lossCause, 'stopped', `loss cause ${keeper.lossCause}`);
+  assert.throws(() => keeper.checkHeld(), (error) => error instanceof LeaseLost && error.lossCause === 'stopped');
+  assert.equal(timers.live(), 0, `${timers.live()} renewals scheduled after the abort`);
+  keeper.abort();
+  keeper.tick();
+  assert.deepEqual(
+    [keeper.lossCause, keeper.signal.reason === reason, renewals, timers.live()],
+    ['stopped', true, 0, 0],
+    `after a second abort and a tick: cause ${keeper.lossCause}, same reason ${keeper.signal.reason === reason}, renewals ${renewals}, scheduled ${timers.live()}`,
+  );
+
+  // A lease already lost keeps its cause.
+  const fencedTimers = fakeTimers();
+  const fenced = new LeaseKeeper({ renew: () => null, leaseExpiresAt: inFuture(leaseMs), leaseMs, clock: clock.now, timers: fencedTimers });
+  fenced.start();
+  clock.advance(leaseMs / 3);
+  fencedTimers.fire();
+  fenced.abort();
+  assert.deepEqual(
+    [fenced.lossCause, fenced.signal.reason?.lossCause],
+    ['fenced', 'fenced'],
+    `abort() after a fenced loss: cause ${fenced.lossCause}, signal reason ${fenced.signal.reason?.lossCause}`,
+  );
+});

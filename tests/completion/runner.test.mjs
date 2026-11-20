@@ -10,19 +10,31 @@
 // suite covers. The key file is a synthetic placeholder opened by the real
 // openSealKey. Synthetic data, injected clock, timers that never fire (the
 // keeper never renews; its deadline still applies).
+//
+// The T038 correction (A-010 requests #80 (3) and #81 (7); FEN-01 extended):
+// stop() aborts an attempt in flight through its lease keeper and resolves
+// once it has unwound, with nothing written after the abort and no timer left
+// (row RUNNER-STOP), and start()'s loop passes a rejected run to onError and
+// carries on (row RUN-ERRORS). FEN-08 (extended) reaches publish step 3's
+// refusal (finding F-3). The verify step there is the real runVerification
+// with a worker that never answers; the database seam only replaces a read of
+// the completion checkpoint and counts runs.
 
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
+import { SealError } from '../../src/cryptograph/worker/index.ts';
 import { canonicalBytes, canonicalDigest } from '../../src/domain/canonical/index.ts';
-import { StepFailure } from '../../src/domain/finalization/index.ts';
+import { LeaseLost, reclaimLease, runVerification, StepFailure, VERIFY_WALL_CAP_MS } from '../../src/domain/finalization/index.ts';
 import { FinalizationRunner } from '../../src/jobs/finalize.ts';
+import { StorageUsageError } from '../../src/storage/db/index.ts';
 import { getCompletionCheckpoint } from '../../src/storage/repositories/artifacts.ts';
-import { ATTEMPT_GRACE_MS, attemptCollectable, DEFAULT_LEASE_MS, listAttemptBlobs, retryDelayMs } from '../../src/storage/repositories/jobs.ts';
-import { eventsOf } from './support/steps.mjs';
-import { describe, makeWorld, reportBytesFor, RESERVED_VERSION, seedSealable, sha256, snapshot, syntheticBytes } from './support/world.mjs';
+import { ATTEMPT_GRACE_MS, attemptCollectable, DEFAULT_LEASE_MS, LEASE_EXPIRED_ERROR_CODE, listAttemptBlobs, retryDelayMs } from '../../src/storage/repositories/jobs.ts';
+import { assertUnchanged, eventsOf, lease, publish, refusedWith } from './support/steps.mjs';
+import { assembleAttempt, describe, hex, makeWorld, reportBytesFor, RESERVED_VERSION, seedFinalizing, seedSealable, sha256, snapshot, syntheticBytes } from './support/world.mjs';
 
 const NEVER = Object.freeze({ setTimeout: () => 0, clearTimeout: () => undefined });
 
@@ -45,7 +57,7 @@ function hookedBlobs(world, beforePut, check) {
   };
 }
 
-function makeRunner(world, { verify, buildPackage, beforePut = () => undefined, check } = {}) {
+function makeRunner(world, { verify, sealPdf, buildPackage, beforePut = () => undefined, check, timers = NEVER, clock = world.clock.now, db = world.db, onError } = {}) {
   const keyFile = join(world.dir, 'synthetic-seal-key');
   writeFileSync(keyFile, 'synthetic placeholder, never a key\n', { mode: 0o600 });
   const certificateDer = syntheticBytes('certificate-der', 64);
@@ -60,6 +72,7 @@ function makeRunner(world, { verify, buildPackage, beforePut = () => undefined, 
     // Deterministic over the composition and the evidence digest (the product CMS has no signingTime).
     sealPdf: async (input, options) => {
       calls.seal.push({ input, options });
+      if (sealPdf !== undefined) return sealPdf(input, options, calls.seal.length);
       const bytes = Buffer.concat([Buffer.from(input.composed.bytes), Buffer.from(input.approvalEvidenceDigest)]);
       return { bytes, finalPdfDigest: sha256(bytes), signerCertificateSha256: sha256(input.certificateDer) };
     },
@@ -79,19 +92,105 @@ function makeRunner(world, { verify, buildPackage, beforePut = () => undefined, 
     return { bytes, packageDigest: sha256(bytes), artifactDigest: sha256(inputs.finalPdf) };
   };
   const runner = new FinalizationRunner({
-    db: world.db,
+    db,
     audit: world.audit,
     blobs: hookedBlobs(world, beforePut, check),
-    clock: world.clock.now,
+    clock,
     owner: 'runner-test',
     seal: { keyFile, certificateDer, developmentCertificate: true },
     anchors: [],
     buildPackage: build,
     ports,
-    timers: NEVER,
+    timers,
+    onError,
   });
   return { runner, calls, certificateDer };
 }
+
+/** Lease timers that never fire and keep the live ones (the keeper's renewal), so a test sees what is left. */
+function countingTimers() {
+  const live = new Set();
+  return {
+    live,
+    setTimeout: (callback, ms) => {
+      const handle = { callback, ms };
+      live.add(handle);
+      return handle;
+    },
+    clearTimeout: (handle) => {
+      live.delete(handle);
+    },
+  };
+}
+
+/** A verify worker that never answers and counts terminate() calls. */
+function heldWorker() {
+  const worker = new EventEmitter();
+  worker.terminated = 0;
+  worker.terminate = () => {
+    worker.terminated += 1;
+  };
+  return worker;
+}
+
+/** 'settled' when `promise` settles within `ms`, otherwise a note of the bound; no timer is left behind. */
+async function within(promise, ms) {
+  let handle;
+  const bound = new Promise((resolve) => {
+    handle = setTimeout(() => resolve(`still pending after ${ms} ms`), ms);
+  });
+  try {
+    return await Promise.race([promise.then(() => 'settled'), bound]);
+  } finally {
+    clearTimeout(handle);
+  }
+}
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const macrotask = () => new Promise((resolve) => setImmediate(resolve));
+/** The process's active Timeout resources; the verify cap's timer is one while a verification runs. */
+const activeTimeouts = () => process.getActiveResourcesInfo().filter((type) => type === 'Timeout').length;
+/** The bound this file states for stop() with an attempt in flight, far under the 120 s verify cap. */
+const STOP_BOUND_MS = 5_000;
+
+/**
+ * The runner's database: the world's, except that once `seam.checkpoint` is
+ * set ('missing' or 'mismatch') a read of the completion checkpoint returns
+ * none or one with another digest, and listTenantIds(), the first step of
+ * every run, is counted in `seam.runs`.
+ */
+function seamDb(world, seam) {
+  seam.runs = 0;
+  const bound = (target, property) => {
+    const value = Reflect.get(target, property, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  };
+  const storeOf = (store) =>
+    new Proxy(store, {
+      get(target, property) {
+        if (property !== 'get') return bound(target, property);
+        return (table, where) => {
+          const row = target.get(table, where);
+          if (table !== 'audit_checkpoints' || where?.kind !== 'completion' || row === undefined || seam.checkpoint === undefined) return row;
+          return seam.checkpoint === 'missing' ? undefined : { ...row, event_digest: hex('not-the-receipt-head') };
+        };
+      },
+    });
+  return new Proxy(world.db, {
+    get(target, property) {
+      if (property === 'forTenant') return (tenantId) => storeOf(target.forTenant(tenantId));
+      if (property === 'listTenantIds') {
+        return () => {
+          seam.runs += 1;
+          return target.listTenantIds();
+        };
+      }
+      return bound(target, property);
+    },
+  });
+}
+
+const reportFor = (job) => reportBytesFor({ artifactDigest: job.expectedArtifactDigest, approvalEvidenceDigest: job.expectedApprovalEvidenceDigest, verifiedAt: job.validationTime });
 
 const roles = (world, envelopeId, token) => listAttemptBlobs(world.store, envelopeId).filter((record) => record.fencingToken === token).map((record) => record.role);
 const hexOf = (bytes) => Buffer.from(bytes).toString('hex');
@@ -301,5 +400,300 @@ test('[FEN-08] a publish refused because a stored blob is missing is the retryab
     assert.equal(failed, 0, `a retryable failure announces nothing (finalization_failed events ${failed})`);
   } finally {
     world.close();
+  }
+});
+
+test('[FEN-08] a receipt head that is not the envelope’s completion checkpoint refuses the publish (step 3): a mismatched digest, a mismatched seq and no checkpoint each write nothing; the runner takes the refusal as a lost attempt and records no failure', async () => {
+  // The publish transaction, called as the runner calls it.
+  const world = makeWorld();
+  try {
+    const { envelopeId } = seedFinalizing(world);
+    const grant = lease(world, envelopeId, 'runner-a');
+    const assembled = assembleAttempt(world, envelopeId);
+    const head = assembled.receiptHead;
+    const before = snapshot(world, envelopeId);
+    for (const receiptHead of [
+      { seq: head.seq, digest: hex('another-head') },
+      { seq: head.seq + 1, digest: head.digest },
+    ]) {
+      const shown = `a receipt ending at seq ${receiptHead.seq}, digest ${receiptHead.digest}, against the checkpoint at seq ${head.seq}, digest ${head.digest}`;
+      assert.throws(() => publish(world, grant, assembled, { receiptHead }), refusedWith('checkpoint'), shown);
+      assertUnchanged(world, envelopeId, before, `${shown} wrote nothing`);
+    }
+    const bare = seedFinalizing(world).envelopeId;
+    const bareGrant = lease(world, bare, 'runner-b');
+    const unchecked = assembleAttempt(world, bare, 'attempt', { checkpoint: false });
+    const none = getCompletionCheckpoint(world.store, bare);
+    assert.equal(none, undefined, `premise: ${bare} has no completion checkpoint (got ${JSON.stringify(none)})`);
+    const bareBefore = snapshot(world, bare);
+    assert.throws(() => publish(world, bareGrant, unchecked), refusedWith('checkpoint'), `a receipt ending at seq ${unchecked.receiptHead.seq} with no checkpoint for ${bare}`);
+    assertUnchanged(world, bare, bareBefore, `a publish of ${bare} with no checkpoint wrote nothing`);
+    // The positive control: the same attempt with the checkpoint's own head publishes.
+    const published = publish(world, grant, assembled);
+    assert.equal(published.envelopeVersion, RESERVED_VERSION + 1, `the true head publishes at v${published.envelopeVersion}`);
+  } finally {
+    world.close();
+  }
+
+  // Through the runner (finalize.ts: a PublishRefused other than 'blob' is a lost attempt, with no failure record).
+  for (const mode of ['mismatch', 'missing']) {
+    const runWorld = makeWorld();
+    try {
+      const { envelopeId } = seedSealable(runWorld);
+      const seam = {};
+      const { runner } = makeRunner(runWorld, {
+        db: seamDb(runWorld, seam),
+        // The package is built to the checkpoint just written; from here on the publish reads another one, or none.
+        buildPackage: (inputs) => {
+          seam.checkpoint = mode;
+          return canonicalBytes({ synthetic_package: true, pdf: sha256(inputs.finalPdf) });
+        },
+      });
+      const outcome = await runner.runAttempt(runWorld.tenantId, envelopeId);
+      assert.deepEqual(outcome, { kind: 'lost' }, `(${mode}) outcome ${JSON.stringify(outcome)}`);
+      const after = snapshot(runWorld, envelopeId);
+      assert.deepEqual(
+        [after.artifacts.length, after.reports, after.outbox.length, after.envelope.state, after.job.status, after.job.last_error_code],
+        [0, 0, 0, 'finalizing', 'running', null],
+        `(${mode}) nothing published and no failure recorded: ${describe(after)}`,
+      );
+      const [last] = runWorld.store.list('audit_events', {}, { orderBy: [['seq', 'desc']], limit: 1 });
+      const checkpointSeq = getCompletionCheckpoint(runWorld.store, envelopeId).seq;
+      assert.equal(last.seq, checkpointSeq, `(${mode}) no event after the checkpoint: last seq ${last.seq}, checkpoint seq ${checkpointSeq}`);
+    } finally {
+      runWorld.close();
+    }
+  }
+});
+
+test('[FEN-01] stop() during a held verify aborts the attempt through its lease keeper: the verify worker is terminated, stop() settles within 5 s (the verify cap is 120 s), nothing is written after it, no timer remains, a second stop() is harmless, and no attempt starts after it', async () => {
+  const world = makeWorld();
+  try {
+    const { envelopeId } = seedSealable(world);
+    const waiting = seedFinalizing(world).envelopeId;
+    const timers = countingTimers();
+    const worker = heldWorker();
+    let entered;
+    const inVerify = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const { runner } = makeRunner(world, {
+      timers,
+      // The real verify step with a worker that never answers. Its rejection on the abort reaches the
+      // attempt one macrotask later, so a stop() that did not wait for the unwinding would be seen.
+      verify: async (job, options) => {
+        try {
+          return await runVerification(job, {
+            ...options,
+            spawn: () => {
+              entered();
+              return worker;
+            },
+          });
+        } catch (error) {
+          await macrotask();
+          throw error;
+        }
+      },
+    });
+    const baseline = activeTimeouts();
+    let unwound = false;
+    const attempt = runner.runAttempt(world.tenantId, envelopeId).then((outcome) => {
+      unwound = true;
+      return outcome;
+    });
+    await inVerify;
+    const before = snapshot(world, envelopeId);
+    const capRunning = activeTimeouts();
+    assert.deepEqual(
+      [before.job.status, timers.live.size, capRunning],
+      ['running', 1, baseline + 1],
+      `premise: the lease row is valid, the keeper holds ${timers.live.size} renewal(s), ${capRunning} timeout(s) run (${baseline} before the attempt): ${describe(before)}`,
+    );
+
+    const started = performance.now();
+    const stopping = runner.stop();
+    assert.ok(stopping instanceof Promise, `stop() returns ${Object.prototype.toString.call(stopping)}`);
+    const settled = await within(stopping, STOP_BOUND_MS);
+    const elapsed = Math.round(performance.now() - started);
+    assert.equal(settled, 'settled', `stop() ${settled}: ${elapsed} ms, bound ${STOP_BOUND_MS} ms, verify cap ${VERIFY_WALL_CAP_MS} ms`);
+    assert.equal(unwound, true, `stop() resolved after the attempt unwound (unwound ${unwound}, ${elapsed} ms)`);
+    const outcome = await attempt;
+    assert.deepEqual(outcome, { kind: 'lost' }, `the stopped attempt's outcome ${JSON.stringify(outcome)}`);
+    assert.equal(worker.terminated, 1, `the verify worker was terminated ${worker.terminated} time(s)`);
+    assertUnchanged(world, envelopeId, before, `stop() of attempt ${before.job.fencing_token} wrote nothing after the abort`);
+    const timeouts = activeTimeouts();
+    assert.ok(timers.live.size === 0 && timeouts <= baseline, `timers left: ${timers.live.size} renewal(s), ${timeouts} timeout(s), ${baseline} before the attempt`);
+
+    const againStarted = performance.now();
+    const again = await within(runner.stop(), STOP_BOUND_MS);
+    const againMs = Math.round(performance.now() - againStarted);
+    assert.ok(again === 'settled' && againMs < 1_000, `a second stop() ${again} in ${againMs} ms`);
+    const late = await runner.runAttempt(world.tenantId, waiting);
+    const waitingJob = snapshot(world, waiting).job;
+    assert.deepEqual(
+      [late.kind, waitingJob.status, waitingJob.attempt_count],
+      ['not-claimed', 'pending', 0],
+      `after stop() no attempt starts: ${late.kind}; ${waiting}'s job ${waitingJob.status} with ${waitingJob.attempt_count} attempt(s)`,
+    );
+
+    // Crash-equivalent: the stopped attempt counts, and its job is reclaimed at the lease expiry.
+    world.clock.advance(DEFAULT_LEASE_MS);
+    const reclaimed = reclaimLease(world.context(), envelopeId);
+    const job = snapshot(world, envelopeId).job;
+    assert.deepEqual(
+      [reclaimed, job.attempt_count, job.last_error_code],
+      ['retryable', 1, LEASE_EXPIRED_ERROR_CODE],
+      `at the lease expiry ${world.clock.iso()} the job is ${reclaimed} after ${job.attempt_count} attempt(s), ${job.last_error_code}`,
+    );
+
+    // With nothing in flight stop() resolves at once, and a runner stopped before its first tick never runs.
+    const seam = {};
+    const { runner: idle } = makeRunner(world, { db: seamDb(world, seam) });
+    idle.start(10);
+    const idleStarted = performance.now();
+    const idleSettled = await within(idle.stop(), STOP_BOUND_MS);
+    const idleMs = Math.round(performance.now() - idleStarted);
+    await pause(50);
+    assert.ok(idleSettled === 'settled' && idleMs < 1_000 && seam.runs === 0, `an idle stop() ${idleSettled} in ${idleMs} ms; runs afterwards ${seam.runs} (interval 10 ms, 50 ms waited)`);
+  } finally {
+    world.close();
+  }
+});
+
+test('[FEN-01] stop() during a held seal aborts it through the keeper’s signal, and a step that ignores the abort writes nothing after it: the held check refuses every later durable write, and no failure is recorded', async () => {
+  // (a) The seal port gets the keeper's signal and rejects as T037 does on an abort (SealError 'aborted', retryable).
+  const sealWorld = makeWorld();
+  try {
+    const { envelopeId } = seedSealable(sealWorld);
+    let entered;
+    const inSeal = new Promise((resolve) => {
+      entered = resolve;
+    });
+    let signal;
+    const { runner } = makeRunner(sealWorld, {
+      timers: countingTimers(),
+      sealPdf: (_input, options) =>
+        new Promise((_resolve, reject) => {
+          signal = options.signal;
+          signal.addEventListener('abort', () => reject(new SealError('aborted')), { once: true });
+          entered();
+        }),
+    });
+    const attempt = runner.runAttempt(sealWorld.tenantId, envelopeId);
+    await inSeal;
+    const before = snapshot(sealWorld, envelopeId);
+    const settled = await within(runner.stop(), STOP_BOUND_MS);
+    const outcome = await attempt;
+    assert.deepEqual([settled, outcome], ['settled', { kind: 'lost' }], `(seal) stop() ${settled}; outcome ${JSON.stringify(outcome)}`);
+    assert.ok(
+      signal?.aborted === true && signal.reason instanceof LeaseLost && signal.reason.lossCause === 'stopped',
+      `(seal) the seal's signal: aborted ${signal?.aborted}, reason ${signal?.reason?.name} ${signal?.reason?.lossCause}`,
+    );
+    assertUnchanged(sealWorld, envelopeId, before, `(seal) the retryable SealError 'aborted' after stop() recorded no failure`);
+  } finally {
+    sealWorld.close();
+  }
+
+  // (b) A verify port that ignores the signal and answers after stop(): the keeper's held check refuses the store.
+  const lateWorld = makeWorld();
+  try {
+    const { envelopeId } = seedSealable(lateWorld);
+    let entered;
+    const inVerify = new Promise((resolve) => {
+      entered = resolve;
+    });
+    let release;
+    const released = new Promise((resolve) => {
+      release = resolve;
+    });
+    const { runner } = makeRunner(lateWorld, {
+      timers: countingTimers(),
+      verify: async (job) => {
+        entered();
+        await released;
+        await macrotask();
+        return reportFor(job);
+      },
+    });
+    const attempt = runner.runAttempt(lateWorld.tenantId, envelopeId);
+    await inVerify;
+    const before = snapshot(lateWorld, envelopeId);
+    const stopping = runner.stop();
+    release();
+    const settled = await within(stopping, STOP_BOUND_MS);
+    const outcome = await attempt;
+    assert.deepEqual([settled, outcome], ['settled', { kind: 'lost' }], `(late verify) stop() ${settled}; outcome ${JSON.stringify(outcome)}`);
+    assertUnchanged(lateWorld, envelopeId, before, `(late verify) a report that arrived after stop() led to no record, checkpoint, failure or publication`);
+  } finally {
+    lateWorld.close();
+  }
+});
+
+test('[FEN-01] start() passes a rejected run to onError exactly once and its loop runs the next tick; an onError that throws and a runner without onError keep the loop too; after stop() no tick follows', async () => {
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    for (const variant of ['observed', 'throwing', 'absent']) {
+      const world = makeWorld();
+      try {
+        const { envelopeId } = seedSealable(world);
+        const seam = {};
+        // The first clock read of the first run is not a date, so that run rejects (StorageUsageError, jobs repository).
+        let poisoned = 1;
+        const clock = () => {
+          if (poisoned > 0) {
+            poisoned -= 1;
+            return new Date(Number.NaN);
+          }
+          return world.clock.now();
+        };
+        const seen = [];
+        const onError =
+          variant === 'absent'
+            ? undefined
+            : (error) => {
+                seen.push(error);
+                if (variant === 'throwing') throw new Error('synthetic onError failure');
+              };
+        let reach;
+        const reached = new Promise((resolve) => {
+          reach = resolve;
+        });
+        const { runner } = makeRunner(world, {
+          db: seamDb(world, seam),
+          clock,
+          onError,
+          timers: countingTimers(),
+          // The next tick's attempt is held in verify until stop() aborts it, so stop() meets a run in flight.
+          verify: (_job, options) =>
+            new Promise((_resolve, reject) => {
+              options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+              reach();
+            }),
+        });
+        runner.start(5);
+        const next = await within(reached, STOP_BOUND_MS);
+        const runsBeforeStop = seam.runs;
+        await runner.stop();
+        const runsAtStop = seam.runs;
+        await pause(50);
+        const names = seen.map((error) => `${error?.name}: ${error?.message}`);
+        assert.equal(next, 'settled', `(${variant}) the tick after the rejected run reached ${envelopeId}'s attempt: ${next}; runs ${runsBeforeStop}; onError saw ${JSON.stringify(names)}`);
+        assert.ok(runsBeforeStop >= 2, `(${variant}) a rejected run and the next one: runs ${runsBeforeStop}`);
+        if (variant !== 'absent') {
+          assert.ok(seen.length === 1 && seen[0] instanceof StorageUsageError, `(${variant}) onError received ${seen.length} error(s): ${JSON.stringify(names)}`);
+        }
+        assert.equal(seam.runs, runsAtStop, `(${variant}) after stop() no tick followed: runs ${runsAtStop} at stop(), ${seam.runs} 50 ms later (interval 5 ms)`);
+      } finally {
+        world.close();
+      }
+    }
+    await macrotask();
+    const reasons = unhandled.map((reason) => `${reason?.name}: ${reason?.message}`);
+    assert.deepEqual(reasons, [], `unhandled rejections: ${JSON.stringify(reasons)}`);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
   }
 });
