@@ -5,7 +5,10 @@
 // - PK-01: exactly five members, each contract-valid; T039 called with the package limits;
 //   the size bound, taken from its owners' exports, with the receipt budget covering T008's
 //   ceiling plus the event sources that are never refused (requests #46 and #50).
-// - PK-02: the digest cross-links and the verdict invariant, each refused when broken.
+// - PK-02: the digest cross-links and the verdict invariant, each refused when broken; a
+//   two-approval package; every manifest and receipt link the builder checks, broken one at
+//   a time; and each list cap at its owner's export, built at the cap and refused one above
+//   (row T016-TESTS, request #76).
 // - PK-03 (builder side): no key material and no slot outside the contract schemas.
 // - PK-05: the receipt recomputes alone with the test-local RFC 8785 serializer.
 // - PK-07: equal inputs give equal bytes.
@@ -42,6 +45,8 @@ import {
 } from '../../src/artifacts/package.ts';
 import { writeZip } from '../../src/artifacts/zip.ts';
 import { MAX_SEALED_PDF_BYTES } from '../../src/cryptograph/compose/bounds.ts';
+import { MAX_CONSENT_TEXT_LENGTH } from '../../src/domain/consent/index.ts';
+import { MAX_FIELDS, MAX_PAGES } from '../../src/domain/envelopes/validation.ts';
 import {
   MAX_COORDINATE,
   MAX_FIELD_VALUES,
@@ -95,9 +100,12 @@ const FINALIZATION_ONCE_EVENTS = 2;
 
 let chain;
 let base;
+/** A consistent two-approval input over the same chain: two recipients, one shared consent text. */
+let pair;
 before(() => {
   chain = chainWorld();
   base = packageInput(chain);
+  pair = packageInput(chain, { approvals: 2 });
 });
 after(() => chain?.close());
 
@@ -117,12 +125,79 @@ function resealed(input) {
   return reserialize(input);
 }
 
-/** A copy of the base input with `mutate` applied; manifest edits are resealed, report edits reserialized. */
-function variant(mutate, { reseal = true } = {}) {
-  const input = structuredClone(base);
+/** A copy of `source` with `mutate` applied; manifest edits are resealed, report edits reserialized. */
+function variantOf(source, mutate, { reseal = true } = {}) {
+  const input = structuredClone(source);
   mutate(input);
   return reseal ? resealed(input) : reserialize(input);
 }
+
+/** A copy of the base input with `mutate` applied (see variantOf). */
+function variant(mutate, options) {
+  return variantOf(base, mutate, options);
+}
+
+/** After a field-manifest edit: manifest_digest and every approval's binding follow the edited field manifest. */
+function refrozen(input) {
+  const manifestDigest = jcsDigest(input.approvalManifest.field_manifest);
+  input.approvalManifest.manifest_digest = manifestDigest;
+  for (const approval of input.approvalManifest.approvals) approval.manifest_digest = manifestDigest;
+  return input;
+}
+
+/** Replace consent text `index`'s wording; its digest and every approval naming its version follow. */
+function reworded(input, index, text) {
+  const entry = input.approvalManifest.consent_texts[index];
+  entry.text = text;
+  entry.text_digest = sha256Hex(Buffer.from(text, 'utf8'));
+  for (const approval of input.approvalManifest.approvals) if (approval.consent_version === entry.version) approval.consent_text_digest = entry.text_digest;
+  return input;
+}
+
+/**
+ * The two-approval input with `count` approvals in ordinal order, each chained to the one
+ * before (added approvals copy the first, with their own identifiers). With `ownTexts`, each
+ * approval names its own consent text, so the manifest carries `count` texts.
+ */
+function approvalsOf(count, { ownTexts = false } = {}) {
+  return variantOf(pair, (input) => {
+    const manifest = input.approvalManifest;
+    const [template] = manifest.approvals;
+    const [wording] = manifest.consent_texts;
+    const approvals = [];
+    const texts = [];
+    let prior = null;
+    for (let index = 0; index < count; index += 1) {
+      const approval = structuredClone(manifest.approvals[index] ?? { ...template, approval_id: sid('apr'), recipient: { ...template.recipient, id: sid('rcp'), ordinal: index + 1 }, approval_digest: hex(`approval-${index + 1}`) });
+      approval.prior_approval_digest = prior;
+      prior = approval.approval_digest;
+      if (ownTexts) {
+        const text = `${wording.text} (text ${index + 1})`;
+        const entry = { version: `consent-${index + 1}`, text_digest: sha256Hex(Buffer.from(text, 'utf8')), text };
+        texts.push(entry);
+        approval.consent_version = entry.version;
+        approval.consent_text_digest = entry.text_digest;
+      }
+      approvals.push(approval);
+    }
+    manifest.approvals = approvals;
+    if (ownTexts) manifest.consent_texts = texts;
+  });
+}
+
+/** The value at a builder path such as `approval-manifest.approvals[0].field_values`. */
+function valueAt(manifest, path) {
+  return path
+    .replace(/^approval-manifest\./, '')
+    .split('.')
+    .reduce((value, part) => {
+      const [, name, index] = /^([a-z_]+)(?:\[(\d+)\])?$/.exec(part) ?? [];
+      const next = value?.[name];
+      return index === undefined ? next : next?.[Number(index)];
+    }, manifest);
+}
+
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
  * buildPackage(input) refuses with `code` and a message matching `message`. Request #70 (6):
@@ -459,6 +534,133 @@ test('[PK-02] every broken cross-link, receipt rule or verdict is refused, and n
   const memoryBuilt = buildPackage(memoryInput()).bytes.length;
   assert.ok(memoryBuilt > 0, `the in-memory control builds: ${memoryBuilt} bytes`);
   assert.equal(check(base, 'trust-anchors').result, 'fail');
+});
+
+test('[PK-02] a two-approval package builds, with every cross-link over both approvals', () => {
+  const built = buildPackage(pair);
+  const manifest = member(built.bytes, 'approval-manifest.json');
+  const report = member(built.bytes, 'verification.json');
+  const approvals = manifest.approvals;
+  same(approvals.length, ENVELOPE_MAX_RECIPIENTS, 'approvals in the packaged manifest');
+  sameDeep(approvals.map((approval) => approval.recipient.ordinal), [1, 2], 'approval ordinals');
+  same(approvals[0].prior_approval_digest, null, 'the first approval chains to nothing');
+  same(approvals[1].prior_approval_digest, approvals[0].approval_digest, 'the second approval chains to the first');
+  const manifestDigest = jcsDigest(manifest.field_manifest);
+  same(manifest.manifest_digest, manifestDigest, 'manifest_digest → the two-field manifest');
+  same(manifest.field_manifest.fields.length, 2, 'fields, one per recipient');
+  for (const [index, approval] of approvals.entries()) {
+    same(approval.document_digest, manifest.document.digest, `approval ${index} → the document`);
+    same(approval.manifest_digest, manifestDigest, `approval ${index} → the field manifest`);
+    same(approval.consent_text_digest, manifest.consent_texts.find((entry) => entry.version === approval.consent_version)?.text_digest, `approval ${index} → its consent text ${approval.consent_version}`);
+  }
+  const { final_pdf_digest: _excluded, ...preSeal } = manifest;
+  same(report.approval_evidence_digest, jcsDigest(preSeal), 'the evidence digest covers both approvals');
+  same(built.approvalEvidenceDigest, jcsDigest(preSeal), 'the builder\'s evidence digest');
+  sameDeep(schemaErrors('ApprovalManifest', manifest), [], 'the two-approval manifest is a contract ApprovalManifest');
+  // Two approvals naming two consent texts build too: each text is named once.
+  const twoTexts = buildPackage(approvalsOf(ENVELOPE_MAX_RECIPIENTS, { ownTexts: true }));
+  const textVersions = member(twoTexts.bytes, 'approval-manifest.json').consent_texts.map((entry) => entry.version);
+  sameDeep(textVersions, ['consent-1', 'consent-2'], 'two approvals with their own consent texts');
+});
+
+test('[PK-02] the field-manifest, ordinal, approval-chain, consent and genesis links: each broken alone is refused with its own message', () => {
+  const tenantId = base.tenantId;
+  const envelopeId = base.envelopeId;
+  const genesis = (shape) => packageInput({ tenantId, envelopeId, ...memoryChain(tenantId, envelopeId, 4, shape) });
+  const unnamedText = 'A second synthetic consent wording that no approval names.';
+  // Each row breaks one link and repairs every digest that depends on it, so only the check
+  // under test can refuse (package.ts at cb0c629: :444, :445, :476, :479, :485 and :613).
+  const rows = [
+    ['the field manifest names another envelope (:444)', variant((i) => {
+      i.approvalManifest.field_manifest.envelope_id = chain.otherId;
+      refrozen(i);
+    }), 'cross-link', /: the field manifest names another envelope$/],
+    ['the field manifest binds another document (:445)', variant((i) => {
+      i.approvalManifest.field_manifest.document_digest = hex('another-document');
+      refrozen(i);
+    }), 'cross-link', /: the field manifest binds another document$/],
+    ['one approval with ordinal 2 (:476)', variant((i) => (i.approvalManifest.approvals[0].recipient.ordinal = 2)), 'cross-link', /approvals\[0\] is out of ordinal order$/],
+    ['two approvals with their ordinals swapped (:476)', variantOf(pair, (i) => {
+      const [first, second] = i.approvalManifest.approvals;
+      [first.recipient.ordinal, second.recipient.ordinal] = [2, 1];
+    }), 'cross-link', /approvals\[0\] is out of ordinal order$/],
+    ['the first approval names a prior approval (:479)', variant((i) => (i.approvalManifest.approvals[0].prior_approval_digest = hex('before-the-first'))), 'cross-link', /approvals\[0\] does not chain to the prior approval$/],
+    ['the second approval chains to another approval (:479)', variantOf(pair, (i) => (i.approvalManifest.approvals[1].prior_approval_digest = hex('another-approval'))), 'cross-link', /approvals\[1\] does not chain to the prior approval$/],
+    ['the second approval chains to nothing (:479)', variantOf(pair, (i) => (i.approvalManifest.approvals[1].prior_approval_digest = null)), 'cross-link', /approvals\[1\] does not chain to the prior approval$/],
+    ['a consent text no approval names (:485)', variant((i) => i.approvalManifest.consent_texts.push({ version: 'unnamed-1', text_digest: sha256Hex(Buffer.from(unnamedText, 'utf8')), text: unnamedText })), 'cross-link', /: a consent text is named by no approval$/],
+    ['seq 1 of the tenant chain carries a prev_digest (:613)', genesis((seq) => (seq === 1 ? { prevDigest: hex('before-genesis') } : {})), 'receipt-invalid', /: only seq 1 of the tenant chain has no prev_digest$/],
+    ['a later event carries no prev_digest (:613)', genesis((seq) => (seq === 3 ? { prevDigest: null } : {})), 'receipt-invalid', /: only seq 1 of the tenant chain has no prev_digest$/],
+  ];
+  for (const [what, input, code, message] of rows) assertRefused(input, code, message, what);
+  // The controls: the unbroken inputs of every row build.
+  for (const [what, input] of [['the one-approval input', base], ['the two-approval input', pair], ['the in-memory chain', genesis(() => ({}))]]) {
+    const bytes = buildPackage(structuredClone(input)).bytes.length;
+    assert.ok(bytes > 0, `${what} builds: ${bytes} bytes`);
+  }
+});
+
+test('[PK-02] each list cap the builder enforces is its owner\'s export: a build at the cap, a refusal one above', () => {
+  // F4 (row T016-TESTS): every cap comes from its owner, never a literal, so a raised owner
+  // limit fails here instead of stranding an approved envelope at packaging.
+  const caps = [
+    {
+      path: 'approval-manifest.field_manifest.fields',
+      owner: 'T007 MAX_FIELDS',
+      cap: MAX_FIELDS,
+      min: 1,
+      at: (count) => variant((i) => {
+        const [first] = i.approvalManifest.field_manifest.fields;
+        i.approvalManifest.field_manifest.fields = Array.from({ length: count }, (_, index) => ({ ...first, key: `sig-${index + 1}` }));
+        refrozen(i);
+      }),
+    },
+    {
+      path: 'approval-manifest.document.pages',
+      owner: 'T007 MAX_PAGES',
+      cap: MAX_PAGES,
+      min: 1,
+      at: (count) => variant((i) => {
+        const [first] = i.approvalManifest.document.pages;
+        i.approvalManifest.document.pages = Array.from({ length: count }, (_, index) => ({ ...first, number: index + 1 }));
+      }),
+    },
+    {
+      path: 'approval-manifest.approvals[0].field_values',
+      owner: 'T010 MAX_FIELD_VALUES',
+      cap: MAX_FIELD_VALUES,
+      min: 1,
+      at: (count) => variant((i) => {
+        const [first] = i.approvalManifest.approvals[0].field_values;
+        i.approvalManifest.approvals[0].field_values = Array.from({ length: count }, (_, index) => ({ ...first, key: `sig-${index + 1}` }));
+      }),
+    },
+    {
+      // A date value is filled for a date field value, so T010's cap bounds both lists.
+      path: 'approval-manifest.approvals[0].date_values',
+      owner: 'T010 MAX_FIELD_VALUES',
+      cap: MAX_FIELD_VALUES,
+      min: 0,
+      at: (count) => variant((i) => {
+        i.approvalManifest.approvals[0].date_values = Array.from({ length: count }, (_, index) => ({ key: `date-${index + 1}`, value: '2026-11-19' }));
+      }),
+    },
+    { path: 'approval-manifest.approvals', owner: 'T008 ENVELOPE_MAX_RECIPIENTS', cap: ENVELOPE_MAX_RECIPIENTS, min: 1, at: (count) => approvalsOf(count) },
+    // One consent text per approval at most, so the recipient cap bounds the texts too.
+    { path: 'approval-manifest.consent_texts', owner: 'T008 ENVELOPE_MAX_RECIPIENTS', cap: ENVELOPE_MAX_RECIPIENTS, min: 1, at: (count) => approvalsOf(count, { ownTexts: true }) },
+    { path: 'approval-manifest.consent_texts[0].text', owner: 'T008 MAX_CONSENT_TEXT_LENGTH', cap: MAX_CONSENT_TEXT_LENGTH, min: 1, text: true, at: (count) => variant((i) => reworded(i, 0, 'c'.repeat(count))) },
+  ];
+  for (const { path, owner, cap, min, text = false, at } of caps) {
+    let built;
+    try {
+      built = buildPackage(at(cap));
+    } catch (error) {
+      assert.fail(`${path} at ${owner} = ${cap} is refused: ${error.message}`);
+    }
+    const packaged = valueAt(member(built.bytes, 'approval-manifest.json'), path);
+    same(text ? [...packaged].length : packaged?.length, cap, `${path} at ${owner}: packaged size`);
+    const limit = text ? `${path} must be a string of ${min} to ${cap} characters` : `${path} must list ${min} to ${cap} items`;
+    assertRefused(at(cap + 1), 'input-invalid', new RegExp(`: ${escapeRegExp(limit)}$`), `${path} one above ${owner} (${cap + 1})`);
+  }
 });
 
 test('[PK-03] key material and members outside the contract schemas are refused in every JSON member', () => {

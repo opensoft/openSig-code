@@ -53,10 +53,27 @@ export function syntheticPdf(label, size = 4096) {
  *     checkpoint at that head
  *   8 recipient.capabilities_revoked (E): after the head, so never in the receipt
  * `events` holds every event of E, seq 8 included, as T038 might read them.
+ * If seeding fails, the scratch database is closed and removed before the error is
+ * rethrown: a failed `before` hook has no world to close, and its temporary directory would
+ * otherwise stay behind (request #76's footprint note).
  */
 export function chainWorld() {
   const scratch = makeScratch();
-  const { db } = openTemp(scratch);
+  let db;
+  try {
+    ({ db } = openTemp(scratch));
+    return seededChain(db, scratch);
+  } catch (error) {
+    try {
+      db?.close();
+    } finally {
+      scratch.cleanup();
+    }
+    throw error;
+  }
+}
+
+function seededChain(db, scratch) {
   const tenantId = sid('tenant');
   createTenant(db, tenantId);
   const store = db.forTenant(tenantId);
