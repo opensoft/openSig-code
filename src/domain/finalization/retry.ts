@@ -5,7 +5,12 @@
 // § Transitions and races, item 3; A-010 requests #28, #59 (4) and (9), #61 (6)).
 //
 // One BEGIN IMMEDIATE transaction, in the order of T034's keyed mutations
-// (src/domain/envelopes/service.ts):
+// (src/domain/envelopes/service.ts). The clock is read first, inside the
+// transaction (request #82, row RETRY-BOUND), so no other connection can
+// commit between the reading and the reads it is compared with. The
+// idempotency record's instants (its expiry check and its creation) use that
+// reading; the job's instant is the later of it and the job's last write
+// (step 4).
 // 1. The Idempotency-Key: a live record with the same request digest and
 //    principal kind replays its stored 202 bytes and writes nothing; a
 //    different request under the key is 409 idempotency_conflict; a record
@@ -23,9 +28,12 @@
 //    { field: 'envelope', code: 'attempt_ceiling' }. The job is written only
 //    on an actual transition (request #80 (1), row RETRY-BOUND): the limit
 //    raised, `failed` made `retryable`, or a later retry_at brought forward,
-//    each leaving the job `retryable` and due now. A job already `retryable`
-//    and due is left as it is. attempt_count is never written, and no
-//    approval is created.
+//    each leaving the job `retryable` with retry_at = updated_at = the
+//    retry's instant. That instant is max(clock, job.updated_at) (request
+//    #82), so a retry whose clock stepped back, was read stale or runs skewed
+//    in another process finds that job already due and leaves it as it is,
+//    and no job instant ever moves backwards. attempt_count is never written,
+//    and no approval is created.
 // 5. Only on that transition, the audit event `envelope.finalization_retried`,
 //    with the operator as actor and the metadata envelope_version,
 //    attempt_count and max_attempts. So each attempt is followed by at most
@@ -86,16 +94,23 @@ function expectedVersionOf(body: JsonValue): number {
   return value;
 }
 
+/** One reading of the retry's clock, refused when it is not a date. */
+function readClock(clock: () => Date): Date {
+  const now = clock();
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new TypeError('the retry clock returned an invalid date');
+  return now;
+}
+
 export function retryFinalization(db: Database, audit: AuditWriter, request: RetryRequest, options: { readonly clock: () => Date }): RetryResult {
   const { key } = request.idempotency;
   if (typeof key !== 'string' || !IDEMPOTENCY_KEY_PATTERN.test(key)) {
     throw new FinalizationError('invalid_request', 'the Idempotency-Key is invalid', [{ field: 'Idempotency-Key', code: 'invalid_key' }]);
   }
-  const now = options.clock();
-  if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new TypeError('the retry clock returned an invalid date');
   const digest = idempotencyRequestDigest({ route: RETRY_ROUTE, target: request.envelopeId, request: request.idempotency.request });
   const store = db.forTenant(request.tenantId);
   return db.transaction((): RetryResult => {
+    // Inside BEGIN IMMEDIATE (request #82): no other connection commits between this reading and the reads below.
+    const now = readClock(options.clock);
     const existing = findIdempotencyRecord(store, RETRY_ROUTE, request.actor.ref, key);
     if (existing !== undefined && isIdempotencyRecordExpired(existing, now)) {
       deleteIdempotencyRecord(store, existing);

@@ -19,7 +19,8 @@
 // exceeds max_attempts, and max_attempts stays in 1..100. The fencing token is
 // the attempt_count at lease grant. A retry from `failed` at the limit raises
 // max_attempts by update (A-010, request #28); it never touches attempt_count,
-// and a retry that makes no transition writes nothing (request #80 (1)).
+// and a retry that makes no transition writes nothing (request #80 (1)); its
+// instant is the later of the clock and the job's last write (request #82).
 // last_error_code holds a code only: the contract's 60-character limit is
 // enforced here, because 0004 allows 64 (row P13).
 //
@@ -60,6 +61,8 @@ export const MAX_JOB_LIST = 1_000;
 
 const ERROR_CODE = /^[a-z0-9_.-]+$/;
 const LEASE_OWNER = /^[A-Za-z0-9_.:-]{1,100}$/;
+/** 0004's stored instant: the fixed-format ISO string iso() writes, so two instants compare as strings. */
+const SERVER_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 export interface JobRow {
   readonly envelopeId: string;
@@ -360,21 +363,36 @@ export function reclaimExpiredLease(store: TenantStore, envelopeId: string, now:
  * - at the attempt limit, max_attempts is raised by RETRY_RAISE within
  *   0004's 1..100 (request #28);
  * - from `failed`, the job becomes `retryable`;
- * - from `retryable` with retry_at later than now, retry_at is brought
- *   forward.
- * Each makes the job `retryable`, due now. Otherwise the job is already
- * `retryable` and due: 'unchanged', and nothing is written. The test and the
- * write run in the caller's one transaction, so concurrent retries serialize
- * and at most one of them transitions. attempt_count is never written.
+ * - from `retryable` with retry_at later than the retry's instant, retry_at
+ *   is brought forward.
+ * Each makes the job `retryable` with retry_at = updated_at = the retry's
+ * instant. Otherwise the job is already `retryable` and due: 'unchanged', and
+ * nothing is written. The test and the write run in the caller's one
+ * transaction, so concurrent retries serialize and at most one of them
+ * transitions. attempt_count is never written.
+ *
+ * The retry's instant (request #82) is at = max(clock, job.updated_at), the
+ * later of `now` (read inside the caller's transaction) and the job's last
+ * write; it is the instant of the transition test and of every write here.
+ * Every write to signing_jobs records updated_at, so after a transition every
+ * later retry's instant is at or after retry_at: it is not brought forward,
+ * and the job is neither `failed` nor at its limit, whether the clock stepped
+ * back, was read stale or runs skewed in another process. Only a grant makes
+ * the next transition possible. No retry writes a job instant earlier than
+ * the job's last write. The instants compare as 0004's fixed-format ISO
+ * strings (its GLOB checks on retry_at and updated_at), as the lease and
+ * claim tests here do.
  */
 export function retryJob(store: TenantStore, envelopeId: string, now: Date): RetryOutcome {
-  const at = iso(now);
+  const clock = iso(now);
   const job = readJob(store, envelopeId);
   if (job === undefined) return { kind: 'refused', reason: 'not-reserved' };
   const from = job.status;
   if (from !== 'retryable' && from !== 'failed') return { kind: 'refused', reason: 'not-retryable' };
   const atLimit = job.attemptCount >= job.maxAttempts;
   if (atLimit && job.attemptCount + RETRY_RAISE > MAX_ATTEMPTS_CEILING) return { kind: 'refused', reason: 'attempt-ceiling' };
+  if (!SERVER_INSTANT.test(job.updatedAt)) throw stored('updated_at');
+  const at = clock > job.updatedAt ? clock : job.updatedAt;
   const transition: RetryTransition | null = atLimit
     ? 'raised'
     : from === 'failed'
