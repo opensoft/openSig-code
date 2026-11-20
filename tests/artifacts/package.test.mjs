@@ -145,6 +145,22 @@ function refrozen(input) {
   return input;
 }
 
+/**
+ * After an approval edit: every approval_digest is recomputed over its record and the chain
+ * relinked in ordinal order, as the fixture first built them (support/inputs.mjs), so the
+ * edited record is internally consistent and only the binding under test is broken.
+ */
+function rechained(input) {
+  let prior = null;
+  for (const approval of input.approvalManifest.approvals) {
+    approval.prior_approval_digest = prior;
+    const { approval_digest: _old, ...body } = approval;
+    approval.approval_digest = jcsDigest(body);
+    prior = approval.approval_digest;
+  }
+  return input;
+}
+
 /** Replace consent text `index`'s wording; its digest and every approval naming its version follow. */
 function reworded(input, index, text) {
   const entry = input.approvalManifest.consent_texts[index];
@@ -569,7 +585,7 @@ test('[PK-02] the field-manifest, ordinal, approval-chain, consent and genesis l
   const genesis = (shape) => packageInput({ tenantId, envelopeId, ...memoryChain(tenantId, envelopeId, 4, shape) });
   const unnamedText = 'A second synthetic consent wording that no approval names.';
   // Each row breaks one link and repairs every digest that depends on it, so only the check
-  // under test can refuse (package.ts at cb0c629: :444, :445, :476, :479, :485 and :613).
+  // under test can refuse (package.ts at cb0c629: :444, :445, :476, :478, :479, :485 and :613).
   const rows = [
     ['the field manifest names another envelope (:444)', variant((i) => {
       i.approvalManifest.field_manifest.envelope_id = chain.otherId;
@@ -584,6 +600,16 @@ test('[PK-02] the field-manifest, ordinal, approval-chain, consent and genesis l
       const [first, second] = i.approvalManifest.approvals;
       [first.recipient.ordinal, second.recipient.ordinal] = [2, 1];
     }), 'cross-link', /approvals\[0\] is out of ordinal order$/],
+    // :478, at each approval position: the approval's manifest_digest names another field
+    // manifest; its approval digest, the chain after it and the evidence digest are repaired.
+    ['the first approval binds another field manifest (:478)', variant((i) => {
+      i.approvalManifest.approvals[0].manifest_digest = hex('another-field-manifest');
+      rechained(i);
+    }), 'cross-link', /: approval-manifest\.approvals\[0\] binds another field manifest$/],
+    ['the second approval binds another field manifest (:478)', variantOf(pair, (i) => {
+      i.approvalManifest.approvals[1].manifest_digest = hex('another-field-manifest');
+      rechained(i);
+    }), 'cross-link', /: approval-manifest\.approvals\[1\] binds another field manifest$/],
     ['the first approval names a prior approval (:479)', variant((i) => (i.approvalManifest.approvals[0].prior_approval_digest = hex('before-the-first'))), 'cross-link', /approvals\[0\] does not chain to the prior approval$/],
     ['the second approval chains to another approval (:479)', variantOf(pair, (i) => (i.approvalManifest.approvals[1].prior_approval_digest = hex('another-approval'))), 'cross-link', /approvals\[1\] does not chain to the prior approval$/],
     ['the second approval chains to nothing (:479)', variantOf(pair, (i) => (i.approvalManifest.approvals[1].prior_approval_digest = null)), 'cross-link', /approvals\[1\] does not chain to the prior approval$/],
