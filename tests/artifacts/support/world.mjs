@@ -131,6 +131,7 @@ export function publish(world, tenant, envelopeId, { insertOnly = false, without
       artifact_digest: built.artifactDigest,
       package_digest: withoutPackage ? null : built.packageDigest,
       approved_composition_digest: input.approvalManifest.approved_composition_digest,
+      approval_evidence_digest: input.report.approval_evidence_digest,
       pdf_blob_ref: pdfBlob.ref,
       evidence_blob_ref: evidenceBlob.ref,
       package_blob_ref: withoutPackage ? null : packageBlob.ref,

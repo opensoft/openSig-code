@@ -472,6 +472,7 @@ test('[DB-14] data-model constraints are enforced by the schema', () => {
       'trigger',
       /^signing_jobs key exists/,
     );
+    // A-010 request #75: 0019's final_artifacts_key_exists refuses the duplicate before the unique constraint.
     rejects(
       db,
       () =>
@@ -480,6 +481,7 @@ test('[DB-14] data-model constraints are enforced by the schema', () => {
           envelope_id: g.env,
           artifact_digest: hex('second-pdf'),
           approved_composition_digest: hex('composition'),
+          approval_evidence_digest: hex('approval-evidence'),
           pdf_blob_ref: blobRef(tenant, hex('second-pdf')),
           evidence_blob_ref: blobRef(tenant, hex('evidence')),
           signer_certificate_sha256: hex('certificate'),
@@ -490,7 +492,8 @@ test('[DB-14] data-model constraints are enforced by the schema', () => {
           fencing_token: 1,
           completed_at: ts(30),
         }),
-      'unique',
+      'trigger',
+      /^final_artifacts key exists/,
     );
     const outbox = (eventId, type) => ({
       event_id: eventId,
@@ -501,8 +504,10 @@ test('[DB-14] data-model constraints are enforced by the schema', () => {
       payload_json: '{}',
       created_at: ts(30),
     });
-    rejects(db, () => s.insert('outbox_events', outbox(sid('evt'), 'envelope.completed')), 'unique', /outbox_events/);
-    rejects(db, () => s.insert('outbox_events', outbox(g.eventId, 'envelope.sent')), ['unique', 'primary-key']);
+    // A-010 request #75: 0019's outbox_events_key_exists refuses a second completion event before the partial unique index.
+    rejects(db, () => s.insert('outbox_events', outbox(sid('evt'), 'envelope.completed')), 'trigger', /^outbox_events key exists/);
+    // A-010 request #75: 0019's outbox_events_key_exists refuses a repeated event id before the unique and primary keys.
+    rejects(db, () => s.insert('outbox_events', outbox(g.eventId, 'envelope.sent')), 'trigger', /^outbox_events key exists/);
     db.transaction(() => s.insert('outbox_events', outbox(sid('evt'), 'envelope.sent')));
 
     rejects(
@@ -608,6 +613,7 @@ test('[DB-15] immutable, single-use, frozen and fenced rows are protected by the
       envelope_id: draft.env,
       artifact_digest: hex('draft-pdf'),
       approved_composition_digest: hex('composition'),
+      approval_evidence_digest: hex('approval-evidence'),
       pdf_blob_ref: blobRef(tenant, hex('draft-pdf')),
       evidence_blob_ref: blobRef(tenant, hex('evidence')),
       signer_certificate_sha256: hex('certificate'),

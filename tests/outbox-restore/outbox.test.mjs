@@ -86,9 +86,10 @@ test('[OR-01] an outbox event is inserted in the transaction of the state change
       );
     }
     db.transaction(() => enqueueOutboxEvent(db, tenant, completion, { clock }));
+    // A-010 request #75: 0019's outbox_events_key_exists refuses the second completion event before the partial unique index.
     assert.throws(
       () => db.transaction(() => enqueueOutboxEvent(db, tenant, completion, { clock })),
-      (error) => error instanceof StorageConstraintError && error.constraint === 'unique',
+      (error) => error instanceof StorageConstraintError && error.constraint === 'trigger' && /^outbox_events key exists/.test(error.message),
       'one completion event per envelope',
     );
 

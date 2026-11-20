@@ -356,6 +356,7 @@ export function seedGraph(db, tenantId) {
       envelope_id: g.env,
       artifact_digest: g.artDigest,
       approved_composition_digest: hex('composition'),
+      approval_evidence_digest: hex('approval-evidence'),
       pdf_blob_ref: blobRef(tenantId, g.artDigest),
       evidence_blob_ref: blobRef(tenantId, hex('evidence')),
       signer_certificate_sha256: hex('certificate'),

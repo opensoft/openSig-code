@@ -927,7 +927,7 @@ test("[OR-21] the required-blob set is T029's reference-protection predicate: an
       walk.forEach((step, index) => assert.equal(store.compareAndSet('envelopes', { id: envelope }, index + 1, { ...step, updated_at: ts(10) }), true, `${step.state} step`));
       // reserved_version is the version written on entering finalizing (data-model.md § Entities, SigningJob).
       store.insert('signing_jobs', { envelope_id: envelope, reserved_version: 4, status: 'succeeded', attempt_count: 2, max_attempts: 3, fencing_token: 2, created_at: ts(4), updated_at: ts(5) });
-      store.insert('final_artifacts', { artifact_id: sid('art'), envelope_id: envelope, artifact_digest: reused.digest, approved_composition_digest: hex(`c-${envelope}`), pdf_blob_ref: reused.ref, evidence_blob_ref: evidence.ref, signer_certificate_sha256: hex('certificate'), development_certificate: 1, verifier_name: 'opensig-verifier', verifier_version: '0.0.0', verification_json: '{"integrity":"valid"}', fencing_token: 2, completed_at: ts(5) });
+      store.insert('final_artifacts', { artifact_id: sid('art'), envelope_id: envelope, artifact_digest: reused.digest, approved_composition_digest: hex(`c-${envelope}`), approval_evidence_digest: hex('or21-approval-evidence'), pdf_blob_ref: reused.ref, evidence_blob_ref: evidence.ref, signer_certificate_sha256: hex('certificate'), development_certificate: 1, verifier_name: 'opensig-verifier', verifier_version: '0.0.0', verification_json: '{"integrity":"valid"}', fencing_token: 2, completed_at: ts(5) });
     });
     const required = requiredBlobRefs(db, tenant);
     assert.equal(required.has(reused.ref), true, 'a final artifact protects R, as the disposer decides');

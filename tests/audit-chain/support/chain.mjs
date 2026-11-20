@@ -121,6 +121,7 @@ export function terminalEnvelope(db, blobs, tenant, { state = 'completed', updat
         envelope_id: env,
         artifact_digest: pdf.digest,
         approved_composition_digest: hex(`composition-${env}`),
+        approval_evidence_digest: hex('approval-evidence'),
         pdf_blob_ref: pdf.ref,
         evidence_blob_ref: evidence.ref,
         signer_certificate_sha256: hex('certificate'),

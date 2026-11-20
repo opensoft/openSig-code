@@ -70,6 +70,8 @@ export const TABLES: Readonly<Record<string, TablePolicy>> = Object.freeze({
   consumer_attachments: { entity: 'ConsumerAttachment', mutability: 'mutable', writer: 'store' },
   anchor_receipts: { entity: 'AnchorReceipt', mutability: 'mutable', writer: 'store' },
   disposal_records: { entity: 'DisposalRecord', mutability: 'immutable', writer: 'store' },
+  // Every blob a finalization attempt writes, recorded first (T038, migration 0019).
+  finalization_attempt_blobs: { entity: 'FinalizationAttemptBlob', mutability: 'immutable', writer: 'store' },
 });
 
 /**
