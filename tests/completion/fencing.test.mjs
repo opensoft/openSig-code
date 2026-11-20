@@ -5,13 +5,20 @@
 // publish is checked for its exact reason and for writing nothing at all: the
 // job, the envelope, final_artifacts, outbox_events and the audit chain are
 // equal before and after. Data is synthetic, in a migrated temporary database.
+//
+// Row LEASE-TOKEN-TEST (A-010 request #86; FEN-05 extended): the guarded
+// writes behind leaseHeld (recordAttemptBlob, writeSealAnchor and
+// writeCompletionCheckpoint) refuse a stale attempt whose owner holds the new
+// lease under the next fencing token, so the token comparison is what refuses.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { DEFAULT_LEASE_MS, LEASE_EXPIRED_ERROR_CODE, leaseHeld, listExpiredLeases, reclaimExpiredLease, retryDelayMs } from '../../src/storage/repositories/jobs.ts';
-import { assertUnchanged, holderOf, lease, publish, refusedWith, takeOver } from './support/steps.mjs';
-import { assembleAttempt, makeWorld, RESERVED_VERSION, seedFinalizing, snapshot } from './support/world.mjs';
+import { writeCompletionCheckpoint, writeSealAnchor } from '../../src/domain/finalization/index.ts';
+import { getCompletionCheckpoint } from '../../src/storage/repositories/artifacts.ts';
+import { DEFAULT_LEASE_MS, LEASE_EXPIRED_ERROR_CODE, leaseHeld, listAttemptBlobs, listExpiredLeases, reclaimExpiredLease, recordAttemptBlob, retryDelayMs } from '../../src/storage/repositories/jobs.ts';
+import { assertUnchanged, eventsOf, holderOf, lease, publish, refusedWith, takeOver } from './support/steps.mjs';
+import { assembleAttempt, hex, makeWorld, RESERVED_VERSION, seedFinalizing, snapshot } from './support/world.mjs';
 
 test('[FEN-01] a stale fencing token publishes nothing after another attempt took over; the current token publishes', () => {
   const world = makeWorld();
@@ -156,6 +163,56 @@ test('[FEN-05] a reclaim needs lease_expires_at at or before now: 1 ms before th
       [job.status, job.fencing_token, job.lease_owner, job.last_error_code, job.retry_at],
       ['retryable', grant.fencingToken, null, LEASE_EXPIRED_ERROR_CODE, retryAt],
       `reclaimed job ${job.status}, attempt ${job.fencing_token}, owner ${job.lease_owner}, ${job.last_error_code}, retry_at ${job.retry_at} (expected ${retryAt})`,
+    );
+  } finally {
+    world.close();
+  }
+});
+
+test('[FEN-05] a reclaimed lease lets the old attempt write nothing, also when the same owner holds the new lease: the stale recordAttemptBlob is false, writeSealAnchor and writeCompletionCheckpoint are null, and the job, the audit chain, the attempt records and the checkpoints are unchanged (row LEASE-TOKEN-TEST, request #86)', () => {
+  const world = makeWorld();
+  try {
+    const { envelopeId } = seedFinalizing(world);
+    const owner = 'runner-a';
+    const stale = lease(world, envelopeId, owner);
+    const current = takeOver(world, stale, owner);
+    const staleHolder = holderOf(stale);
+    const currentHolder = holderOf(current);
+    const renewed = [current.leaseOwner, current.fencingToken];
+    assert.deepEqual(renewed, [owner, stale.fencingToken + 1], `premise: the new lease is ${current.leaseOwner} attempt ${current.fencingToken}; the stale one ${stale.leaseOwner} attempt ${stale.fencingToken}`);
+    const held = leaseHeld(world.store, currentHolder, world.clock.now());
+    assert.equal(held, true, `premise: at ${world.clock.iso()} ${owner} holds attempt ${current.fencingToken} until ${current.leaseExpiresAt} (held ${held})`);
+    const head = () => {
+      const [last] = world.store.list('audit_events', {}, { orderBy: [['seq', 'desc']], limit: 1 });
+      return last === undefined ? null : [last.seq, last.event_digest];
+    };
+    const before = snapshot(world, envelopeId);
+    const headBefore = head();
+    const empty = [eventsOf(world, envelopeId, 'envelope.seal_started').length, getCompletionCheckpoint(world.store, envelopeId) ?? null, before.attemptBlobs];
+    assert.deepEqual(empty, [0, null, 0], `premise: no anchor, no checkpoint and no attempt record yet (anchors, checkpoint, records ${JSON.stringify(empty)})`);
+
+    const context = world.context();
+    const blobRef = `tenants/${world.tenantId}/sha256/${hex(`stale-composed-${envelopeId}`)}`;
+    const recorded = world.db.transaction(() => recordAttemptBlob(world.store, staleHolder, { blobRef, role: 'composed', now: world.clock.now() }));
+    const anchor = writeSealAnchor(context, staleHolder);
+    const checkpoint = writeCompletionCheckpoint(context, staleHolder);
+    assert.deepEqual(
+      [recorded, anchor, checkpoint],
+      [false, null, null],
+      `${owner} attempt ${stale.fencingToken}, while ${owner} holds attempt ${current.fencingToken}: recordAttemptBlob ${recorded}, writeSealAnchor ${JSON.stringify(anchor)}, writeCompletionCheckpoint ${JSON.stringify(checkpoint)}`,
+    );
+    assertUnchanged(world, envelopeId, before, `the stale holder ${owner} attempt ${stale.fencingToken} wrote nothing`);
+    const headAfter = head();
+    assert.deepEqual(headAfter, headBefore, `the audit head (seq, digest) ${JSON.stringify(headBefore)} then ${JSON.stringify(headAfter)}`);
+
+    // The refusal is the token's: the same owner's current attempt records and anchors.
+    const currentRecorded = world.db.transaction(() => recordAttemptBlob(world.store, currentHolder, { blobRef, role: 'composed', now: world.clock.now() }));
+    const currentAnchor = writeSealAnchor(context, currentHolder);
+    const tokens = listAttemptBlobs(world.store, envelopeId).map((record) => record.fencingToken);
+    assert.deepEqual(
+      [currentRecorded, currentAnchor !== null, tokens],
+      [true, true, [current.fencingToken]],
+      `${owner} attempt ${current.fencingToken}: recordAttemptBlob ${currentRecorded}, writeSealAnchor ${JSON.stringify(currentAnchor)}, attempt records of attempts ${JSON.stringify(tokens)}`,
     );
   } finally {
     world.close();
