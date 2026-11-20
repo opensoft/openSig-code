@@ -24,7 +24,8 @@
 //   moved after the bind fails here even before a `listening` line; a look-alike argument
 //   still starts. The flag goes onto process.argv only for the duration of each in-process
 //   start and is restored at once.
-// - SEC-12, runner: the composition starts its runner exactly once, at its default interval.
+// - SEC-12, runner: the composition starts its runner exactly once, at its default interval, after
+//   both listeners (TCP and relay) are bound: each is listening when start() is called (request #81).
 //   The runner is built from exactly the values startup validated (request #81 (10)): the key
 //   file's path, the certificate's DER and the anchors' PEM items, read once, with no path to
 //   re-read them from; a runner given no anchors fails here (the preparation's M21). Its onError
@@ -261,23 +262,33 @@ test('[SEC-12] startup checks the seal and trust-anchor settings before composin
   assert.doesNotMatch(output.stdout, /"event":"listening"/);
 });
 
-test('[SEC-12] the composition starts T038\'s runner once at its default interval, built from exactly the validated values with its onError wired; over the composed database it reclaims an expired lease at the attempt limit, and the retry route answers through T038\'s handler and audits the operator', async () => {
+test('[SEC-12] the composition starts T038\'s runner once at its default interval after both listeners are bound, built from exactly the validated values with its onError wired; over the composed database it reclaims an expired lease at the attempt limit, and the retry route answers through T038\'s handler and audits the operator', async () => {
   const started = [];
+  // Request #81 (row N1): the runner starts once BOTH listeners are bound. Every server whose
+  // listen() is called during the start is recorded, and the start spy notes whether each is
+  // listening at that moment; with the relay socket set there are two (TCP and relay).
+  const bound = [];
+  const originalListen = NetServer.prototype.listen;
+  NetServer.prototype.listen = function recordedListen(...args) {
+    bound.push(this);
+    return originalListen.apply(this, args);
+  };
   const originalStart = FinalizationRunner.prototype.start;
   FinalizationRunner.prototype.start = function recordedStart(...args) {
     // Recorded, not called through: no scheduled run races the steps below.
-    started.push({ runner: this, args });
+    started.push({ runner: this, args, listening: bound.map((server) => server.listening) });
   };
   // The seal certificate and two anchors, built here so the test knows the values startup must hand the runner.
   const certificate = certificateFor(sealKeyPair(), { serial: 0x3104 });
   const anchorsText = [0x3105, 0x3106].map((serial) => certificateFor(rsaKeyPair(2048), { commonName: 'T031 Development Anchor (anchor.example.test)', serial }).pem).join('');
-  const env = composedEnv({ OPENSIG_OPERATOR_AUTH_FILE: authFile(), ...sealFiles({ certificate: certificate.pem }), OPENSIG_TRUST_ANCHORS_FILE: anchorsFile(anchorsText) });
+  const env = composedEnv({ OPENSIG_OPERATOR_AUTH_FILE: authFile(), OPENSIG_RELAY_SOCKET: join(tempDir('relay'), 'opensig.sock'), ...sealFiles({ certificate: certificate.pem }), OPENSIG_TRUST_ANCHORS_FILE: anchorsFile(anchorsText) });
   const lines = [];
   let running;
   try {
     running = await start(env, lines);
   } finally {
     FinalizationRunner.prototype.start = originalStart;
+    NetServer.prototype.listen = originalListen;
   }
   const side = testSide(env);
   const job = (id) => rows(env.OPENSIG_DATABASE, 'SELECT status, attempt_count, max_attempts, last_error_code FROM signing_jobs WHERE envelope_id = ?', id)[0];
@@ -287,6 +298,7 @@ test('[SEC-12] the composition starts T038\'s runner once at its default interva
     assert.equal(started.length, 1, `the runner is started ${started.length} time(s)`);
     assert.equal(started[0].runner, running.composition.finalization, 'the composition\'s own runner');
     assert.deepEqual(started[0].args, [], 'at its default interval');
+    assert.deepEqual(started[0].listening, [true, true], `the runner starts after both listeners are bound: ${bound.length} listen() call(s) during the start, listening ${JSON.stringify(started[0].listening)} when the runner started`);
 
     // Request #81 (10): the runner is built from exactly the values startup validated, read once.
     const options = running.composition.finalizationOptions;
