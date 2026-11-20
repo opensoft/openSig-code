@@ -68,6 +68,7 @@ import { sealComposedPdf, type SealedPdf, type SealInput, type SealOptions } fro
 import { canonicalBytes } from '../domain/canonical/index.ts';
 import { PublishRefused } from '../domain/finalization/errors.ts';
 import { classifyFailure, StepFailure, type FailureStage } from '../domain/finalization/failure.ts';
+import { faultPoint } from '../domain/finalization/fault-hook.ts';
 import { LeaseKeeper, LeaseLost, type LeaseTimers } from '../domain/finalization/lease.ts';
 import { buildPreSealManifest, readSealRecords } from '../domain/finalization/manifest.ts';
 import { publishFinalization, type Publication } from '../domain/finalization/publish.ts';
@@ -192,6 +193,7 @@ export class FinalizationRunner {
     const grant = o.db.transaction(() => grantLease(store, envelopeId, { owner: o.owner, now: o.clock(), leaseMs: this.#leaseMs }));
     if (grant === null) return { kind: 'not-claimed' };
     // hook: reserve, right after the grant commits.
+    faultPoint('reserve');
     const holder: LeaseHolder = { envelopeId, fencingToken: grant.fencingToken, leaseOwner: grant.leaseOwner };
     const context: StepContext = { db: o.db, audit: o.audit, tenantId, clock: o.clock, newEventId: o.newEventId };
     const keeper = new LeaseKeeper({
@@ -233,6 +235,8 @@ export class FinalizationRunner {
     const storeBlob = (role: AttemptBlobRole, bytes: Uint8Array): string => {
       const digest = sha256(bytes);
       // hook: before this phase's first durable write (the record).
+      if (role === 'sealed') faultPoint('store-pdf');
+      else if (role === 'evidence') faultPoint('store-evidence');
       if (!recordBlob(context, holder, blobRef(context.tenantId, digest), role)) lost();
       o.blobs.put(context.tenantId, bytes, { expectedDigest: digest });
       return digest;
@@ -243,6 +247,7 @@ export class FinalizationRunner {
 
     enter('anchor');
     // hook: compose, before the anchor (its first durable write, when this attempt writes it).
+    faultPoint('compose');
     const anchor = writeSealAnchor(context, holder) ?? lost();
     enter('compose');
     keeper.checkHeld();
@@ -267,6 +272,7 @@ export class FinalizationRunner {
 
     enter('seal');
     // hook: seal, at the phase's start.
+    faultPoint('seal');
     keeper.checkHeld();
     const keyFd = (ports.openKey ?? openSealKey)(o.seal.keyFile);
     let sealed: SealedPdf;
@@ -284,6 +290,7 @@ export class FinalizationRunner {
 
     enter('verify');
     // hook: verify, at the phase's start.
+    faultPoint('verify');
     keeper.checkHeld();
     const reportBytes = await (ports.verify ?? runVerification)(
       {
@@ -346,6 +353,7 @@ export class FinalizationRunner {
       { clock: o.clock, audit: o.audit, blobs: o.blobs, newEventId: o.newEventId },
     );
     // hook: outbox, right after the publish commits.
+    faultPoint('outbox');
     return publication;
   }
 

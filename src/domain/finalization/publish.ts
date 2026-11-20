@@ -51,6 +51,7 @@ import {
 import { compareAndSetEnvelope, getEnvelope } from '../../storage/repositories/envelopes.ts';
 import { completeJob, type LeaseHolder } from '../../storage/repositories/jobs.ts';
 import { PublishRefused } from './errors.ts';
+import { faultPoint } from './fault-hook.ts';
 import { FINALIZATION_ACTOR_REF } from './transitions.ts';
 
 export { FINALIZATION_ACTOR_REF };
@@ -159,6 +160,8 @@ export function publishFinalization(db: Database, input: PublishInput, options: 
       { type: 'envelope.completed', envelopeId: holder.envelopeId, envelopeVersion, artifactId: artifact.artifactId, artifactDigest: artifact.artifactDigest },
       { clock: () => now, newId: options.newEventId },
     );
+    // hook: publish, after the transaction's last statement and before COMMIT (T015; request #61 (2)).
+    faultPoint('publish');
     return {
       envelopeId: holder.envelopeId,
       artifactId: artifact.artifactId,
