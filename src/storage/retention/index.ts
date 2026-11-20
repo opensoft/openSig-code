@@ -19,6 +19,7 @@ export {
   type DisposalKind,
   type DisposalOutcome,
   type DisposalRequest,
+  type ProtectionOptions,
   type ReferenceKind,
   type RetentionRun,
   type RetentionServiceOptions,

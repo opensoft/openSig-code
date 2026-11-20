@@ -11,9 +11,13 @@
 //    removed), inserts the DisposalRecord with its kind ('retention' or
 //    'orphan-collection') and appends an audit event whose subject_digest is
 //    the RFC 8785 digest of the record.
-// 2. After the commit, removes the disposed blobs through the blob store.
+// 2. After the commit, removes each disposed blob in its own BEGIN IMMEDIATE
+//    transaction that re-checks protection first (A-010 request #59 (7);
+//    RET-09). A finalization attempt records a ref in its own transaction
+//    before it writes the blob (T038), so a live attempt's blob is either
+//    seen and kept, or removed before the attempt writes it again.
 // resume() finishes step 2 for earlier records after a crash between the
-// commit and the removal, keeping any ref that is referenced again.
+// commit and the removal, the same way: a ref referenced again is kept.
 //
 // Reference rule (ReferenceProtection, exported as the single
 // reference-protection predicate: backup computes its required blobs with it
@@ -27,13 +31,27 @@
 // An orphan collection never removes a ref that any final artifact references.
 // Every referencing row is read (keyset iteration), never a truncated list.
 //
+// FinalizationAttemptBlob records (request #59 (7)): when the predicate is
+// given the instant to judge attempts at (`attempts.now`, which the disposer
+// always passes), a record protects its ref unless its attempt is collectable
+// by data-model.md's rule (attemptCollectable in
+// src/storage/repositories/jobs.ts: not published, lease ended, plus 24
+// hours). The published attempt's records protect exactly as its envelope's
+// final artifact does, so retention scope 'all' still gives them up. The
+// records are read in referenced() only: protects(), and so backup's
+// required-blob set, is unchanged, because a recorded ref may not be written
+// yet (the record precedes the write) or may have been collected.
+//
 // A retention run, for one tenant:
 // 1. Reads the tenant's policy; with no policy nothing is disposed.
 // 2. Resumes interrupted blob removals.
 // 3. Iterates envelopes in a terminal state (completed, declined, expired,
 //    voided) last updated at or before now - dispose_after_days (injected
 //    clock), skipping only envelopes that already have a retention
-//    DisposalRecord (an orphan-collection record does not count).
+//    DisposalRecord (an orphan-collection record does not count). Each
+//    request proposes the document revisions' refs and, for scope 'all', the
+//    final artifact's three refs and every ref its published attempt
+//    recorded (row ATTEMPT-ALL).
 // 4. Disposes them in batches of up to RETENTION_BATCH_SIZE envelopes per
 //    transaction, each envelope with its own record and audit event.
 // Rows are never changed: completed evidence is not mutated in place; only
@@ -48,6 +66,7 @@ import { parseBlobRef } from '../blobs/refs.ts';
 import type { Database } from '../db/connection.ts';
 import { StorageUsageError } from '../db/errors.ts';
 import type { Row, TenantStore } from '../db/tenant-store.ts';
+import { attemptBlobsOfRef, attemptCollectable, listAttemptBlobs } from '../repositories/jobs.ts';
 import { parseRetentionPolicy, type RetentionPolicy, type RetentionScope } from './policy.ts';
 
 export const DISPOSAL_RECORD_SCHEMA = 'opensig.disposal-record/1';
@@ -134,6 +153,15 @@ export interface DisposalContext {
   readonly scope: RetentionScope | undefined;
 }
 
+/** How referenced() judges FinalizationAttemptBlob records (request #59 (7)). */
+export interface ProtectionOptions {
+  /**
+   * The instant attempts are judged at, or a clock read once, on the first
+   * attempt record met. Without it referenced() does not read attempt records.
+   */
+  readonly attempts?: { readonly now: Date | (() => Date) };
+}
+
 /** The scope of the envelope's retention disposal, from its audit event ('documents' when not recorded). */
 function retentionScope(store: TenantStore, envelopeId: string): RetentionScope {
   for (const event of store.iterate('audit_events', { envelope_id: envelopeId, type: EVENT.retention.type })) {
@@ -160,17 +188,46 @@ function hasRetentionDisposal(store: TenantStore, envelopeId: string): boolean {
  *   up what the disposal gives up (a retention disposal: its documents, and
  *   its final artifacts for scope 'all'), and for an orphan collection every
  *   final artifact protects.
- * Orphan-collection records never make an envelope give anything up. An
- * instance caches per envelope; use one instance per consistent read.
+ * Orphan-collection records never make an envelope give anything up. With
+ * `options.attempts`, referenced() also reads FinalizationAttemptBlob records
+ * (see the header). An instance caches per envelope; use one instance per
+ * consistent read.
  */
 export class ReferenceProtection {
   readonly #store: TenantStore;
   readonly #context: DisposalContext | undefined;
   readonly #cache = new Map<string, GivenUp>();
+  readonly #attemptsNow: Date | (() => Date) | undefined;
+  #instant: Date | undefined = undefined;
 
-  constructor(store: TenantStore, context?: DisposalContext) {
+  constructor(store: TenantStore, context?: DisposalContext, options: ProtectionOptions = {}) {
     this.#store = store;
     this.#context = context;
+    this.#attemptsNow = options.attempts?.now;
+  }
+
+  #now(): Date {
+    if (this.#instant === undefined) {
+      const source = this.#attemptsNow;
+      const now = typeof source === 'function' ? source() : source;
+      if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new StorageUsageError('the attempt protection instant is not a valid date');
+      this.#instant = now;
+    }
+    return this.#instant;
+  }
+
+  /** True while a FinalizationAttemptBlob record of `ref` still protects it. */
+  #attemptProtects(ref: string): boolean {
+    if (this.#attemptsNow === undefined) return false;
+    for (const record of attemptBlobsOfRef(this.#store, ref)) {
+      if (this.#store.count('final_artifacts', { envelope_id: record.envelopeId, fencing_token: record.fencingToken }) > 0) {
+        // The published attempt: protected as its final artifact is.
+        if (this.protects(record.envelopeId, 'artifact')) return true;
+        continue;
+      }
+      if (!attemptCollectable(this.#store, record.envelopeId, record.fencingToken, this.#now())) return true;
+    }
+    return false;
   }
 
   #givenUp(envelopeId: string): GivenUp {
@@ -193,14 +250,14 @@ export class ReferenceProtection {
     return kind === 'document' ? !givenUp.documents : !givenUp.artifacts;
   }
 
-  /** True while any row that still protects `ref` references it (every row is read). */
+  /** True while any row that still protects `ref` references it (every row is read), or, with `attempts`, an attempt record protects it. */
   referenced(ref: string): boolean {
     for (const { table, column, kind } of BLOB_REFERENCE_COLUMNS) {
       for (const row of this.#store.iterate(table, { [column]: ref })) {
         if (this.protects(String(row['envelope_id']), kind)) return true;
       }
     }
-    return false;
+    return this.#attemptProtects(ref);
   }
 }
 
@@ -254,15 +311,30 @@ export class BlobDisposer {
     return now;
   }
 
-  /** True while any row still protecting the ref (ReferenceProtection) references it. */
-  #referenced(store: TenantStore, ref: string, context: DisposalContext): boolean {
-    return new ReferenceProtection(store, context).referenced(ref);
+  /** The clock, read at most once per operation and only when an attempt record is met. */
+  #onceNow(): () => Date {
+    let instant: Date | undefined;
+    return () => (instant ??= this.#now());
+  }
+
+  /** True while any row still protecting the ref (ReferenceProtection, attempts judged at `now`) references it. */
+  #referenced(store: TenantStore, ref: string, context: DisposalContext, now: () => Date): boolean {
+    return new ReferenceProtection(store, context, { attempts: { now } }).referenced(ref);
   }
 
   #removeBlob(tenantId: string, ref: string): boolean {
     const key = parseBlobRef(ref);
     if (key.tenantId !== tenantId) throw new StorageUsageError('a disposal blob ref belongs to another tenant');
     return this.#blobs.dispose(tenantId, key.digest);
+  }
+
+  /**
+   * One removal (request #59 (7)): in its own BEGIN IMMEDIATE transaction,
+   * re-check protection and remove the blob only when nothing protects it.
+   * True when a blob was removed.
+   */
+  #removeUnprotected(store: TenantStore, tenantId: string, ref: string, context: DisposalContext, now: () => Date): boolean {
+    return this.#db.transaction(() => (this.#referenced(store, ref, context, now) ? false : this.#removeBlob(tenantId, ref)));
   }
 
   #checkRequest(tenantId: string, request: DisposalRequest): DisposalContext & { readonly refs: readonly string[] } {
@@ -298,15 +370,17 @@ export class BlobDisposer {
   /**
    * Several disposals in one BEGIN IMMEDIATE transaction, decided in order
    * (a later request sees the records of earlier ones). The blobs are removed
-   * after the commit. Refuses to run inside a caller's transaction, because
-   * blob removal must follow the commit, and refuses (writing nothing) a
-   * retention disposal of an envelope that already has one.
+   * after the commit, each in its own transaction that re-checks protection.
+   * Refuses to run inside a caller's transaction, because blob removal must
+   * follow the commit, and refuses (writing nothing) a retention disposal of
+   * an envelope that already has one.
    */
   disposeBatch(tenantId: string, requests: readonly DisposalRequest[]): DisposalOutcome[] {
     if (this.#db.inTransaction) throw new StorageUsageError('a disposal runs its own transaction; call it outside Database.transaction()');
     if (!Array.isArray(requests)) throw new StorageUsageError('disposal requests must be an array');
     const checked = requests.map((request) => this.#checkRequest(tenantId, request));
     const store = this.#db.forTenant(tenantId);
+    const now = this.#onceNow();
     const outcomes = this.#db.transaction(() =>
       checked.map((context, index): DisposalOutcome => {
         const request = requests[index] as DisposalRequest;
@@ -316,7 +390,7 @@ export class BlobDisposer {
         const disposedBlobRefs: string[] = [];
         const keptBlobRefs: string[] = [];
         for (const ref of context.refs) {
-          if (this.#referenced(store, ref, context)) keptBlobRefs.push(ref);
+          if (this.#referenced(store, ref, context, now)) keptBlobRefs.push(ref);
           else disposedBlobRefs.push(ref);
         }
         const retainedArtifactDigests = [...new Set(request.retainedArtifactDigests)].sort();
@@ -368,19 +442,22 @@ export class BlobDisposer {
         };
       }),
     );
-    for (const outcome of outcomes) {
-      for (const ref of outcome.disposedBlobRefs) this.#removeBlob(tenantId, ref);
-    }
+    outcomes.forEach((outcome, index) => {
+      const context = checked[index] as DisposalContext;
+      for (const ref of outcome.disposedBlobRefs) this.#removeUnprotected(store, tenantId, ref, context, now);
+    });
     return outcomes;
   }
 
   /**
    * Finish blob removal for earlier records whose blobs still exist (a crash
-   * between a record's commit and its blob removal). A ref referenced again
-   * is kept. Returns the refs removed now.
+   * between a record's commit and its blob removal). Each removal re-checks
+   * protection in its own transaction; a ref referenced again is kept.
+   * Returns the refs removed now.
    */
   resume(tenantId: string): string[] {
     const store = this.#db.forTenant(tenantId);
+    const now = this.#onceNow();
     const resumed: string[] = [];
     for (const record of store.iterate('disposal_records', {}, { orderBy: [['server_time', 'asc']] })) {
       const envelopeId = String(record['envelope_id']);
@@ -391,8 +468,7 @@ export class BlobDisposer {
         if (key.tenantId !== tenantId) throw new StorageUsageError('a disposal blob ref belongs to another tenant');
         if (this.#blobs.check(tenantId, key.digest) === 'missing') continue;
         context ??= { envelopeId, kind, scope: kind === 'retention' ? retentionScope(store, envelopeId) : undefined };
-        if (this.#referenced(store, ref, context)) continue;
-        if (this.#removeBlob(tenantId, ref)) resumed.push(ref);
+        if (this.#removeUnprotected(store, tenantId, ref, context, now)) resumed.push(ref);
       }
     }
     return resumed;
@@ -428,6 +504,12 @@ export class RetentionService {
       for (const column of ARTIFACT_REF_COLUMNS) {
         const ref = artifact[column];
         if (typeof ref === 'string') refs.add(ref);
+      }
+      // Row ATTEMPT-ALL (request #75 (2)): every ref the published attempt recorded, the
+      // composed PDF included, which no other path removes. The predicate re-checks each.
+      const published = artifact['fencing_token'];
+      for (const record of listAttemptBlobs(store, envelopeId)) {
+        if (record.fencingToken === Number(published)) refs.add(record.blobRef);
       }
     }
     const retainedArtifactDigests =
