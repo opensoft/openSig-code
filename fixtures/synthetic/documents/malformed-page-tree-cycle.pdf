@@ -1,0 +1,42 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 3 0 R >>
+endobj
+2 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+3 0 obj
+<< /Type /Pages /Kids [4 0 R 3 0 R] /Count 2 /MediaBox [0 0 612 792] >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 3 0 R /Resources << /Font << /F1 2 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 105 >>
+stream
+BT
+/F1 11 Tf
+15 TL
+72 720 Td
+(Page-tree cycle fixture: the root /Kids array lists the root itself.) Tj
+ET
+endstream
+endobj
+6 0 obj
+<< /Title (Synthetic page-tree cycle fixture) /Producer (openSig synthetic fixture generator) >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000161 00000 n 
+0000000248 00000 n 
+0000000350 00000 n 
+0000000506 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R /Info 6 0 R /ID [<7ecd01e53b74473418b18976ea79b0ed> <7ecd01e53b74473418b18976ea79b0ed>] >>
+startxref
+618
+%%EOF

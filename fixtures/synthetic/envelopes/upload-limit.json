@@ -1,0 +1,291 @@
+{
+  "schema": "opensig.envelope-conformance-fixture/1",
+  "category": "upload-limit",
+  "cases": [
+    {
+      "id": "EC-LIM-01",
+      "title": "a PDF of exactly 10 MiB is accepted",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "targetBytes": 10485760
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "document.bytes",
+            "equals": 10485760
+          },
+          {
+            "path": "document.digest",
+            "equals": {
+              "$ctx": "upload_sha256"
+            }
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/DocumentSummary/properties/bytes/maximum",
+          "value": 10485760
+        },
+        {
+          "pointer": "#/components/responses/PayloadTooLarge/description",
+          "text": "10 MiB for PDF upload, enforced while streaming"
+        }
+      ]
+    },
+    {
+      "id": "EC-LIM-02",
+      "title": "a PDF one byte over 10 MiB is too large",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1,
+            "targetBytes": 10485761
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-too-large"
+      },
+      "expect": {
+        "status": 413,
+        "code": "payload_too_large"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/PayloadTooLarge/description",
+          "text": "10 MiB for PDF upload, enforced while streaming"
+        }
+      ]
+    },
+    {
+      "id": "EC-LIM-03",
+      "title": "a PDF of 50 pages is accepted",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 50
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "document.pages",
+            "length": 50
+          },
+          {
+            "path": "document.pages[49].number",
+            "equals": 50
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/DocumentSummary/properties/pages/maxItems",
+          "value": 50
+        },
+        {
+          "pointer": "#/components/schemas/PageGeometry/properties/number/maximum",
+          "value": 50
+        }
+      ]
+    },
+    {
+      "id": "EC-LIM-04",
+      "title": "a PDF of 51 pages is unsupported",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 51
+          }
+        }
+      },
+      "defect": {
+        "kind": "pdf-content",
+        "feature": "pages-over-50"
+      },
+      "expect": {
+        "status": 422,
+        "code": "unsupported_pdf"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/Unprocessable/description",
+          "text": "over 50 pages"
+        }
+      ]
+    },
+    {
+      "id": "EC-LIM-05",
+      "title": "a PDF of 50 pages and exactly 10 MiB is accepted",
+      "given": "draft-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 50,
+            "targetBytes": 10485760
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "document.pages",
+            "length": 50
+          },
+          {
+            "path": "document.bytes",
+            "equals": 10485760
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/DocumentSummary/properties/bytes/maximum",
+          "value": 10485760
+        },
+        {
+          "pointer": "#/components/schemas/DocumentSummary/properties/pages/maxItems",
+          "value": 50
+        }
+      ]
+    },
+    {
+      "id": "EC-LIM-06",
+      "title": "a JSON body of exactly 256 KiB is accepted",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              }
+            ]
+          },
+          "padTo": 262144
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 201,
+        "body": [
+          {
+            "path": "state",
+            "equals": "draft"
+          },
+          {
+            "path": "version",
+            "equals": 1
+          },
+          {
+            "path": "recipients",
+            "length": 1
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/PayloadTooLarge/description",
+          "text": "256 KiB for JSON"
+        }
+      ]
+    },
+    {
+      "id": "EC-LIM-07",
+      "title": "a JSON body one byte over 256 KiB is too large",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              }
+            ]
+          },
+          "padTo": 262145
+        }
+      },
+      "defect": {
+        "kind": "body-too-large"
+      },
+      "expect": {
+        "status": 413,
+        "code": "payload_too_large"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/PayloadTooLarge/description",
+          "text": "256 KiB for JSON"
+        },
+        {
+          "pointer": "#/paths/~1v1~1envelopes/post/responses/413/$ref",
+          "value": "#/components/responses/PayloadTooLarge"
+        }
+      ]
+    }
+  ]
+}

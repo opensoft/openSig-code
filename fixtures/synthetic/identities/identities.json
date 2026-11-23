@@ -1,0 +1,134 @@
+{
+  "schema": "opensig.fixtures.identities.v1",
+  "generator": "scripts/gen-fixtures.mjs",
+  "synthetic": true,
+  "notice": "Synthetic identities for local tests only. Reserved domains (.test and example.com); no keys, credentials or real people.",
+  "reserved_domains": [
+    ".test",
+    "example.com"
+  ],
+  "tenants": [
+    {
+      "id": "tenant_alpha_synthetic01",
+      "name": "Alpha Synthetic Holdings (synthetic)",
+      "oidc": {
+        "issuer": "https://issuer.alpha.test",
+        "audience": "opensig-local-alpha",
+        "claims": {
+          "tenant": "opensig_tenant",
+          "roles": "opensig_roles",
+          "principal_kind": "opensig_principal_kind"
+        }
+      },
+      "operators": [
+        {
+          "id": "op_alpha_sender_000001",
+          "subject": "alpha-sender-0001",
+          "kind": "human-operator",
+          "roles": [
+            "sender"
+          ],
+          "display_name": "Alpha Sender (synthetic)",
+          "email": "sender@alpha.test"
+        },
+        {
+          "id": "op_alpha_admin_0000001",
+          "subject": "alpha-admin-0001",
+          "kind": "human-operator",
+          "roles": [
+            "tenant_admin"
+          ],
+          "display_name": "Alpha Tenant Admin (synthetic)",
+          "email": "admin@alpha.test"
+        },
+        {
+          "id": "svc_alpha_hermes_000001",
+          "subject": "alpha-hermes-service",
+          "kind": "service",
+          "roles": [
+            "service"
+          ],
+          "display_name": "Alpha Hermes service (synthetic)",
+          "email": null
+        }
+      ],
+      "recipients": [
+        {
+          "id": "rcp_alpha_one_00000001",
+          "ordinal": 1,
+          "role": "Approver",
+          "display_name": "Recipient One (synthetic)",
+          "email": "recipient.one@example.com"
+        },
+        {
+          "id": "rcp_alpha_two_00000001",
+          "ordinal": 2,
+          "role": "Countersigner",
+          "display_name": "Recipient Two (synthetic)",
+          "email": "recipient.two@alpha.test"
+        }
+      ]
+    },
+    {
+      "id": "tenant_beta_synthetic01",
+      "name": "Beta Synthetic Holdings (synthetic)",
+      "oidc": {
+        "issuer": "https://issuer.beta.test",
+        "audience": "opensig-local-beta",
+        "claims": {
+          "tenant": "opensig_tenant",
+          "roles": "opensig_roles",
+          "principal_kind": "opensig_principal_kind"
+        }
+      },
+      "operators": [
+        {
+          "id": "op_beta_sender_000001",
+          "subject": "beta-sender-0001",
+          "kind": "human-operator",
+          "roles": [
+            "sender"
+          ],
+          "display_name": "Beta Sender (synthetic)",
+          "email": "sender@beta.test"
+        },
+        {
+          "id": "op_beta_admin_0000001",
+          "subject": "beta-admin-0001",
+          "kind": "human-operator",
+          "roles": [
+            "tenant_admin"
+          ],
+          "display_name": "Beta Tenant Admin (synthetic)",
+          "email": "admin@beta.test"
+        },
+        {
+          "id": "svc_beta_hermes_000001",
+          "subject": "beta-hermes-service",
+          "kind": "service",
+          "roles": [
+            "service"
+          ],
+          "display_name": "Beta Hermes service (synthetic)",
+          "email": null
+        }
+      ],
+      "recipients": [
+        {
+          "id": "rcp_beta_one_000000001",
+          "ordinal": 1,
+          "role": "Approver",
+          "display_name": "Recipient Three (synthetic)",
+          "email": "recipient.three@example.com"
+        },
+        {
+          "id": "rcp_beta_two_000000001",
+          "ordinal": 2,
+          "role": "Countersigner",
+          "display_name": "Recipient Four (synthetic)",
+          "email": "recipient.four@beta.test"
+        }
+      ]
+    }
+  ]
+}

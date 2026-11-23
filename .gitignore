@@ -10,3 +10,20 @@ venv/
 *.swp
 .idea/
 .vscode/
+
+# Node.js runtime, dependencies and generated output (plan.md, T001)
+node_modules/
+tools/
+dist/
+.verify-out/
+var/
+spool/
+
+# Local databases, key material and environment files must never be committed
+*.sqlite*
+*.db
+*.pem
+*.key
+*.p12
+*.pfx
+.env*

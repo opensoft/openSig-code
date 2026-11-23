@@ -1,0 +1,121 @@
+{
+  "schema": "opensig.envelope-conformance-manifest/1",
+  "task": "T006",
+  "kind": "harness",
+  "evidence_scope": "Harness only: never success-criterion evidence and never runtime acceptance. T034 consumes it with a count check.",
+  "acceptance": "provisional on branch 001-corporate-signing-mvp-us1-t006 (A-009); final after Phase 2 close, before T007",
+  "contract": {
+    "file": "contracts/http-api.json",
+    "source": "contracts/http-api.source.json",
+    "sha256": "9e53f792672d6976972beab1a102fa87d6e26fb35b778044c7e77ebca4a654fd",
+    "info_version": "0.2.3-draft"
+  },
+  "limits": {
+    "json_body_bytes": 262144,
+    "pdf_body_bytes": 10485760,
+    "pdf_pages": 50
+  },
+  "principals": {
+    "sender": "human-operator principal with role sender and the scopes the operation names",
+    "service": "service principal with role service and its client-credentials scopes"
+  },
+  "fixtures": [
+    {
+      "category": "envelope",
+      "file": "envelope.json",
+      "cases": 29
+    },
+    {
+      "category": "version",
+      "file": "version.json",
+      "cases": 17
+    },
+    {
+      "category": "upload-limit",
+      "file": "upload-limit.json",
+      "cases": 7
+    },
+    {
+      "category": "unsupported-pdf",
+      "file": "unsupported-pdf.json",
+      "cases": 19
+    }
+  ],
+  "total": 72,
+  "givens": {
+    "draft-1": {
+      "state": "draft",
+      "principal": "sender",
+      "create": {
+        "source": {
+          "app": "manual",
+          "record": "synthetic-record-0001",
+          "version": "v1"
+        },
+        "recipients": [
+          {
+            "email": "signer.one@example.test",
+            "role": "approver",
+            "ordinal": 1
+          }
+        ]
+      }
+    },
+    "draft-1-document": {
+      "state": "draft",
+      "principal": "sender",
+      "create": {
+        "source": {
+          "app": "manual",
+          "record": "synthetic-record-0001",
+          "version": "v1"
+        },
+        "recipients": [
+          {
+            "email": "signer.one@example.test",
+            "role": "approver",
+            "ordinal": 1
+          }
+        ]
+      },
+      "document": {
+        "pages": 1
+      }
+    },
+    "prepared-1": {
+      "state": "prepared",
+      "principal": "sender",
+      "create": {
+        "source": {
+          "app": "manual",
+          "record": "synthetic-record-0001",
+          "version": "v1"
+        },
+        "recipients": [
+          {
+            "email": "signer.one@example.test",
+            "role": "approver",
+            "ordinal": 1
+          }
+        ]
+      },
+      "document": {
+        "pages": 1
+      },
+      "prepare": [
+        {
+          "key": "sig_1",
+          "recipient_ordinal": 1,
+          "page": 1,
+          "type": "signature",
+          "rect": {
+            "x": 0.1,
+            "y": 0.8,
+            "width": 0.3,
+            "height": 0.08
+          }
+        }
+      ]
+    }
+  }
+}

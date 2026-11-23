@@ -1,0 +1,1357 @@
+{
+  "schema": "opensig.envelope-conformance-fixture/1",
+  "category": "envelope",
+  "cases": [
+    {
+      "id": "EC-ENV-01",
+      "title": "create a draft envelope with one recipient",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              }
+            ]
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 201,
+        "body": [
+          {
+            "path": "state",
+            "equals": "draft"
+          },
+          {
+            "path": "version",
+            "equals": 1
+          },
+          {
+            "path": "recipients",
+            "length": 1
+          },
+          {
+            "path": "recipients[0].ordinal",
+            "equals": 1
+          },
+          {
+            "path": "recipients[0].email",
+            "equals": "signer.one@example.test"
+          },
+          {
+            "path": "recipients[0].status",
+            "equals": "pending"
+          },
+          {
+            "path": "recipients[0].invited_at",
+            "equals": null
+          },
+          {
+            "path": "document",
+            "equals": null
+          },
+          {
+            "path": "manifest_digest",
+            "equals": null
+          },
+          {
+            "path": "approvals_complete",
+            "equals": false
+          },
+          {
+            "path": "created_by.kind",
+            "equals": "human-operator"
+          },
+          {
+            "path": "send_confirmation.required",
+            "equals": false
+          },
+          {
+            "path": "reissue_of",
+            "equals": null
+          },
+          {
+            "path": "artifact",
+            "equals": null
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/paths/~1v1~1envelopes/post/responses/201/description",
+          "text": "recipient IDs are server-generated and returned with their ordinals"
+        },
+        {
+          "pointer": "#/components/schemas/RecipientView/properties/status/description",
+          "text": "pending = not yet its turn or not sent"
+        },
+        {
+          "pointer": "#/components/schemas/Envelope/properties/send_confirmation/properties/required/description",
+          "text": "True when created_by.kind is service"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-02",
+      "title": "create a draft envelope with two sequential recipients",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              },
+              {
+                "email": "signer.two@example.test",
+                "role": "reviewer",
+                "ordinal": 2
+              }
+            ]
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 201,
+        "body": [
+          {
+            "path": "state",
+            "equals": "draft"
+          },
+          {
+            "path": "version",
+            "equals": 1
+          },
+          {
+            "path": "recipients",
+            "length": 2
+          },
+          {
+            "path": "recipients[0].ordinal",
+            "equals": 1
+          },
+          {
+            "path": "recipients[1].ordinal",
+            "equals": 2
+          },
+          {
+            "path": "recipients[1].status",
+            "equals": "pending"
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/EnvelopeCreate/properties/recipients/maxItems",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-03",
+      "title": "a service principal creates a draft that requires human send confirmation",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "hermes",
+              "record": "synthetic-record-0002",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              }
+            ]
+          }
+        },
+        "principal": "service"
+      },
+      "defect": null,
+      "expect": {
+        "status": 201,
+        "body": [
+          {
+            "path": "state",
+            "equals": "draft"
+          },
+          {
+            "path": "version",
+            "equals": 1
+          },
+          {
+            "path": "created_by.kind",
+            "equals": "service"
+          },
+          {
+            "path": "send_confirmation.required",
+            "equals": true
+          },
+          {
+            "path": "send_confirmation.authorization_reference",
+            "equals": null
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Envelope/properties/send_confirmation/properties/required/description",
+          "text": "True when created_by.kind is service"
+        },
+        {
+          "pointer": "#/x-opensig-role-matrix/createEnvelope/roles",
+          "value": [
+            "sender",
+            "service"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-04",
+      "title": "create without source is a schema violation",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/EnvelopeCreate/required",
+          "value": [
+            "source",
+            "recipients"
+          ]
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-05",
+      "title": "create without recipients is a schema violation",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            }
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/EnvelopeCreate/required",
+          "value": [
+            "source",
+            "recipients"
+          ]
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-06",
+      "title": "create with an empty recipient list is a schema violation",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": []
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/EnvelopeCreate/properties/recipients/minItems",
+          "value": 1
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-07",
+      "title": "create with three recipients exceeds the recipient limit",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              },
+              {
+                "email": "signer.two@example.test",
+                "role": "reviewer",
+                "ordinal": 2
+              },
+              {
+                "email": "signer.three@example.test",
+                "role": "observer",
+                "ordinal": 2
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/EnvelopeCreate/properties/recipients/maxItems",
+          "value": 2
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-08",
+      "title": "a recipient ordinal above 2 is a schema violation",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 3
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/RecipientInput/properties/ordinal/maximum",
+          "value": 2
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-09",
+      "title": "a tenant supplied in the body is an unknown property",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              }
+            ],
+            "tenant_id": "synthetictenant0001"
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/EnvelopeCreate/description",
+          "text": "Tenant comes from the verified principal, never from the body."
+        },
+        {
+          "pointer": "#/components/schemas/EnvelopeCreate/additionalProperties",
+          "value": false
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-10",
+      "title": "an unknown recipient property is a schema violation",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1,
+                "display_name": "Signer One"
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/RecipientInput/additionalProperties",
+          "value": false
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-11",
+      "title": "a source app outside the enumeration is a schema violation",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "erp",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Source/properties/app/enum",
+          "value": [
+            "hermes",
+            "openchart",
+            "openpractice",
+            "manual"
+          ]
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-12",
+      "title": "an empty recipient role is a schema violation",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "",
+                "ordinal": 1
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/RecipientInput/properties/role/minLength",
+          "value": 1
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-13",
+      "title": "a recipient role of 81 characters exceeds its maximum length",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "ordinal": 1
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/RecipientInput/properties/role/maxLength",
+          "value": 80
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-14",
+      "title": "a source record of 201 characters exceeds its maximum length",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Source/properties/record/maxLength",
+          "value": 200
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-15",
+      "title": "duplicate recipient ordinals break the ordinal rule",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              },
+              {
+                "email": "signer.two@example.test",
+                "role": "reviewer",
+                "ordinal": 1
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-rule"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/EnvelopeCreate/description",
+          "text": "Ordinals must be exactly 1 or 1..2 without gaps."
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-16",
+      "title": "a single recipient with ordinal 2 leaves a gap",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 2
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-rule"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/EnvelopeCreate/description",
+          "text": "Ordinals must be exactly 1 or 1..2 without gaps."
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-17",
+      "title": "a malformed JSON body is rejected",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "text": "{\"source\": {\"app\": \"manual\", ",
+          "contentType": "application/json"
+        }
+      },
+      "defect": {
+        "kind": "body-syntax"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-18",
+      "title": "create without an Idempotency-Key is rejected",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              }
+            ]
+          }
+        },
+        "headers": {
+          "Idempotency-Key": null
+        }
+      },
+      "defect": {
+        "kind": "header-missing",
+        "header": "Idempotency-Key"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/parameters/IdempotencyKey/required",
+          "value": true
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-19",
+      "title": "an Idempotency-Key of 15 characters is malformed",
+      "given": null,
+      "request": {
+        "operationId": "createEnvelope",
+        "body": {
+          "json": {
+            "source": {
+              "app": "manual",
+              "record": "synthetic-record-0001",
+              "version": "v1"
+            },
+            "recipients": [
+              {
+                "email": "signer.one@example.test",
+                "role": "approver",
+                "ordinal": 1
+              }
+            ]
+          }
+        },
+        "headers": {
+          "Idempotency-Key": {
+            "$gen": "idempotency-key-short"
+          }
+        }
+      },
+      "defect": {
+        "kind": "header-invalid",
+        "header": "Idempotency-Key"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/parameters/IdempotencyKey/schema/pattern",
+          "value": "^[A-Za-z0-9_-]{16,128}$"
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-20",
+      "title": "read an existing draft envelope",
+      "given": "draft-1",
+      "request": {
+        "operationId": "readEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "id",
+            "equals": {
+              "$ctx": "envelope_id"
+            }
+          },
+          {
+            "path": "version",
+            "equals": {
+              "$ctx": "version"
+            }
+          },
+          {
+            "path": "state",
+            "equals": "draft"
+          },
+          {
+            "path": "recipients",
+            "length": 1
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/paths/~1v1~1envelopes~1{envelope_id}/get/summary",
+          "text": "Read envelope status, recipients and artifact summary"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-21",
+      "title": "read a well-formed but absent envelope id",
+      "given": null,
+      "request": {
+        "operationId": "readEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "absent_envelope_id"
+          }
+        }
+      },
+      "defect": {
+        "kind": "absent-resource",
+        "parameter": "envelope_id"
+      },
+      "expect": {
+        "status": 404,
+        "code": "not_found"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/responses/NotFound/description",
+          "text": "not_found: absent or inaccessible"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-22",
+      "title": "an envelope id shorter than 16 characters is malformed",
+      "given": null,
+      "request": {
+        "operationId": "readEnvelope",
+        "path": {
+          "envelope_id": "short-id"
+        }
+      },
+      "defect": {
+        "kind": "path-parameter",
+        "parameter": "envelope_id"
+      },
+      "expect": {
+        "status": 404,
+        "code": "not_found"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/parameters/EnvelopeId/schema/pattern",
+          "value": "^[A-Za-z0-9_-]{16,64}$"
+        },
+        {
+          "pointer": "#/components/responses/NotFound/description",
+          "text": "not_found: absent or inaccessible"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-23",
+      "title": "prepare freezes the document and field manifest",
+      "given": "draft-1-document",
+      "request": {
+        "operationId": "prepareEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "version"
+            },
+            "fields": [
+              {
+                "key": "sig_1",
+                "recipient_ordinal": 1,
+                "page": 1,
+                "type": "signature",
+                "rect": {
+                  "x": 0.1,
+                  "y": 0.8,
+                  "width": 0.3,
+                  "height": 0.08
+                }
+              }
+            ]
+          }
+        }
+      },
+      "defect": null,
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "path": "state",
+            "equals": "prepared"
+          },
+          {
+            "path": "version",
+            "equals": {
+              "$ctx": "next_version"
+            }
+          },
+          {
+            "path": "manifest_digest",
+            "notEquals": null
+          },
+          {
+            "path": "document",
+            "notEquals": null
+          },
+          {
+            "path": "fields",
+            "length": 1
+          },
+          {
+            "path": "fields[0].key",
+            "equals": "sig_1"
+          },
+          {
+            "path": "fields[0].recipient_ordinal",
+            "equals": 1
+          },
+          {
+            "path": "fields[0].type",
+            "equals": "signature"
+          }
+        ]
+      },
+      "basis": [
+        {
+          "pointer": "#/paths/~1v1~1envelopes~1{envelope_id}~1prepare/post/responses/200/description",
+          "text": "Prepared; document_digest and manifest_digest frozen"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-24",
+      "title": "a field rectangle with x plus width above 1 is out of bounds",
+      "given": "draft-1-document",
+      "request": {
+        "operationId": "prepareEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "version"
+            },
+            "fields": [
+              {
+                "key": "sig_1",
+                "recipient_ordinal": 1,
+                "page": 1,
+                "type": "signature",
+                "rect": {
+                  "x": 0.8,
+                  "y": 0.1,
+                  "width": 0.3,
+                  "height": 0.1
+                }
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "field-bounds"
+      },
+      "expect": {
+        "status": 422,
+        "code": "field_out_of_bounds"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Rect/description",
+          "text": "x+width<=1 and y+height<=1 are enforced by the server (422 field_out_of_bounds)"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-25",
+      "title": "a field rectangle with y plus height above 1 is out of bounds",
+      "given": "draft-1-document",
+      "request": {
+        "operationId": "prepareEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "version"
+            },
+            "fields": [
+              {
+                "key": "sig_1",
+                "recipient_ordinal": 1,
+                "page": 1,
+                "type": "signature",
+                "rect": {
+                  "x": 0.1,
+                  "y": 0.95,
+                  "width": 0.3,
+                  "height": 0.1
+                }
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "field-bounds"
+      },
+      "expect": {
+        "status": 422,
+        "code": "field_out_of_bounds"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Rect/description",
+          "text": "x+width<=1 and y+height<=1 are enforced by the server (422 field_out_of_bounds)"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-26",
+      "title": "a field key with upper-case characters is a schema violation",
+      "given": "draft-1-document",
+      "request": {
+        "operationId": "prepareEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "version"
+            },
+            "fields": [
+              {
+                "key": "Sig-1",
+                "recipient_ordinal": 1,
+                "page": 1,
+                "type": "signature",
+                "rect": {
+                  "x": 0.1,
+                  "y": 0.8,
+                  "width": 0.3,
+                  "height": 0.08
+                }
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/FieldInput/properties/key/pattern",
+          "value": "^[a-z0-9_-]{1,40}$"
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-27",
+      "title": "a field type outside signature and date is a schema violation",
+      "given": "draft-1-document",
+      "request": {
+        "operationId": "prepareEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "version"
+            },
+            "fields": [
+              {
+                "key": "sig_1",
+                "recipient_ordinal": 1,
+                "page": 1,
+                "type": "initials",
+                "rect": {
+                  "x": 0.1,
+                  "y": 0.8,
+                  "width": 0.3,
+                  "height": 0.08
+                }
+              }
+            ]
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/FieldInput/properties/type/enum",
+          "value": [
+            "signature",
+            "date"
+          ]
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-28",
+      "title": "prepare with an empty field list is a schema violation",
+      "given": "draft-1-document",
+      "request": {
+        "operationId": "prepareEnvelope",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "json": {
+            "expected_version": {
+              "$ctx": "version"
+            },
+            "fields": []
+          }
+        }
+      },
+      "defect": {
+        "kind": "body-schema"
+      },
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      },
+      "basis": [
+        {
+          "pointer": "#/components/schemas/Prepare/properties/fields/minItems",
+          "value": 1
+        },
+        {
+          "pointer": "#/components/responses/BadRequest/description",
+          "text": "invalid_request: malformed JSON, schema violation or unknown property"
+        }
+      ]
+    },
+    {
+      "id": "EC-ENV-29",
+      "title": "uploading to a prepared envelope is a state conflict",
+      "given": "prepared-1",
+      "request": {
+        "operationId": "uploadDocument",
+        "path": {
+          "envelope_id": {
+            "$ctx": "envelope_id"
+          }
+        },
+        "body": {
+          "pdf": {
+            "pages": 1
+          }
+        }
+      },
+      "defect": {
+        "kind": "state",
+        "state": "prepared"
+      },
+      "expect": {
+        "status": 409,
+        "code": "state_conflict"
+      },
+      "basis": [
+        {
+          "pointer": "#/paths/~1v1~1envelopes~1{envelope_id}~1document/put/requestBody/content/application~1pdf/schema/description",
+          "text": "draft only"
+        },
+        {
+          "pointer": "#/paths/~1v1~1envelopes~1{envelope_id}~1document/put/summary",
+          "text": "Upload or replace the single PDF while in draft"
+        },
+        {
+          "pointer": "#/components/responses/Conflict/description",
+          "text": "state_conflict"
+        }
+      ]
+    }
+  ]
+}
