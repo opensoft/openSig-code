@@ -129,6 +129,30 @@ export async function documentChecked(page) {
 }
 
 /**
+ * Wait for the PDF loaded by the current review's own iframe. The Checked notice establishes
+ * document identity, while the viewer navigation and its load event arrive separately.
+ */
+async function documentViewerReady(page, origin) {
+  const iframe = await page.$('#document-frame');
+  assert.ok(iframe, 'the checked review has a document iframe');
+  try {
+    assert.equal(await iframe.getAttribute('src'), PATHS.document, 'the document iframe uses the exact viewer endpoint');
+    const frame = await iframe.contentFrame();
+    assert.ok(frame && frame.parentFrame() === page.mainFrame() && !frame.isDetached(), 'the document iframe is attached to the current review');
+    const expectedUrl = new URL(PATHS.document, origin).href;
+    assert.ok(frame.url() === 'about:blank' || frame.url() === expectedUrl, 'the document iframe has no unexpected navigation');
+    await frame.waitForURL(expectedUrl, { waitUntil: 'load', timeout: PAGE_TIMEOUT_MS });
+    const current = await page.evaluate(({ element, path }) =>
+      element.isConnected && element === document.getElementById('document-frame') && element.getAttribute('src') === path,
+    { element: iframe, path: PATHS.document });
+    assert.ok(current && await iframe.contentFrame() === frame && !frame.isDetached() && frame.url() === expectedUrl,
+      'the exact loaded document frame still belongs to the current review');
+  } finally {
+    await iframe.dispose();
+  }
+}
+
+/**
  * The response to `method` `path` that `action` causes. The wait is created first and the action
  * started at once; both are awaited as one, so the first failure is the one thrown and no wait is
  * ever left without a handler.
@@ -348,7 +372,16 @@ export async function approveInBrowser(party, { world, invitation, to, ordinal, 
 
   const key = `sig_${ordinal}`;
   if (signature === 'drawn') {
-    await page.getByRole('radio', { name: 'Draw my signature' }).check();
+    await documentViewerReady(page, world.origin);
+    const drawMode = page.getByRole('radio', { name: 'Draw my signature' });
+    // Finish scrolling before restoring radio focus for the ordinary pointer action.
+    await drawMode.scrollIntoViewIfNeeded();
+    const focused = await drawMode.evaluate((radio) => {
+      radio.focus({ preventScroll: true });
+      return radio.isConnected && radio.ownerDocument.activeElement === radio && radio.matches(':focus');
+    });
+    assert.ok(focused, who + ': the drawn signature radio has focus before selection');
+    await drawMode.check();
     await drawWithMouse(page, key);
   } else {
     await page.locator(`#typed-${key}`).fill(`Synthetic Recipient ${ordinal}`);
