@@ -448,6 +448,11 @@ test('[SEC-11] control: a malformed request with no response pending still gets 
   const reads = [];
   const control = await serveApp({
     handlers: {
+      // Keep this request open so the parser owns the response if the body is malformed.
+      uploadDocument: counted(async (ctx) => {
+        await hold(ctx);
+        return { status: 200, json: { uploaded: true } };
+      }),
       readEnvelope: async (ctx) => {
         reads.push('read');
         await hold(ctx);
@@ -474,9 +479,12 @@ test('[SEC-11] control: a malformed request with no response pending still gets 
     const malformedFirst = await exchange(control.port, chunkedHead('B') + BAD_CHUNK);
     assert.equal(malformedFirst.text, NODE_400, 'exactly Node\'s 400');
     assert.equal(malformedFirst.closedByLimit, false);
-    const extensionFirst = await exchange(control.port, chunkedHead('B') + LONG_EXTENSION);
+    const extensionFirst = await exchange(control.port, chunkedHead('B'), { second: LONG_EXTENSION });
     assert.equal(extensionFirst.text, NODE_413, 'exactly Node\'s 413');
     assert.equal(extensionFirst.closedByLimit, false);
+
+    // Drain the malformed uploads before measuring requests on the keep-alive connection.
+    await quiesce();
 
     // Bytes after a finished response on a keep-alive connection.
     const before = handled().length;
