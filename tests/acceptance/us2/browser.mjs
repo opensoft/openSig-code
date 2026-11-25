@@ -131,6 +131,7 @@ export async function documentChecked(page) {
 /**
  * Wait for the PDF loaded by the current review's own iframe. The Checked notice establishes
  * document identity, while the viewer navigation and its load event arrive separately.
+ * Replacing the review before the iframe loads can cancel its paused PDF response.
  */
 async function documentViewerReady(page, origin) {
   const iframe = await page.$('#document-frame');
@@ -194,7 +195,7 @@ function recordCapturedDocuments(caseId, recipient, seen) {
  */
 export function assertDocumentTransport(received, label) {
   for (const seen of received) {
-    assert.equal(seen.error ?? null, null, label + ': the intercepted body is readable (' + (seen.error ?? 'no error') + ')');
+    assert.equal(seen.error ?? null, null, label + ': the intercepted body is readable (' + (seen.bodyError ?? seen.error ?? 'no error') + ')');
     const identity = {
       network_id: seen.networkIdPresent,
       request: seen.networkCorrelated,
@@ -297,8 +298,9 @@ export async function captureDocument(page, { origin, caseId, recipient }) {
         const body = await cdp.send('Fetch.getResponseBody', { requestId: event.requestId });
         const bytes = Buffer.from(body.body, body.base64Encoded ? 'base64' : 'utf8');
         seen.push({ ...entry, sha256: sha256(bytes), bytes: bytes.length });
-      } catch {
-        seen.push({ ...entry, error: 'body-unavailable' });
+      } catch (error) {
+        const bodyError = String(error?.message ?? '').endsWith('Invalid InterceptionId.') ? 'invalid-interception-id' : 'body-read-failed';
+        seen.push({ ...entry, error: 'body-unavailable', bodyError });
       } finally {
         await cdp.send('Fetch.continueRequest', { requestId: event.requestId }).catch(() => undefined);
       }
@@ -363,16 +365,17 @@ export async function approveInBrowser(party, { world, invitation, to, ordinal, 
   assert.equal(state.turn, 'yours', `${who}: it is this recipient's turn (${state.turn})`);
   await step(page, 'review');
   await documentChecked(page);
+  await documentViewerReady(page, world.origin);
 
   const reloading = performance.now();
   await page.reload();
   await step(page, 'review');
   await documentChecked(page);
   world.samples.push({ flow, kind: 'review-reload', ms: performance.now() - reloading });
+  await documentViewerReady(page, world.origin);
 
   const key = `sig_${ordinal}`;
   if (signature === 'drawn') {
-    await documentViewerReady(page, world.origin);
     const drawMode = page.getByRole('radio', { name: 'Draw my signature' });
     // Finish scrolling before restoring radio focus for the ordinary pointer action.
     await drawMode.scrollIntoViewIfNeeded();
