@@ -117,13 +117,31 @@ test('[SEC-13] (a) a stalled partial request behind a pending response never dis
   }
 });
 
+/**
+ * Accept B's headers before A queues its large response. If A has already backpressured
+ * the socket when Node sees B's headers, Node also pauses input, so B's later chunk
+ * cannot reach the parser until the client resumes reading A.
+ */
+function uploadSocketAfterHeaders(server) {
+  return new Promise((resolve) => {
+    const onRequest = (req) => {
+      if (req.method !== 'PUT') return;
+      server.off('request', onRequest);
+      resolve(req.socket);
+    };
+    server.on('request', onRequest);
+  });
+}
+
 test('[SEC-13] (c) a malformed chunk after a pipelined upload handler was entered gets 400 right after the pending response, and its body-read permit is released at once', async () => {
   const LARGE = 32 * 1024 * 1024; // more than loopback buffers hold while the client is not reading
   const entered = [];
+  let uploadSocket;
   const served = await serveApp({
     handlers: {
       readEnvelope: async () => {
         entered.push('A');
+        await uploadSocket;
         return { status: 200, json: { pad: 'x'.repeat(LARGE) } };
       },
       uploadDocument: async (ctx) => {
@@ -134,14 +152,18 @@ test('[SEC-13] (c) a malformed chunk after a pipelined upload handler was entere
       },
     },
   });
+  uploadSocket = uploadSocketAfterHeaders(served.server);
   try {
     assert.equal(bodyReadCapacity().held, 0, 'premise: no body-read permit held');
     const connection = rawConnection(served.port, { paused: true });
     const upload = `PUT /v1/envelopes/${ENVELOPE_ID}/document HTTP/1.1\r\nHost: 127.0.0.1\r\n${auth()}Content-Type: application/pdf\r\nIf-Match: "1"\r\nIdempotency-Key: idem_synthetic_000000000013\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n%PDF-1.7\r\n`;
-    connection.socket.write(`GET /v1/envelopes/${ENVELOPE_ID} HTTP/1.1\r\nHost: 127.0.0.1\r\n${auth()}\r\n${upload}`);
+    connection.socket.write(`GET /v1/envelopes/${ENVELOPE_ID} HTTP/1.1\r\nHost: 127.0.0.1\r\n${auth()}\r\n`);
+    assert.ok(await until(() => entered.includes('A'), 5_000), 'premise: A is waiting for the upload headers');
+    connection.socket.write(upload);
     // B's handler is entered while A's large response is still being sent, and its parse holds a permit.
     const reading = await until(() => entered.includes('B') && bodyReadCapacity().held === 1, 5_000);
     assert.ok(reading, `premise: the upload's handler was entered and its parse holds a body-read permit (entered ${entered}; held ${bodyReadCapacity().held}); this case needs the T033 sandbox launcher`);
+    assert.ok((await uploadSocket).writableNeedDrain, 'premise: A is backpressured before the malformed chunk arrives');
     connection.socket.write('zz\r\n');
     const released = await until(() => bodyReadCapacity().held === 0, BODY_IDLE_TIMEOUT_MS / 2);
     assert.ok(released, `the body-read permit is released at once, never after the ${BODY_IDLE_TIMEOUT_MS} ms idle timer`);
@@ -170,10 +192,12 @@ test('[SEC-13] (c) a malformed chunk after a pipelined upload handler was entere
 test('[SEC-13] (c) the close after the decision waits for every pending response, however slowly the client reads', async () => {
   const LARGE = 32 * 1024 * 1024;
   const entered = [];
+  let uploadSocket;
   const served = await serveApp({
     handlers: {
       readEnvelope: async () => {
         entered.push('A');
+        await uploadSocket;
         return { status: 200, json: { pad: 'x'.repeat(LARGE) } };
       },
       uploadDocument: async (ctx) => {
@@ -184,11 +208,15 @@ test('[SEC-13] (c) the close after the decision waits for every pending response
       },
     },
   });
+  uploadSocket = uploadSocketAfterHeaders(served.server);
   try {
     const connection = rawConnection(served.port, { paused: true });
     const upload = `PUT /v1/envelopes/${ENVELOPE_ID}/document HTTP/1.1\r\nHost: 127.0.0.1\r\n${auth()}Content-Type: application/pdf\r\nIf-Match: "1"\r\nIdempotency-Key: idem_synthetic_000000000014\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n%PDF-1.7\r\n`;
-    connection.socket.write(`GET /v1/envelopes/${ENVELOPE_ID} HTTP/1.1\r\nHost: 127.0.0.1\r\n${auth()}\r\n${upload}`);
+    connection.socket.write(`GET /v1/envelopes/${ENVELOPE_ID} HTTP/1.1\r\nHost: 127.0.0.1\r\n${auth()}\r\n`);
+    assert.ok(await until(() => entered.includes('A'), 5_000), 'premise: A is waiting for the upload headers');
+    connection.socket.write(upload);
     assert.ok(await until(() => entered.includes('B'), 5_000), 'premise: the upload\'s handler was entered while A\'s response was pending');
+    assert.ok((await uploadSocket).writableNeedDrain, 'premise: A is backpressured before the malformed chunk arrives');
     connection.socket.write('zz\r\n');
     // B's 400 is decided (its request line is logged) while A's response is still unsent ...
     const decided = await until(() => served.lines.some((line) => line.includes('"event":"request"') && line.includes('"operation":"uploadDocument"')), BODY_IDLE_TIMEOUT_MS / 2);

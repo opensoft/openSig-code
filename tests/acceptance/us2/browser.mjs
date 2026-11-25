@@ -389,7 +389,12 @@ export async function approveInBrowser(party, { world, invitation, to, ordinal, 
   } else {
     await page.locator(`#typed-${key}`).fill(`Synthetic Recipient ${ordinal}`);
   }
-  await page.getByRole('checkbox', { name: CONSENT_BOX }).check();
+  const consent = page.getByRole('checkbox', { name: CONSENT_BOX });
+  await consent.scrollIntoViewIfNeeded();
+  assert.equal(await consent.isChecked(), false, who + ': consent starts unchecked');
+  // Use the native keyboard action so consent does not depend on a pair of pointer hits.
+  await consent.press('Space');
+  assert.equal(await consent.isChecked(), true, who + ': the consent checkbox changed after Space');
   const approved = await respondedTo(page, world.origin, PATHS.approval, 'POST', () => page.getByRole('button', { name: 'Approve the document' }).click());
   assert.equal(approved.status(), 200, `${who}: approveAsHuman answers 200, not ${approved.status()}`);
   const receipt = await approved.json();
